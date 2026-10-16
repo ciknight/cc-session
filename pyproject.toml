@@ -1,0 +1,6 @@
+[project]
+name = "claude-sessions"
+version = "0.1.0"
+description = "监控 Claude Code 会话任务内容和状态的 Web 服务（纯标准库，零第三方依赖）"
+requires-python = ">=3.9"
+dependencies = []

@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# uv / 虚拟环境
+.venv/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Claude Code 本地配置
+.claude/settings.local.json
+
+# uv 项目需要提交 .python-version（覆盖全局忽略）
+!.python-version
