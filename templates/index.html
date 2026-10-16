@@ -73,10 +73,27 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .tool{font:12px ui-monospace,monospace;color:var(--mut);background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:2px 8px;margin:3px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
 .terror{font-size:12px;color:#dc2626;background:rgba(220,38,38,.08);border-radius:6px;padding:2px 8px;margin:3px 0}
 .info-panel{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 14px;margin:10px 0}
+/* 移动端：抽屉式侧栏 */
+#menu{display:none}
+#mask{display:none}
+@media(max-width:768px){
+  #app{grid-template-columns:1fr}
+  #menu{display:inline-block}
+  header{padding:8px 10px;gap:10px}
+  main{padding:8px 10px}
+  .ubody{max-width:92%}
+  aside{position:fixed;top:0;bottom:0;left:0;width:min(75vw,300px);z-index:20;background:var(--bg);
+        transform:translateX(-100%);transition:transform .2s ease}
+  aside.open{transform:none}
+  #mask{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:15;
+        opacity:0;pointer-events:none;transition:opacity .2s}
+  #mask.show{opacity:1;pointer-events:auto}
+}
 </style>
 </head>
 <body>
 <header>
+  <button id="menu" class="back" aria-label="项目列表">☰</button>
   <h1>Claude Sessions <span class="mut" id="total"></span></h1>
   <label class="ctl">
     <span class="sw"><input type="checkbox" id="auto" checked><i></i></span> 自动刷新
@@ -96,6 +113,7 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
   <aside id="projs"></aside>
   <main id="main"></main>
 </div>
+<div id="mask"></div>
 
 <script>
 const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
@@ -241,7 +259,7 @@ function convHtml(messages){
 async function renderConversation(id, force){
   const main = document.getElementById("main");
   const scrollTop = main.scrollTop;
-  const nearBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
+  const nearTop = main.scrollTop < 80;   // 倒序后最新消息在顶部
   try{
     const [dRes, mRes] = await Promise.all([
       fetch("/sessions/" + encodeURIComponent(id)),
@@ -258,9 +276,9 @@ async function renderConversation(id, force){
           <span class="mut">${esc(d.cwd || "")}</span></h2>
         <div class="info-panel">${infoHtml(d)}</div>
         <h4>对话 (${m.messages.length})</h4>
-        <div id="conv">${convHtml(m.messages)}</div>`;
+        <div id="conv">${convHtml(m.messages.slice().reverse())}</div>`;
       document.getElementById("back").onclick = () => { view.session = null; convCache = {id: null, size: -1}; renderMain(); };
-      if(nearBottom) main.scrollTop = main.scrollHeight;
+      if(force || nearTop) main.scrollTop = 0;
       else main.scrollTop = scrollTop;
     }
   }catch(e){ /* 下次刷新重试 */ }
@@ -298,11 +316,19 @@ async function load(){
 }
 
 /* ---------- 交互 ---------- */
+const asideEl = document.getElementById("projs"), maskEl = document.getElementById("mask");
+function toggleDrawer(open){
+  asideEl.classList.toggle("open", open);
+  maskEl.classList.toggle("show", open);
+}
+document.getElementById("menu").onclick = () => toggleDrawer(!asideEl.classList.contains("open"));
+maskEl.onclick = () => toggleDrawer(false);
 document.getElementById("projs").addEventListener("click", e => {
   const item = e.target.closest(".pitem");
   if(!item) return;
   view = {project: item.dataset.cwd, session: null};
   convCache = {id: null, size: -1};
+  toggleDrawer(false);
   renderMain();
 });
 document.getElementById("main").addEventListener("click", e => {
