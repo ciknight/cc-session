@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Sessions 监控</title>
+<script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--card:#f6f6f4;--card2:#efefec;--mut:#777;--bd:#e2e2de;--acc:#2563eb;--accbg:#dbeafe}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1b1a;--fg:#eee;--card:#262625;--card2:#2e2d2c;--mut:#999;--bd:#3a3a38;--acc:#60a5fa;--accbg:#1e3a5f}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:14px/1.55 system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--bd);flex:none}
+h1{font-size:16px;margin:0}
+.ctl{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--mut)}
+select{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:2px 6px}
+/* 开关 */
+.sw{position:relative;display:inline-block;width:36px;height:20px}
+.sw input{display:none}
+.sw i{position:absolute;inset:0;background:var(--bd);border-radius:20px;transition:.2s;cursor:pointer}
+.sw i:before{content:"";position:absolute;width:16px;height:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:.2s}
+.sw input:checked+i{background:var(--acc)}
+.sw input:checked+i:before{transform:translateX(16px)}
+/* 布局 */
+#app{flex:1;display:grid;grid-template-columns:280px 1fr;min-height:0}
+aside{border-right:1px solid var(--bd);overflow-y:auto;padding:8px}
+main{overflow-y:auto;padding:12px 18px;min-width:0}
+/* 项目列表 */
+.pitem{padding:8px 10px;border-radius:8px;cursor:pointer;margin:2px 0;border:1px solid transparent}
+.pitem:hover{background:var(--card)}
+.pitem.active{background:var(--card);border-color:var(--bd)}
+.pname{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pmeta{font-size:12px;color:var(--mut)}
+/* 会话卡片 */
+.scard{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin:8px 0;cursor:pointer}
+.scard:hover{border-color:var(--acc)}
+.stitle{font-weight:600;margin:2px 0}
+.b{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff;white-space:nowrap}
+.working{background:#d97706}.idle{background:#16a34a}.stale{background:#888}
+.chip{display:inline-block;padding:0 7px;border:1px solid var(--bd);border-radius:10px;font-size:12px;color:var(--mut);margin:1px 2px;background:var(--card)}
+.mut{color:var(--mut);font-size:12px}
+.grid{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0;font-size:12px;color:var(--mut)}
+.grid b{color:var(--fg);font-weight:600}
+ul{margin:6px 0;padding-left:18px}
+.completed{text-decoration:line-through;color:var(--mut)}
+.in_progress{font-weight:600}
+h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.fold{margin:8px 0 2px}
+.fold>summary{font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;list-style:none;user-select:none}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary:before{content:"▸ "}
+.fold[open]>summary:before{content:"▾ "}
+.fold ul{max-height:300px;overflow-y:auto}
+.empty{color:var(--mut);padding:40px;text-align:center}
+#err{color:#dc2626;font-size:12px}
+.back{background:none;border:1px solid var(--bd);border-radius:6px;color:var(--fg);padding:3px 12px;cursor:pointer;font-size:13px}
+.back:hover{border-color:var(--acc)}
+/* 对话 */
+.msg{margin:10px 0}
+.mhead{font-size:11px;color:var(--mut);margin-bottom:2px}
+.ubody{background:var(--accbg);border-radius:10px;padding:8px 12px;white-space:pre-wrap;word-break:break-word;max-width:85%}
+.msg.user{display:flex;flex-direction:column;align-items:flex-end}
+.msg.user .mhead{text-align:right}
+.abody{max-width:100%;word-break:break-word}
+.abody pre{background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:8px 10px;overflow-x:auto;font-size:12.5px}
+.abody code{font-family:ui-monospace,monospace;font-size:12.5px;background:var(--card2);padding:0 3px;border-radius:4px}
+.abody pre code{background:none;padding:0}
+.abody p{margin:4px 0}
+.abody h1,.abody h2,.abody h3{font-size:15px;margin:8px 0 4px}
+.abody table{border-collapse:collapse}.abody td,.abody th{border:1px solid var(--bd);padding:2px 8px;font-size:13px}
+.tool{font:12px ui-monospace,monospace;color:var(--mut);background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:2px 8px;margin:3px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.terror{font-size:12px;color:#dc2626;background:rgba(220,38,38,.08);border-radius:6px;padding:2px 8px;margin:3px 0}
+.info-panel{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 14px;margin:10px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude Sessions <span class="mut" id="total"></span></h1>
+  <label class="ctl">
+    <span class="sw"><input type="checkbox" id="auto" checked><i></i></span> 自动刷新
+  </label>
+  <label class="ctl">间隔
+    <select id="ival">
+      <option value="2000">2s</option>
+      <option value="3000">3s</option>
+      <option value="5000">5s</option>
+      <option value="10000">10s</option>
+    </select>
+  </label>
+  <span class="ctl" id="updated"></span>
+  <span id="err"></span>
+</header>
+<div id="app">
+  <aside id="projs"></aside>
+  <main id="main"></main>
+</div>
+
+<script>
+const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const STATE_ZH = {working: "工作中", idle: "空闲", stale: "无活动"};
+const TASK_ZH = {pending: "待办", in_progress: "进行中", completed: "已完成", deleted: "已删除"};
+
+let sessions = [];                 // 最新概览数据
+let view = {project: null, session: null};   // 当前视图
+let convCache = {id: null, size: -1};        // 对话缓存标记，避免重复渲染
+let timer = null;
+
+/* ---------- 工具 ---------- */
+function relTime(ts){
+  if(!ts) return "";
+  const d = Date.now()/1000 - ts;
+  if(d < 60) return Math.floor(d) + " 秒前";
+  if(d < 3600) return Math.floor(d/60) + " 分钟前";
+  if(d < 86400) return Math.floor(d/3600) + " 小时前";
+  return Math.floor(d/86400) + " 天前";
+}
+function dur(a, b){
+  if(!a || !b || b <= a) return "";
+  const d = b - a;
+  if(d < 3600) return Math.floor(d/60) + "m";
+  if(d < 86400) return (d/3600).toFixed(1) + "h";
+  return (d/86400).toFixed(1) + "d";
+}
+function fmtTok(n){
+  if(!n) return "0";
+  if(n >= 1e6) return (n/1e6).toFixed(1) + "M";
+  if(n >= 1e3) return (n/1e3).toFixed(1) + "k";
+  return String(n);
+}
+const projName = cwd => (cwd || "?").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
+const sessTitle = s => (!s.title || s.title.includes("�")) ? (s.first_user_message || s.id.slice(0, 8)) : s.title;
+
+function md(text){
+  if(window.marked){
+    const html = marked.parse(text);
+    return window.DOMPurify ? DOMPurify.sanitize(html) : html;
+  }
+  return `<pre>${esc(text)}</pre>`;
+}
+
+/* ---------- 分组 ---------- */
+function groupByProject(){
+  const groups = new Map();
+  for(const s of sessions){
+    const k = s.project || s.cwd || "?";
+    if(!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(s);
+  }
+  return [...groups.entries()]
+    .map(([cwd, ss]) => ({
+      cwd, sessions: ss,
+      working: ss.filter(s => s.state === "working").length,
+      wt: ss.filter(s => s.cwd && s.cwd !== s.project).length,
+      out: ss.reduce((a, s) => a + ((s.tokens || {}).output || 0), 0),
+      last: Math.max(...ss.map(s => s.last_event_at || 0)),
+    }))
+    .sort((a, b) => b.last - a.last);
+}
+
+/* ---------- 渲染：项目侧栏 ---------- */
+function renderSidebar(projects){
+  document.getElementById("projs").innerHTML = projects.map(p => `
+    <div class="pitem ${p.cwd === view.project ? "active" : ""}" data-cwd="${esc(p.cwd)}">
+      <div class="pname">${esc(projName(p.cwd))}
+        ${p.working ? `<span class="b working">${p.working}</span>` : ""}</div>
+      <div class="pmeta">${p.sessions.length} 会话${p.wt ? ` · ${p.wt} worktree` : ""} · ${relTime(p.last)}</div>
+    </div>`).join("") || '<div class="empty">暂无项目</div>';
+}
+
+/* ---------- 渲染：会话列表 ---------- */
+function renderSessionList(p){
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <h2 style="font-size:16px;margin:4px 0">${esc(projName(p.cwd))}
+      <span class="mut">${esc(p.cwd)} · ${p.sessions.length} 会话 · 输出合计 ${fmtTok(p.out)} tok</span></h2>
+    ${p.sessions.map(s => `
+      <div class="scard" data-id="${esc(s.id)}">
+        <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
+        <span class="stitle">${esc(sessTitle(s))}</span>
+        <div class="mut">${[
+          s.cwd !== s.project ? "⎇ " + projName(s.cwd) : null,
+          s.model, s.git_branch,
+          relTime(s.last_event_at),
+          dur(s.first_event_at, s.last_event_at) && "时长 " + dur(s.first_event_at, s.last_event_at),
+          s.tasks_total && `任务 ${s.tasks_completed}/${s.tasks_total}`,
+          s.subagent_count && `${s.subagent_count} 子代理`,
+          s.tokens && s.tokens.output && `输出 ${fmtTok(s.tokens.output)} tok`,
+        ].filter(Boolean).map(esc).join(" · ")}</div>
+        <div class="mut" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.last_user_message || "")}</div>
+      </div>`).join("")}`;
+}
+
+/* ---------- 渲染：会话详情 + 对话 ---------- */
+function infoHtml(d){
+  const t = d.tokens || {};
+  const tools = Object.entries(d.tool_uses || {}).map(([k, v]) => `<span class="chip">${esc(k)} ×${v}</span>`).join("");
+  return `
+    <div class="grid">
+      <span>模型 <b>${esc(d.model || "?")}</b></span>
+      <span>分支 <b>${esc(d.git_branch || "?")}</b></span>
+      <span>版本 <b>${esc(d.version || "?")}</b></span>
+      <span>消息 <b>${d.user_msgs}/${d.assistant_msgs}</b></span>
+      <span>token 输入 <b>${fmtTok(t.input)}</b> 输出 <b>${fmtTok(t.output)}</b> 缓存 <b>${fmtTok(t.cache_read)}</b></span>
+      <span>开始 <b>${d.first_event_at ? new Date(d.first_event_at*1000).toLocaleString() : "?"}</b></span>
+    </div>
+    ${tools ? `<details class="fold"><summary>工具调用 (${Object.keys(d.tool_uses).length} 种)</summary><div>${tools}</div></details>` : ""}
+    ${d.subagents && d.subagents.length ? `<details class="fold"><summary>子代理 (${d.subagents.length})</summary><ul>` +
+      d.subagents.map(a => `<li><span class="chip">${esc(a.type)}</span> ${esc(a.description)}</li>`).join("") + "</ul></details>" : ""}
+    ${d.tasks && d.tasks.length ? `<details class="fold" open><summary>任务 ${d.tasks_completed}/${d.tasks_total}</summary><ul>` +
+      d.tasks.map(x => `<li class="${x.status}">[${TASK_ZH[x.status] || x.status}] ${esc(x.subject)}</li>`).join("") + "</ul></details>" : ""}`;
+}
+
+function convHtml(messages){
+  // 连续同角色合并为一组渲染
+  const groups = [];
+  for(const m of messages){
+    const last = groups[groups.length - 1];
+    if(last && last.role === m.role) last.parts.push(...m.parts);
+    else groups.push({role: m.role, ts: m.ts, parts: [...m.parts]});
+  }
+  return groups.map(g => {
+    const body = g.parts.map(p => {
+      if(p.type === "text")
+        return g.role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
+                                 : `<div class="abody">${md(p.text)}</div>`;
+      if(p.type === "tool")
+        return `<div class="tool">🔧 ${esc(p.name)}: ${esc(p.input)}</div>`;
+      if(p.type === "error")
+        return `<div class="terror">✗ ${esc(p.text)}</div>`;
+      return "";
+    }).join("");
+    const who = g.role === "user" ? "用户" : "助手";
+    const when = g.ts ? new Date(g.ts*1000).toLocaleString() : "";
+    return `<div class="msg ${g.role}"><div class="mhead">${who} · ${when}</div>${body}</div>`;
+  }).join("");
+}
+
+async function renderConversation(id, force){
+  const main = document.getElementById("main");
+  const scrollTop = main.scrollTop;
+  const nearBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
+  try{
+    const [dRes, mRes] = await Promise.all([
+      fetch("/sessions/" + encodeURIComponent(id)),
+      fetch(`/sessions/${encodeURIComponent(id)}/messages`),
+    ]);
+    const d = await dRes.json(), m = await mRes.json();
+    if(view.session !== id) return;   // 已切换走
+    if(force || convCache.id !== id || convCache.size !== m.size){
+      convCache = {id, size: m.size};
+      main.innerHTML = `
+        <button class="back" id="back">← 返回列表</button>
+        <h2 style="font-size:16px;margin:8px 0">
+          <span class="b ${d.state}">${STATE_ZH[d.state] || d.state}</span> ${esc(sessTitle(d))}
+          <span class="mut">${esc(d.cwd || "")}</span></h2>
+        <div class="info-panel">${infoHtml(d)}</div>
+        <h4>对话 (${m.messages.length})</h4>
+        <div id="conv">${convHtml(m.messages)}</div>`;
+      document.getElementById("back").onclick = () => { view.session = null; convCache = {id: null, size: -1}; renderMain(); };
+      if(nearBottom) main.scrollTop = main.scrollHeight;
+      else main.scrollTop = scrollTop;
+    }
+  }catch(e){ /* 下次刷新重试 */ }
+}
+
+/* ---------- 主渲染 ---------- */
+function renderMain(){
+  const projects = groupByProject();
+  renderSidebar(projects);
+  document.getElementById("total").textContent = `(${sessions.length})`;
+  if(view.session){
+    renderConversation(view.session, false);
+    return;
+  }
+  if(!view.project || !projects.some(p => p.cwd === view.project))
+    view.project = projects.length ? projects[0].cwd : null;
+  renderSidebar(projects);   // 更新 active 高亮
+  const p = projects.find(x => x.cwd === view.project);
+  const main = document.getElementById("main");
+  if(p) renderSessionList(p);
+  else main.innerHTML = '<div class="empty">暂无会话</div>';
+}
+
+/* ---------- 数据 ---------- */
+async function load(){
+  try{
+    const r = await fetch("/sessions");
+    sessions = await r.json();
+    document.getElementById("err").textContent = "";
+    document.getElementById("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
+    renderMain();
+  }catch(e){
+    document.getElementById("err").textContent = "连接失败: " + e.message;
+  }
+}
+
+/* ---------- 交互 ---------- */
+document.getElementById("projs").addEventListener("click", e => {
+  const item = e.target.closest(".pitem");
+  if(!item) return;
+  view = {project: item.dataset.cwd, session: null};
+  convCache = {id: null, size: -1};
+  renderMain();
+});
+document.getElementById("main").addEventListener("click", e => {
+  const card = e.target.closest(".scard");
+  if(!card) return;
+  view.session = card.dataset.id;
+  convCache = {id: null, size: -1};
+  renderConversation(view.session, true);
+});
+
+const auto = document.getElementById("auto"), ival = document.getElementById("ival");
+auto.checked = localStorage.getItem("auto") !== "0";
+ival.value = localStorage.getItem("ival") || String(DEFAULT_IVAL);
+function resetTimer(){
+  clearInterval(timer);
+  if(auto.checked) timer = setInterval(() => { if(!document.hidden) load(); }, +ival.value);
+}
+auto.onchange = () => { localStorage.setItem("auto", auto.checked ? "1" : "0"); resetTimer(); };
+ival.onchange = () => { localStorage.setItem("ival", ival.value); resetTimer(); };
+
+if(window.marked) marked.setOptions({breaks: true});
+load();
+resetTimer();
+</script>
+</body>
+</html>
