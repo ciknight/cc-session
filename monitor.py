@@ -68,9 +68,11 @@ def project_root(cwd):
     if not cwd:
         return cwd
     norm = cwd.replace("\\", "/")
-    marker = "/.claude/worktrees/"
-    idx = norm.find(marker)
-    return cwd[:idx] if idx > 0 else cwd
+    for marker in ("/.claude/worktrees/", "/.worktrees/"):
+        idx = norm.find(marker)
+        if idx > 0:
+            return cwd[:idx]
+    return cwd
 
 
 class Session:
@@ -100,7 +102,7 @@ class Session:
         self.state = "idle"
         self.recent = deque(maxlen=50)
 
-    def summary(self, stale_after):
+    def summary(self, stale_after, project=None):
         state = self.state
         if self.last_event_ts and now_ts() - self.last_event_ts > stale_after:
             state = "stale"
@@ -108,7 +110,7 @@ class Session:
         return {
             "id": self.id,
             "cwd": self.cwd or self.path.parent.name,
-            "project": project_root(self.cwd) or self.path.parent.name,
+            "project": project or project_root(self.cwd) or self.path.parent.name,
             "title": self.title,
             "model": self.model,
             "version": self.version,
@@ -127,8 +129,8 @@ class Session:
             "tokens": dict(self.tokens),
         }
 
-    def detail(self, stale_after):
-        d = self.summary(stale_after)
+    def detail(self, stale_after, project=None):
+        d = self.summary(stale_after, project)
         d["tasks"] = list(self.tasks.values())
         d["subagents"] = list(self.subagents)
         d["tool_uses"] = dict(self.tool_uses.most_common())
@@ -164,6 +166,30 @@ class Monitor:
             if cur is None or s.last_event_ts > cur.last_event_ts:
                 best[s.id] = s
         return list(best.values())
+
+    def project_map(self):
+        """会话 cwd -> 归并后的项目根目录。
+
+        先剥掉 worktree 后缀，再把子目录里的会话归并到最外层的
+        祖先项目（即本身也有会话的最短祖先路径），
+        如 <proj>/web -> <proj>、<proj>/desktop_app -> <proj>。
+        """
+        cwds = {project_root(s.cwd) for s in self.sessions.values() if s.cwd}
+        norm = {c: c.replace("\\", "/").rstrip("/").lower() for c in cwds}
+
+        def root_of(cwd):
+            n = norm[cwd]
+            best = None   # 最短祖先 = 根目录
+            for other, on in norm.items():
+                if on != n and n.startswith(on + "/"):
+                    if best is None or len(on) < len(norm[best]):
+                        best = other
+            return best or cwd
+
+        return {c: root_of(c) for c in cwds}
+
+    def project_of(self, sess, pmap):
+        return pmap.get(project_root(sess.cwd))
 
     # ---------- 事件分发 ----------
     def emit(self, sess, kind, data):
@@ -428,7 +454,8 @@ def make_handler(mon, refresh_interval):
                 # 默认返回概览（按项目分组所需字段齐全）；加 ?full=1 返回完整信息
                 full = parse_qs(u.query).get("full", ["0"])[0] in ("1", "true")
                 with mon.lock:
-                    items = sorted(((s.detail if full else s.summary)(mon.stale_after)
+                    pmap = mon.project_map()
+                    items = sorted(((s.detail if full else s.summary)(mon.stale_after, mon.project_of(s, pmap))
                                     for s in mon.unique_sessions()),
                                    key=lambda x: x["last_event_at"], reverse=True)
                 return self._json(items)
@@ -450,7 +477,9 @@ def make_handler(mon, refresh_interval):
                 sid = u.path.split("/", 2)[2]
                 with mon.lock:
                     s = mon.by_sid(sid)
-                    return self._json(s.detail(mon.stale_after)) if s else self._json({"error": "not found"}, 404)
+                    if not s:
+                        return self._json({"error": "not found"}, 404)
+                    return self._json(s.detail(mon.stale_after, mon.project_of(s, mon.project_map())))
             if u.path.startswith("/static/"):
                 return self._static(u.path[len("/static/"):])
             if u.path == "/events":

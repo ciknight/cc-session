@@ -166,7 +166,7 @@ function renderSidebar(projects){
     <div class="pitem ${p.cwd === view.project ? "active" : ""}" data-cwd="${esc(p.cwd)}">
       <div class="pname">${esc(projName(p.cwd))}
         ${p.working ? `<span class="b working">${p.working}</span>` : ""}</div>
-      <div class="pmeta">${p.sessions.length} 会话${p.wt ? ` · ${p.wt} worktree` : ""} · ${relTime(p.last)}</div>
+      <div class="pmeta">${p.sessions.length} 会话${p.wt ? ` · ${p.wt} 子目录` : ""} · ${relTime(p.last)}</div>
     </div>`).join("") || '<div class="empty">暂无项目</div>';
 }
 
