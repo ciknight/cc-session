@@ -372,10 +372,11 @@ class Monitor:
 
         elif typ == "user":
             blocks = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
+            kind = classify_user_line(obj, blocks)
             for b in blocks:
                 if b.get("type") == "tool_result":
                     self._on_tool_result(sess, b)
-                elif b.get("type") == "text" and b.get("text"):
+                elif b.get("type") == "text" and b.get("text") and kind == "user":
                     sess.user_msgs += 1
                     if sess.first_user is None:
                         sess.first_user = clip(b["text"], 80)
@@ -667,10 +668,37 @@ def _parse_iso(s):
         return None
 
 
+# 转录里 type=user 的行不一定是真人输入：工具结果回传、isMeta 注入、
+# 命令/任务通知等系统文本也以 user 角色写入，展示时需区分开
+SYSTEM_MARKERS = ("<task-notification>", "<command-name>", "<command-message>",
+                  "<local-command-stdout>", "Caveat:", "[Request interrupted")
+
+
+def classify_user_line(o, blocks):
+    """把 type=user 的行分类为 user（真人）/ system（系统文本）/ tool（工具结果回传）。"""
+    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks):
+        return "tool"
+    if o.get("isMeta"):
+        return "system"
+    for b in blocks:
+        if isinstance(b, dict) and b.get("type") == "text":
+            if (b.get("text") or "").lstrip().startswith(SYSTEM_MARKERS):
+                return "system"
+    return "user"
+
+
+def _result_text(b):
+    """提取 tool_result 的文本内容；content 可能是字符串或 text block 列表。"""
+    c = b.get("content", "")
+    if isinstance(c, list):
+        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+    return c if isinstance(c, str) else str(c)
+
+
 def parse_msg_line(ln, clip_len=8000):
     """把一行转录解析为一条消息（跳过子代理 sidechain 和工具结果）；无内容返回 None。
 
-    返回 {role: user/assistant, ts, parts: [{type: text|tool|error, ...}]}
+    返回 {role: user/assistant/tool/system, ts, parts: [{type: text|tool|error, ...}]}
     """
     if b'"type"' not in ln:
         return None
@@ -686,19 +714,21 @@ def parse_msg_line(ln, clip_len=8000):
     content = (o.get("message") or {}).get("content")
     parts = []
     blocks = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
+    role = classify_user_line(o, blocks) if typ == "user" else "assistant"
     for b in blocks:
         if not isinstance(b, dict):
             continue
         bt = b.get("type")
         if bt == "text" and b.get("text", "").strip():
-            parts.append({"type": "text", "text": clip(b["text"], clip_len)})
+            # 系统文本（任务通知/命令输出等）截短即可，不需要全文
+            parts.append({"type": "text", "text": clip(b["text"], 500 if role == "system" else clip_len)})
         elif bt == "tool_use":
             parts.append({"type": "tool", "name": b.get("name"),
                           "input": clip(b.get("input") or {}, 200)})
         elif bt == "tool_result" and b.get("is_error"):
-            parts.append({"type": "error", "text": clip(b.get("content", ""), 300)})
+            parts.append({"type": "error", "text": clip(_result_text(b), 300)})
     if parts:
-        return {"role": typ, "ts": _parse_iso(o.get("timestamp")), "parts": parts}
+        return {"role": role, "ts": _parse_iso(o.get("timestamp")), "parts": parts}
     return None
 
 

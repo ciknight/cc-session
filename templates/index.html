@@ -76,6 +76,9 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .abody table{border-collapse:collapse}.abody td,.abody th{border:1px solid var(--bd);padding:2px 8px;font-size:13px}
 .tool{font:12px ui-monospace,monospace;color:var(--mut);background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:2px 8px;margin:3px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
 .terror{font-size:12px;color:#dc2626;background:rgba(220,38,38,.08);border-radius:6px;padding:2px 8px;margin:3px 0}
+.sysbody{font-size:12.5px;color:var(--mut);white-space:pre-wrap;word-break:break-word;
+         border:1px dashed var(--bd);border-radius:6px;padding:4px 8px;max-width:100%}
+.msg.tool,.msg.system{display:flex;flex-direction:column;align-items:flex-start}
 .info-panel{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 14px;margin:10px 0}
 /* 移动端：抽屉式侧栏 */
 #menu{display:none}
@@ -250,14 +253,15 @@ function convHtml(messages){
     const body = g.parts.map(p => {
       if(p.type === "text")
         return g.role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
-                                 : `<div class="abody">${md(p.text)}</div>`;
+             : g.role === "assistant" ? `<div class="abody">${md(p.text)}</div>`
+             : `<div class="sysbody">${esc(p.text)}</div>`;
       if(p.type === "tool")
         return `<div class="tool">🔧 ${esc(p.name)}: ${esc(p.input)}</div>`;
       if(p.type === "error")
         return `<div class="terror">✗ ${esc(p.text)}</div>`;
       return "";
     }).join("");
-    const who = g.role === "user" ? "用户" : "助手";
+    const who = {user: "用户", assistant: "助手", tool: "工具", system: "系统"}[g.role] || g.role;
     const when = g.ts ? new Date(g.ts*1000).toLocaleString() : "";
     return `<div class="msg ${g.role}"><div class="mhead">${who} · ${when}</div>${body}</div>`;
   }).join("");
