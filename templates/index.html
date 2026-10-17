@@ -134,7 +134,8 @@ let curPanel = null;               // main 里已渲染的面板 {type:"list"|"c
                                    // 自动刷新只更新数据区域、不重建输入区，避免失焦/丢草稿
 let convCache = {id: null, size: -1};        // 对话缓存标记，避免重复渲染
 let timer = null;
-let sendJob = null;                // {sid, jobId, status, result, error} 发送任务状态，跨刷新保留
+let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
+                                   // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
 
 /* ---------- 工具 ---------- */
 function relTime(ts){
@@ -332,9 +333,9 @@ async function renderConversation(id, force){
     document.getElementById("back").onclick = () => { view.session = null; convCache = {id: null, size: -1}; renderMain(); };
     document.getElementById("msgbox").value = draft;
     bindSendBox(id, d);
-    updateSendSt(id);   // 恢复进行中任务的状态显示
-    main.scrollTop = 0;
     curPanel = {type: "conv", key: id};
+    updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
+    main.scrollTop = 0;
   }catch(e){ /* 下次刷新重试 */ }
   finally{ if(convLoading === id) convLoading = null; }
 }
@@ -348,22 +349,32 @@ function fetchT(url, opts = {}, ms = 30000){
 }
 
 function sendJobText(id){
-  // 状态从模块级 sendJob 读取，而不是闭包里的 DOM 引用——
+  // 状态从模块级 sendJobs 读取，而不是闭包里的 DOM 引用——
   // 自动刷新会整体重渲染对话视图，旧引用会指向已替换的节点导致界面停在"发送中…"
-  if(!sendJob || sendJob.sid !== id) return "";
-  if(sendJob.status === "sending") return "发送中…";
-  if(sendJob.status === "queued") return "排队中…";
-  if(sendJob.status === "running") return "Claude 正在处理…";
-  if(sendJob.status === "done") return "已完成，回复见下方对话";
-  if(sendJob.status === "failed") return "失败: " + (sendJob.error || "未知错误");
+  const j = sendJobs[id];
+  if(!j) return "";
+  if(j.status === "sending") return "发送中…";
+  if(j.status === "queued") return "排队中…";
+  if(j.status === "running") return "Claude 正在处理…";
+  if(j.status === "done") return "已完成，回复见下方对话";
+  if(j.status === "failed") return "失败: " + (j.error || "未知错误");
   return "";
 }
+function panelMatch(id){
+  // 当前显示的面板是否属于该任务 key：后台轮询循环在用户切走后仍会存活，
+  // 不检查就会把 A 会话的状态写进 B 会话/新建会话的输入区、禁用它们的按钮
+  if(!curPanel) return false;
+  if(curPanel.type === "conv") return curPanel.key === id;
+  if(curPanel.type === "new") return id === "new:" + curPanel.key;
+  return false;
+}
 function updateSendSt(id){
+  if(!panelMatch(id)) return;
   const st = document.getElementById("sendst");
   if(st) st.textContent = sendJobText(id);
   const btn = document.getElementById("sendbtn");
-  if(btn) btn.disabled = !!sendJob && sendJob.sid === id
-    && ["sending", "queued", "running"].includes(sendJob.status);
+  const j = sendJobs[id];
+  if(btn) btn.disabled = !!j && ["sending", "queued", "running"].includes(j.status);
 }
 
 /* ---------- 新建会话（不依赖已有历史；可选托管常驻进程或每次独立运行） ---------- */
@@ -391,8 +402,8 @@ function renderNewSession(p){
   document.getElementById("back").onclick = () => { view.new = false; renderMain(); };
   document.getElementById("msgbox").value = draft;
   bindNewBox(p);
-  updateSendSt("new:" + p.cwd);   // 恢复进行中任务的状态显示
   curPanel = {type: "new", key: p.cwd};
+  updateSendSt("new:" + p.cwd);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
 }
 
 function bindNewBox(p){
@@ -403,11 +414,12 @@ function bindNewBox(p){
     if(!text) return;
     const useHost = document.getElementById("hostcb").checked;
     const key = "new:" + p.cwd;
-    sendJob = {sid: key, status: "sending"};
+    sendJobs[key] = {status: "sending"};
     updateSendSt(key);
     let sid = null;
     const enterSession = () => {   // 拿到新 session id 后切换到对话视图
-      sendJob.sid = sid;
+      sendJobs[sid] = sendJobs[key] || sendJobs[sid];   // 任务状态改挂到新会话 id 名下
+      delete sendJobs[key];
       if(view.new && view.project === p.cwd){
         view = {project: p.cwd, session: sid, new: false};
         convCache = {id: null, size: -1};
@@ -421,7 +433,7 @@ function bindNewBox(p){
       }, 30000);
       const j = await r.json();
       if(r.status !== 202){
-        sendJob = {sid: key, status: "failed", error: j.error || ("HTTP " + r.status)};
+        sendJobs[key] = {status: "failed", error: j.error || ("HTTP " + r.status)};
         updateSendSt(key); return;
       }
       document.getElementById("msgbox").value = "";
@@ -440,8 +452,8 @@ function bindNewBox(p){
               sid = h.session_id;
               enterSession();
             }else if(h && h.status === "exited"){
-              sendJob = {sid: key, jobId: j.job_id, status: "failed",
-                         error: "claude 进程已退出: " + (h.stderr_tail || []).slice(-3).join(" | ")};
+              sendJobs[key] = {jobId: j.job_id, status: "failed",
+                               error: "claude 进程已退出: " + (h.stderr_tail || []).slice(-3).join(" | ")};
               updateSendSt(key);
               break;
             }
@@ -451,13 +463,13 @@ function bindNewBox(p){
             enterSession();
           }
         }
-        sendJob = {sid: sid || key, jobId: j.job_id, status: jr.status, result: jr.result, error: jr.error};
+        sendJobs[sid || key] = {jobId: j.job_id, status: jr.status, result: jr.result, error: jr.error};
         updateSendSt(sid || key);
         if(jr.status === "running" || jr.status === "queued") continue;
         break;
       }
     }catch(e){
-      sendJob = {sid: sid || key, status: "failed", error: String(e)};
+      sendJobs[sid || key] = {status: "failed", error: String(e)};
       updateSendSt(sid || key);
     }
   };
@@ -490,7 +502,7 @@ function bindSendBox(id, d){
     // 已托管的会话 /sessions/<id>/message 会自动路由到常驻进程，无需再 POST /hosted
     const useHost = document.getElementById("hostcb").checked
       && !(d.hosted || sessions.find(s => s.id === id)?.hosted);
-    sendJob = {sid: id, status: "sending"};
+    sendJobs[id] = {status: "sending"};
     updateSendSt(id);
     try{
       const r = await fetchT(useHost ? "/hosted" : "/sessions/" + encodeURIComponent(id) + "/message", {
@@ -499,7 +511,7 @@ function bindSendBox(id, d){
       }, 30000);
       const j = await r.json();
       if(r.status !== 202){
-        sendJob = {sid: id, status: "failed", error: j.error || ("HTTP " + r.status)};
+        sendJobs[id] = {status: "failed", error: j.error || ("HTTP " + r.status)};
         updateSendSt(id); return;
       }
       const box = document.getElementById("msgbox");
@@ -507,8 +519,8 @@ function bindSendBox(id, d){
       for(;;){
         await new Promise(f => setTimeout(f, 1500));
         const jr = await (await fetchT("/jobs/" + encodeURIComponent(j.job_id), {}, 15000)).json();
-        sendJob = {sid: id, jobId: j.job_id, status: jr.status,
-                   result: jr.result, error: jr.error};
+        sendJobs[id] = {jobId: j.job_id, status: jr.status,
+                        result: jr.result, error: jr.error};
         updateSendSt(id);
         if(jr.status === "running" || jr.status === "queued") continue;
         break;
@@ -516,7 +528,7 @@ function bindSendBox(id, d){
       curPanel = null;   // 强制整体重渲染，更新托管标识
       load();   // 立即拉一次最新对话
     }catch(e){
-      sendJob = {sid: id, status: "failed", error: String(e)};
+      sendJobs[id] = {status: "failed", error: String(e)};
       updateSendSt(id);
     }
   };
