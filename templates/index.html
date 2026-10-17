@@ -28,9 +28,13 @@ select{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-
 aside{border-right:1px solid var(--bd);overflow-y:auto;padding:8px}
 main{overflow-y:auto;padding:12px 18px;min-width:0}
 /* 项目列表 */
-.pitem{padding:8px 10px;border-radius:8px;cursor:pointer;margin:2px 0;border:1px solid transparent}
+.pitem{padding:8px 10px;border-radius:8px;cursor:pointer;margin:2px 0;border:1px solid transparent;position:relative}
 .pitem:hover{background:var(--card)}
 .pitem.active{background:var(--card);border-color:var(--bd)}
+.newbtn{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;
+        border:1px solid var(--bd);border-radius:6px;color:var(--mut);cursor:pointer;
+        font-size:13px;line-height:1;padding:4px 8px}
+.newbtn:hover{border-color:var(--acc);color:var(--fg)}
 .pname{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pmeta{font-size:12px;color:var(--mut)}
 /* 会话卡片 */
@@ -186,6 +190,7 @@ function renderSidebar(projects){
       <div class="pname">${esc(projName(p.cwd))}
         ${p.working ? `<span class="b working">${p.working}</span>` : ""}</div>
       <div class="pmeta">${p.sessions.length} 会话${p.wt ? ` · ${p.wt} 子目录` : ""} · ${relTime(p.last)}</div>
+      <button class="newbtn" data-cwd="${esc(p.cwd)}" title="在此项目新建会话">＋</button>
     </div>`).join("") || '<div class="empty">暂无项目</div>';
 }
 
@@ -194,7 +199,8 @@ function renderSessionList(p){
   const main = document.getElementById("main");
   main.innerHTML = `
     <h2 style="font-size:16px;margin:4px 0">${esc(projName(p.cwd))}
-      <span class="mut">${esc(p.cwd)} · ${p.sessions.length} 会话 · 输出合计 ${fmtTok(p.out)} tok</span></h2>
+      <span class="mut">${esc(p.cwd)} · ${p.sessions.length} 会话 · 输出合计 ${fmtTok(p.out)} tok</span>
+      <button class="back" id="newp" style="float:right">＋ 新建会话</button></h2>
     ${p.sessions.map(s => `
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
@@ -333,6 +339,86 @@ function updateSendSt(id){
     && ["sending", "queued", "running"].includes(sendJob.status);
 }
 
+/* ---------- 新建会话（不依赖已有历史，走 /hosted 托管启动全新进程） ---------- */
+function renderNewSession(p){
+  const main = document.getElementById("main");
+  const draft = document.getElementById("msgbox")?.value || "";   // 刷新时保留输入框草稿
+  main.innerHTML = `
+    <button class="back" id="back">← 返回列表</button>
+    <h2 style="font-size:16px;margin:8px 0">新建会话 <span class="mut">${esc(p.cwd)}</span></h2>
+    <div class="info-panel">
+      <div class="mut" style="margin-bottom:6px">将在此目录启动一个全新的托管会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>
+      <textarea id="msgbox" rows="3" placeholder="输入首条消息…"
+        style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
+      <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <button class="back" id="sendbtn">创建并发送</button>
+      </div>
+      <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
+    </div>`;
+  document.getElementById("back").onclick = () => { view.new = false; renderMain(); };
+  document.getElementById("msgbox").value = draft;
+  bindNewBox(p);
+  updateSendSt("new:" + p.cwd);   // 恢复进行中任务的状态显示
+}
+
+function bindNewBox(p){
+  const btn = document.getElementById("sendbtn");
+  if(!btn) return;
+  btn.onclick = async () => {
+    const text = document.getElementById("msgbox").value.trim();
+    if(!text) return;
+    const key = "new:" + p.cwd;
+    sendJob = {sid: key, status: "sending"};
+    updateSendSt(key);
+    let sid = null;
+    try{
+      const r = await fetchT("/hosted", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({cwd: p.cwd, text}),
+      }, 30000);
+      const j = await r.json();
+      if(r.status !== 202){
+        sendJob = {sid: key, status: "failed", error: j.error || ("HTTP " + r.status)};
+        updateSendSt(key); return;
+      }
+      document.getElementById("msgbox").value = "";
+      for(;;){
+        await new Promise(f => setTimeout(f, 1500));
+        // 并行跟踪：任务状态 + 托管进程的 init 事件（后者几秒内就带上新 session id，不用等首轮跑完）
+        const [jrRes, hsRes] = await Promise.all([
+          fetchT("/jobs/" + encodeURIComponent(j.job_id), {}, 15000),
+          sid ? Promise.resolve(null) : fetchT("/hosted", {}, 15000),
+        ]);
+        const jr = await jrRes.json();
+        if(!sid){
+          const h = (await hsRes.json()).find(x => x.hosted_id === j.hosted_id);
+          if(h && h.session_id){
+            sid = h.session_id;
+            sendJob.sid = sid;   // 状态展示切到新会话的对话视图
+            if(view.new && view.project === p.cwd){
+              view = {project: p.cwd, session: sid, new: false};
+              convCache = {id: null, size: -1};
+              renderConversation(sid, true);   // 转录尚未被轮询发现时静默失败，稍后自动刷新补上
+            }
+          }else if(h && h.status === "exited"){
+            sendJob = {sid: key, jobId: j.job_id, status: "failed",
+                       error: "claude 进程已退出: " + (h.stderr_tail || []).slice(-3).join(" | ")};
+            updateSendSt(key);
+            break;
+          }
+        }
+        sendJob = {sid: sid || key, jobId: j.job_id, status: jr.status, result: jr.result, error: jr.error};
+        updateSendSt(sid || key);
+        if(jr.status === "running" || jr.status === "queued") continue;
+        break;
+      }
+    }catch(e){
+      sendJob = {sid: sid || key, status: "failed", error: String(e)};
+      updateSendSt(sid || key);
+    }
+  };
+}
+
 function bindSendBox(id, d){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
@@ -404,7 +490,10 @@ function renderMain(){
   renderSidebar(projects);   // 更新 active 高亮
   const p = projects.find(x => x.cwd === view.project);
   const main = document.getElementById("main");
-  if(p) renderSessionList(p);
+  if(p){
+    if(view.new){ renderNewSession(p); return; }
+    renderSessionList(p);
+  }
   else main.innerHTML = '<div class="empty">暂无会话</div>';
 }
 
@@ -437,6 +526,14 @@ function toggleDrawer(open){
 document.getElementById("menu").onclick = () => toggleDrawer(!asideEl.classList.contains("open"));
 maskEl.onclick = () => toggleDrawer(false);
 document.getElementById("projs").addEventListener("click", e => {
+  const nb = e.target.closest(".newbtn");
+  if(nb){
+    view = {project: nb.dataset.cwd, session: null, new: true};
+    convCache = {id: null, size: -1};
+    toggleDrawer(false);
+    renderMain();
+    return;
+  }
   const item = e.target.closest(".pitem");
   if(!item) return;
   view = {project: item.dataset.cwd, session: null};
@@ -445,9 +542,15 @@ document.getElementById("projs").addEventListener("click", e => {
   renderMain();
 });
 document.getElementById("main").addEventListener("click", e => {
+  if(e.target.closest("#newp")){
+    view = {project: view.project, session: null, new: true};
+    renderMain();
+    return;
+  }
   const card = e.target.closest(".scard");
   if(!card) return;
   view.session = card.dataset.id;
+  view.new = false;
   convCache = {id: null, size: -1};
   renderConversation(view.session, true);
 });
