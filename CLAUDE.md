@@ -34,6 +34,10 @@ uv run monitor.py --webhook http://localhost:3000/hook
 3. **HTTP 层**（`make_handler`，`ThreadingHTTPServer` + `BaseHTTPRequestHandler`）：
    `GET /` 渲染看板模板，`/sessions`、`/sessions/<id>`、`/sessions/<id>/messages` 返回 JSON，
    `/events` 是 SSE 流，`/static/` 提供静态文件。
+4. **远程发消息/托管**（`send_message` + `Hosted`）：`POST /sessions/<id>/message` 用
+   `claude -p --resume` 跑一轮（异步 job，`GET /jobs/<id>` 查询）；`POST /hosted` 启动
+   stream-json 双向的常驻 claude 进程，消息写 stdin、忙时排队，已托管会话的
+   message 请求自动路由到常驻进程。接口无鉴权，不要暴露到不可信网络。
 
 ### 关键设计决策
 
@@ -42,8 +46,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
   `by_sid`/`unique_sessions` 按 id 去重（取最近活跃的）。
 - **任务清单双来源**：从转录里的 `TaskCreate`/`TaskUpdate` 工具调用推断，但
   `~/.claude/tasks/<sid>/*.json` 目录存在时以它为准（`_merge_task_dirs`）。
-- **对话消息按需提取**（`extract_messages`）：不随轮询解析，只在请求
-  `/sessions/<id>/messages` 时读整个文件，按文件大小缓存（`Monitor.msg_cache`）；
+- **对话消息按需增量提取**（`parse_msg_line`）：不随轮询解析，只在请求
+  `/sessions/<id>/messages` 时解析；`Monitor.msg_cache` 记录每个文件的读取 offset、
+  半行 buffer、已解析消息和序列化字节，后续请求只解析新增部分；
   跳过 sidechain（子代理对话）和非错误工具结果。
 - **worktree 归并**（`project_root`）：`<proj>/.claude/worktrees/<name>` 视为属于 `<proj>`，
   看板按项目分组依赖此逻辑。
