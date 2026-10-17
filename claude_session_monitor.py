@@ -286,7 +286,11 @@ class Monitor:
                     self.emit(sess, "assistant_message", {"text": sess.last_assistant})
                 elif b.get("type") == "tool_use":
                     self._on_tool_use(sess, b)
-            sess.state = "idle" if msg.get("stop_reason") == "end_turn" else "working"
+            if obj.get("isSidechain"):
+                # 子代理（sidechain）在跑：即使它本回合 end_turn，主对话仍在等结果，不算空闲
+                sess.state = "working"
+            else:
+                sess.state = "idle" if msg.get("stop_reason") == "end_turn" else "working"
             if sess.state == "idle":
                 self.emit(sess, "turn_finished", {"last": sess.last_assistant})
 

@@ -20,6 +20,9 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
                                内部执行 `claude -p --resume <id>`（工作目录取会话的 cwd，
                                环境变量原样继承，所以自建 API / ANTHROPIC_BASE_URL 同样适用）
   GET /jobs/<job_id>           查询发消息任务的状态和回复 (queued / running / done / failed)
+  POST /new                    {"cwd": "<目录>", "text": "首条消息"} 在该目录跑一轮全新会话
+                               （不托管，每条消息重启一次 claude）；job 完成后
+                               result_session_id 即新会话 id
 
 托管会话（常驻 claude 进程，后续消息直接写 stdin，不再每次重启）:
   POST /hosted                 {"resume_id": "<已有会话id>" 或 "cwd": "<新建会话的目录>",
@@ -249,12 +252,23 @@ class Monitor:
         self.emit(sess, "remote_message_sent", {"job": job["id"], "text": job["text"]})
         cmd = [self.claude_bin, "-p", "--resume", sess.id, "--output-format", "json"] + self.claude_args
         print(f"[msg] job {job['id']} 会话 {sess.id} 开始: {job['text']}", flush=True)
+        self._exec(job, cmd, sess.cwd, text)
+        with self.lock:
+            self.busy.discard(sess.id)
+        print(f"[msg] job {job['id']} {job['status']}"
+              + (f": {job['error']}" if job["error"] else f" {clip(job['result'] or '', 120)}"), flush=True)
+        self.emit(sess, "remote_message_done", {"job": job["id"], "status": job["status"],
+                                                "error": job["error"],
+                                                "result": clip(job["result"] or "", 300)})
+
+    def _exec(self, job, cmd, cwd, text):
+        """同步跑一轮 `claude -p`，把结果写进 job（status/finished_at 在此收尾）。"""
         try:
             # 环境变量原样继承，所以 ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY 等自定义配置同样生效
             # 显式 utf-8：Windows 中文系统默认是 gbk，会把中文消息和回复弄乱
             p = subprocess.run(cmd, input=text, capture_output=True, text=True,
                                encoding="utf-8", errors="replace",
-                               cwd=sess.cwd, timeout=self.msg_timeout)
+                               cwd=cwd, timeout=self.msg_timeout)
             out = p.stdout.strip()
             try:
                 data = json.loads(out)
@@ -275,13 +289,23 @@ class Monitor:
         finally:
             job["status"] = "failed" if job["error"] else "done"
             job["finished_at"] = now_ts()
-            with self.lock:
-                self.busy.discard(sess.id)
-            print(f"[msg] job {job['id']} {job['status']}"
-                  + (f": {job['error']}" if job["error"] else f" {clip(job['result'] or '', 120)}"), flush=True)
-            self.emit(sess, "remote_message_done", {"job": job["id"], "status": job["status"],
-                                                    "error": job["error"],
-                                                    "result": clip(job["result"] or "", 300)})
+
+    def new_session(self, cwd, text):
+        """在 cwd 里用 `claude -p` 跑一轮全新会话（不托管，每条消息重启一次 claude）。
+        新会话 id 在 job 完成后由 result_session_id 带回。返回 (http_code, body)。"""
+        if not cwd or not os.path.isdir(cwd):
+            return 400, {"error": f"cwd unavailable: {cwd}"}
+        job = self._new_job(None, text)
+        job["status"] = "running"
+        threading.Thread(target=self._run_new_job, args=(cwd, job, text), daemon=True).start()
+        return 202, {"job_id": job["id"], "status": "running"}
+
+    def _run_new_job(self, cwd, job, text):
+        cmd = [self.claude_bin, "-p", "--output-format", "json"] + self.claude_args
+        print(f"[msg] job {job['id']} 新会话 (cwd={cwd}) 开始: {job['text']}", flush=True)
+        self._exec(job, cmd, cwd, text)
+        print(f"[msg] job {job['id']} {job['status']} 新会话={job['result_session_id']}"
+              + (f": {job['error']}" if job["error"] else ""), flush=True)
 
     def _new_job(self, sid, text):
         job = {"id": secrets.token_hex(6), "session": sid, "status": "queued",
@@ -366,6 +390,7 @@ class Monitor:
         typ = obj.get("type")
         msg = obj.get("message") or {}
         content = msg.get("content")
+        sidechain = bool(obj.get("isSidechain"))
 
         if typ == "ai-title":
             sess.title = obj.get("aiTitle") or sess.title
@@ -376,20 +401,22 @@ class Monitor:
             for b in blocks:
                 if b.get("type") == "tool_result":
                     self._on_tool_result(sess, b)
-                elif b.get("type") == "text" and b.get("text") and kind == "user":
+                elif b.get("type") == "text" and b.get("text") and kind == "user" and not sidechain:
+                    # sidechain 里的 user 行是子代理的提示词，不是真人输入，不计入
                     sess.user_msgs += 1
                     if sess.first_user is None:
                         sess.first_user = clip(b["text"], 80)
                     sess.last_user = clip(b["text"])
                     sess.state = "working"
                     self.emit(sess, "user_message", {"text": sess.last_user})
-            if any(b.get("type") == "tool_result" for b in blocks):
+            if any(b.get("type") == "tool_result" for b in blocks) or sidechain:
                 sess.state = "working"
 
         elif typ == "assistant":
-            sess.assistant_msgs += 1
-            if msg.get("model"):
-                sess.model = msg["model"]
+            if not sidechain:
+                sess.assistant_msgs += 1
+                if msg.get("model"):
+                    sess.model = msg["model"]
             usage = msg.get("usage") or {}
             sess.tokens["input"] += usage.get("input_tokens", 0)
             sess.tokens["output"] += usage.get("output_tokens", 0)
@@ -397,14 +424,18 @@ class Monitor:
             sess.tokens["cache_creation"] += usage.get("cache_creation_input_tokens", 0)
             blocks = content if isinstance(content, list) else []
             for b in blocks:
-                if b.get("type") == "text" and b.get("text"):
+                if b.get("type") == "text" and b.get("text") and not sidechain:
                     sess.last_assistant = clip(b["text"])
                     self.emit(sess, "assistant_message", {"text": sess.last_assistant})
                 elif b.get("type") == "tool_use":
                     self._on_tool_use(sess, b)
-            sess.state = "idle" if msg.get("stop_reason") == "end_turn" else "working"
-            if sess.state == "idle":
-                self.emit(sess, "turn_finished", {"last": sess.last_assistant})
+            if sidechain:
+                # 子代理（sidechain）在跑：即使它本回合 end_turn，主对话仍在等它的结果，不算空闲
+                sess.state = "working"
+            else:
+                sess.state = "idle" if msg.get("stop_reason") == "end_turn" else "working"
+                if sess.state == "idle":
+                    self.emit(sess, "turn_finished", {"last": sess.last_assistant})
 
     def _on_tool_use(self, sess, b):
         name, inp, tid = b.get("name"), b.get("input") or {}, b.get("id")
@@ -850,6 +881,15 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": "body must contain \"text\" (first message)"}, 400)
                 code, resp = mon.host_session(body.get("cwd"), body.get("resume_id"),
                                               text, bool(body.get("force")))
+                return self._json(resp, code)
+            if u.path == "/new":
+                body = self._read_body()
+                if body is None:
+                    return self._json({"error": "invalid JSON body"}, 400)
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    return self._json({"error": "body must contain \"text\" (first message)"}, 400)
+                code, resp = mon.new_session(body.get("cwd"), text)
                 return self._json(resp, code)
             parts = u.path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "message":

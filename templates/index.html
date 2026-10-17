@@ -130,6 +130,8 @@ const TASK_ZH = {pending: "待办", in_progress: "进行中", completed: "已完
 
 let sessions = [];                 // 最新概览数据
 let view = {project: null, session: null};   // 当前视图
+let curPanel = null;               // main 里已渲染的面板 {type:"list"|"conv"|"new", key}，
+                                   // 自动刷新只更新数据区域、不重建输入区，避免失焦/丢草稿
 let convCache = {id: null, size: -1};        // 对话缓存标记，避免重复渲染
 let timer = null;
 let sendJob = null;                // {sid, jobId, status, result, error} 发送任务状态，跨刷新保留
@@ -207,6 +209,7 @@ function renderSessionList(p){
     ${p.sessions.map(s => `
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
+        ${s.hosted ? '<span class="chip" title="消息直接写入常驻 claude 进程">⚙ 托管中</span>' : ""}
         <span class="stitle">${esc(sessTitle(s))}</span>
         <div class="mut">${[
           s.cwd !== s.project ? "⎇ " + projName(s.cwd) : null,
@@ -219,6 +222,7 @@ function renderSessionList(p){
         ].filter(Boolean).map(esc).join(" · ")}</div>
         <div class="mut" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.last_user_message || "")}</div>
       </div>`).join("")}`;
+  curPanel = {type: "list", key: p.cwd};
 }
 
 /* ---------- 渲染：会话详情 + 对话 ---------- */
@@ -272,9 +276,7 @@ async function renderConversation(id, force){
   if(!force && convLoading === id) return;
   convLoading = id;
   const main = document.getElementById("main");
-  const scrollTop = main.scrollTop;
-  const nearTop = main.scrollTop < 80;   // 倒序后最新消息在顶部
-  const draft = document.getElementById("msgbox")?.value || "";   // 刷新时保留输入框草稿
+  const draft = document.getElementById("msgbox")?.value || "";   // 整体重建面板时保留草稿
   try{
     const [dRes, mRes] = await Promise.all([
       fetch("/sessions/" + encodeURIComponent(id)),
@@ -282,36 +284,57 @@ async function renderConversation(id, force){
     ]);
     const d = await dRes.json(), m = await mRes.json();
     if(view.session !== id) return;   // 已切换走
-    if(force || convCache.id !== id || convCache.size !== m.size){
-      convCache = {id, size: m.size};
-      main.innerHTML = `
-        <button class="back" id="back">← 返回列表</button>
-        <h2 style="font-size:16px;margin:8px 0">
-          <span class="b ${d.state}">${STATE_ZH[d.state] || d.state}</span> ${esc(sessTitle(d))}
-          <span class="mut">${esc(d.cwd || "")}</span></h2>
-        <div class="info-panel">${infoHtml(d)}</div>
-        <div class="info-panel">
-          <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
-            style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
-          <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-            <button class="back" id="sendbtn">发送</button>
-            <label class="ctl"><input type="checkbox" id="forcecb"> 忽略 working 强制发送</label>
-            <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
-              <input type="checkbox" id="hostcb" ${d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
-            ${d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
-              <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
-          </div>
-          <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
-        </div>
-        <h4>对话 (${m.messages.length})</h4>
-        <div id="conv">${convHtml(m.messages.slice().reverse())}</div>`;
-      document.getElementById("back").onclick = () => { view.session = null; convCache = {id: null, size: -1}; renderMain(); };
-      document.getElementById("msgbox").value = draft;
-      bindSendBox(id, d);
-      updateSendSt(id);   // 恢复进行中任务的状态显示
-      if(force || nearTop) main.scrollTop = 0;
-      else main.scrollTop = scrollTop;
+    const keep = curPanel && curPanel.type === "conv" && curPanel.key === id
+                 && document.getElementById("conv");
+    if(d.error){   // 转录尚未被轮询发现（常见于刚创建的会话）
+      if(!keep) main.innerHTML = '<div class="empty">会话转录尚未就绪，稍候自动刷新…</div>';
+      return;
     }
+    if(keep){
+      // 该会话的面板已在页面上：只更新随刷新变化的部分（状态/信息/对话），
+      // 不动发送区，自动刷新不会打断正在输入的内容
+      const badge = document.getElementById("statebadge");
+      if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
+      if(force || convCache.id !== id || convCache.size !== m.size){
+        const nearTop = main.scrollTop < 80;   // 倒序后最新消息在顶部
+        convCache = {id, size: m.size};
+        document.getElementById("conv").innerHTML = convHtml(m.messages.slice().reverse());
+        document.getElementById("convcount").textContent = `对话 (${m.messages.length})`;
+        document.getElementById("infopanel").innerHTML = infoHtml(d);
+        if(force || nearTop) main.scrollTop = 0;
+      }
+      return;
+    }
+    convCache = {id, size: m.size};
+    main.innerHTML = `
+      <button class="back" id="back">← 返回列表</button>
+      <h2 style="font-size:16px;margin:8px 0">
+        <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
+        ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
+        ${esc(sessTitle(d))}
+        <span class="mut">${esc(d.cwd || "")}</span></h2>
+      <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
+      <div class="info-panel">
+        <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
+          style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
+        <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <button class="back" id="sendbtn">发送</button>
+          <label class="ctl"><input type="checkbox" id="forcecb"> 忽略 working 强制发送</label>
+          <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
+            <input type="checkbox" id="hostcb" ${d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
+          ${d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
+            <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
+        </div>
+        <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
+      </div>
+      <h4 id="convcount">对话 (${m.messages.length})</h4>
+      <div id="conv">${convHtml(m.messages.slice().reverse())}</div>`;
+    document.getElementById("back").onclick = () => { view.session = null; convCache = {id: null, size: -1}; renderMain(); };
+    document.getElementById("msgbox").value = draft;
+    bindSendBox(id, d);
+    updateSendSt(id);   // 恢复进行中任务的状态显示
+    main.scrollTop = 0;
+    curPanel = {type: "conv", key: id};
   }catch(e){ /* 下次刷新重试 */ }
   finally{ if(convLoading === id) convLoading = null; }
 }
@@ -331,7 +354,7 @@ function sendJobText(id){
   if(sendJob.status === "sending") return "发送中…";
   if(sendJob.status === "queued") return "排队中…";
   if(sendJob.status === "running") return "Claude 正在处理…";
-  if(sendJob.status === "done") return "回复:\n" + (sendJob.result || "");
+  if(sendJob.status === "done") return "已完成，回复见下方对话";
   if(sendJob.status === "failed") return "失败: " + (sendJob.error || "未知错误");
   return "";
 }
@@ -343,19 +366,25 @@ function updateSendSt(id){
     && ["sending", "queued", "running"].includes(sendJob.status);
 }
 
-/* ---------- 新建会话（不依赖已有历史，走 /hosted 托管启动全新进程） ---------- */
+/* ---------- 新建会话（不依赖已有历史；可选托管常驻进程或每次独立运行） ---------- */
 function renderNewSession(p){
   const main = document.getElementById("main");
-  const draft = document.getElementById("msgbox")?.value || "";   // 刷新时保留输入框草稿
+  if(curPanel && curPanel.type === "new" && curPanel.key === p.cwd && document.getElementById("msgbox")){
+    updateSendSt("new:" + p.cwd);   // 面板已在页面上：只更新状态行，不动输入框
+    return;
+  }
+  const draft = document.getElementById("msgbox")?.value || "";   // 整体重建面板时保留草稿
   main.innerHTML = `
     <button class="back" id="back">← 返回列表</button>
     <h2 style="font-size:16px;margin:8px 0">新建会话 <span class="mut">${esc(p.cwd)}</span></h2>
     <div class="info-panel">
-      <div class="mut" style="margin-bottom:6px">将在此目录启动一个全新的托管会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>
+      <div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>
       <textarea id="msgbox" rows="3" placeholder="输入首条消息…"
         style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
       <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <button class="back" id="sendbtn">创建并发送</button>
+        <label class="ctl" title="勾选后以常驻 claude 进程方式创建，之后的消息直接写进它的 stdin；不勾选则每条消息独立运行一次 claude">
+          <input type="checkbox" id="hostcb"> 托管（常驻进程，后续消息不再重启）</label>
       </div>
       <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
     </div>`;
@@ -363,6 +392,7 @@ function renderNewSession(p){
   document.getElementById("msgbox").value = draft;
   bindNewBox(p);
   updateSendSt("new:" + p.cwd);   // 恢复进行中任务的状态显示
+  curPanel = {type: "new", key: p.cwd};
 }
 
 function bindNewBox(p){
@@ -371,12 +401,21 @@ function bindNewBox(p){
   btn.onclick = async () => {
     const text = document.getElementById("msgbox").value.trim();
     if(!text) return;
+    const useHost = document.getElementById("hostcb").checked;
     const key = "new:" + p.cwd;
     sendJob = {sid: key, status: "sending"};
     updateSendSt(key);
     let sid = null;
+    const enterSession = () => {   // 拿到新 session id 后切换到对话视图
+      sendJob.sid = sid;
+      if(view.new && view.project === p.cwd){
+        view = {project: p.cwd, session: sid, new: false};
+        convCache = {id: null, size: -1};
+        renderConversation(sid, true);   // 转录尚未被轮询发现时先显示占位，稍后自动刷新补上
+      }
+    };
     try{
-      const r = await fetchT("/hosted", {
+      const r = await fetchT(useHost ? "/hosted" : "/new", {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({cwd: p.cwd, text}),
       }, 30000);
@@ -391,24 +430,25 @@ function bindNewBox(p){
         // 并行跟踪：任务状态 + 托管进程的 init 事件（后者几秒内就带上新 session id，不用等首轮跑完）
         const [jrRes, hsRes] = await Promise.all([
           fetchT("/jobs/" + encodeURIComponent(j.job_id), {}, 15000),
-          sid ? Promise.resolve(null) : fetchT("/hosted", {}, 15000),
+          useHost && !sid ? fetchT("/hosted", {}, 15000) : Promise.resolve(null),
         ]);
         const jr = await jrRes.json();
         if(!sid){
-          const h = (await hsRes.json()).find(x => x.hosted_id === j.hosted_id);
-          if(h && h.session_id){
-            sid = h.session_id;
-            sendJob.sid = sid;   // 状态展示切到新会话的对话视图
-            if(view.new && view.project === p.cwd){
-              view = {project: p.cwd, session: sid, new: false};
-              convCache = {id: null, size: -1};
-              renderConversation(sid, true);   // 转录尚未被轮询发现时静默失败，稍后自动刷新补上
+          if(useHost){
+            const h = (await hsRes.json()).find(x => x.hosted_id === j.hosted_id);
+            if(h && h.session_id){
+              sid = h.session_id;
+              enterSession();
+            }else if(h && h.status === "exited"){
+              sendJob = {sid: key, jobId: j.job_id, status: "failed",
+                         error: "claude 进程已退出: " + (h.stderr_tail || []).slice(-3).join(" | ")};
+              updateSendSt(key);
+              break;
             }
-          }else if(h && h.status === "exited"){
-            sendJob = {sid: key, jobId: j.job_id, status: "failed",
-                       error: "claude 进程已退出: " + (h.stderr_tail || []).slice(-3).join(" | ")};
-            updateSendSt(key);
-            break;
+          }else if(jr.result_session_id){
+            // 非托管模式下新会话 id 只在首轮跑完的结果里才有
+            sid = jr.result_session_id;
+            enterSession();
           }
         }
         sendJob = {sid: sid || key, jobId: j.job_id, status: jr.status, result: jr.result, error: jr.error};
@@ -436,6 +476,7 @@ function bindSendBox(id, d){
         const j = await r.json().catch(() => ({}));
         document.getElementById("sendst").textContent = "退出托管失败: " + (j.error || r.status);
       }
+      curPanel = null;   // 强制整体重渲染，更新托管标识
       load();   // 状态变为未托管
     }catch(e){
       document.getElementById("sendst").textContent = "退出托管错误: " + e;
@@ -472,6 +513,7 @@ function bindSendBox(id, d){
         if(jr.status === "running" || jr.status === "queued") continue;
         break;
       }
+      curPanel = null;   // 强制整体重渲染，更新托管标识
       load();   // 立即拉一次最新对话
     }catch(e){
       sendJob = {sid: id, status: "failed", error: String(e)};
