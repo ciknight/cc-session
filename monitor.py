@@ -67,6 +67,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from session_preferences import ModelPreferences, UNSET, default_model, model_args, validate_model
+from cc_switch import CCSwitch, SwitchError
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -97,6 +99,13 @@ def project_root(cwd):
         if idx > 0:
             return cwd[:idx]
     return cwd
+
+
+def path_is_within(path, root):
+    try:
+        return os.path.commonpath([os.path.normcase(str(path)), os.path.normcase(str(root))]) == os.path.normcase(str(root))
+    except ValueError:
+        return False
 
 
 class Session:
@@ -179,8 +188,11 @@ class Monitor:
         self.msg_timeout = 600
         self.jobs = {}             # job_id -> dict
         self.busy = set()          # 正在执行远程消息的 session id
+        self.new_cwd_busy = set()  # 尚未取得 session id 的新会话目录
         self.hosted = {}           # hosted_id -> Hosted（服务托管的常驻进程）
         self.hosted_by_sid = {}    # session id -> Hosted
+        self.preferences = ModelPreferences(CLAUDE_DIR / "claude-sessions" / "preferences.json")
+        self.cc_switch = CCSwitch(CLAUDE_DIR)
 
     def by_sid(self, sid):
         """按 session id 查找；同名取最近活跃的一个。"""
@@ -223,13 +235,58 @@ class Monitor:
     def project_of(self, sess, pmap):
         return pmap.get(project_root(sess.cwd))
 
+    def known_project_cwd(self, cwd):
+        if not isinstance(cwd, str) or not cwd:
+            return False
+        try:
+            target = Path(cwd).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            return False
+        with self.lock:
+            pmap = self.project_map()
+            known = {Path(s.cwd).expanduser().resolve() for s in self.sessions.values() if s.cwd}
+            known.update(Path(project_root(s.cwd)).expanduser().resolve()
+                         for s in self.sessions.values() if s.cwd)
+            known.update(Path(root).expanduser().resolve() for root in pmap.values() if root)
+            known.update(Path(h.cwd).expanduser().resolve() for h in self.hosted.values() if h.cwd)
+        return target in known and target.is_dir()
+
     # ---------- 远程给会话发消息 ----------
-    def send_message(self, sid, text, force=False):
-        """给会话发消息。若该会话已被托管，直接写入常驻进程；否则用
-        `claude -p --resume <sid>` 在会话的工作目录里跑一轮。返回 (http_code, body)。"""
+    def _selected_model(self, sid, model=UNSET):
+        if model is UNSET:
+            return self.preferences.get(sid)
+        model = validate_model(model)
+        self.preferences.set(sid, model)
+        return model
+
+    def send_message(self, sid, text, force=False, model=UNSET):
+        with self.lock:
+            h = self.hosted_by_sid.get(sid)
+            sess = self.by_sid(sid)
+        cwd = h.cwd if h and h.status != "exited" else sess.cwd if sess else None
+        if not sess and not h:
+            return 404, {"error": "session not found"}
+        if not cwd or not os.path.isdir(cwd):
+            return 400, {"error": f"session cwd unavailable: {cwd}"}
+        with self.cc_switch.operation(cwd):
+            return self._send_message_locked(sid, text, force, model)
+
+    def _send_message_locked(self, sid, text, force=False, model=UNSET):
+        """给会话发消息；model 是该会话后续发送的模型覆盖。"""
+        try:
+            selected = validate_model(self.preferences.get(sid) if model is UNSET else model)
+        except ValueError as e:
+            return 400, {"error": str(e)}
         h = self.hosted_by_sid.get(sid)
-        if h and h.alive():
-            return h.send(text)
+        if h and h.needs_rehost and h.status != "exited":
+            return 409, {"error": "项目 local 配置已更改；请退出托管后重新托管以加载新配置"}
+        if h and h.status != "exited" and (h.alive() or h.control_failed or h.stopping):
+            try:
+                if model is not UNSET:
+                    self.preferences.set(sid, selected)
+                return h.send(text, selected)
+            except ValueError as e:
+                return 500, {"error": str(e)}
         with self.lock:
             sess = self.by_sid(sid)
             if not sess:
@@ -242,15 +299,22 @@ class Monitor:
                 return 409, {"error": "session is working (maybe in use in a terminal); "
                                       "retry when idle, or pass force=true"}
             self.busy.add(sid)
-        # 注意：_new_job 内部也要拿 self.lock，必须在锁外调用（Lock 不可重入，锁内调会死锁）
-        job = self._new_job(sid, text)
+        try:
+            if model is not UNSET:
+                self.preferences.set(sid, selected)
+        except ValueError as e:
+            with self.lock:
+                self.busy.discard(sid)
+            return 500, {"error": str(e)}
+        job = self._new_job(sid, text, selected)
         job["status"] = "running"
-        threading.Thread(target=self._run_job, args=(sess, job, text), daemon=True).start()
+        threading.Thread(target=self._run_job, args=(sess, job, text, selected), daemon=True).start()
         return 202, {"job_id": job["id"], "status": "running"}
 
-    def _run_job(self, sess, job, text):
+    def _run_job(self, sess, job, text, selected_model=None):
         self.emit(sess, "remote_message_sent", {"job": job["id"], "text": job["text"]})
-        cmd = [self.claude_bin, "-p", "--resume", sess.id, "--output-format", "json"] + self.claude_args
+        cmd = [self.claude_bin, "-p", "--resume", sess.id, "--output-format", "json"]
+        cmd += model_args(self.claude_args, selected_model)
         print(f"[msg] job {job['id']} 会话 {sess.id} 开始: {job['text']}", flush=True)
         self._exec(job, cmd, sess.cwd, text)
         with self.lock:
@@ -290,26 +354,49 @@ class Monitor:
             job["status"] = "failed" if job["error"] else "done"
             job["finished_at"] = now_ts()
 
-    def new_session(self, cwd, text):
-        """在 cwd 里用 `claude -p` 跑一轮全新会话（不托管，每条消息重启一次 claude）。
-        新会话 id 在 job 完成后由 result_session_id 带回。返回 (http_code, body)。"""
-        if not cwd or not os.path.isdir(cwd):
+    def new_session(self, cwd, text, model=UNSET):
+        """在 cwd 启动一个全新会话；返回 job_id。"""
+        if not isinstance(cwd, str) or not cwd or not os.path.isdir(cwd):
             return 400, {"error": f"cwd unavailable: {cwd}"}
-        job = self._new_job(None, text)
-        job["status"] = "running"
-        threading.Thread(target=self._run_new_job, args=(cwd, job, text), daemon=True).start()
+        try:
+            selected = validate_model(None if model is UNSET else model)
+        except ValueError as e:
+            return 400, {"error": str(e)}
+        operation = self.cc_switch.operation(cwd)
+        with operation:
+            key = os.path.normcase(str(Path(cwd).resolve()))
+            with self.lock:
+                if key in self.new_cwd_busy:
+                    return 409, {"error": "该目录的新会话仍在运行，请稍后再试"}
+                self.new_cwd_busy.add(key)
+            job = self._new_job(None, text, selected)
+            job["status"] = "running"
+            threading.Thread(target=self._run_new_job, args=(cwd, job, text, selected, key), daemon=True).start()
         return 202, {"job_id": job["id"], "status": "running"}
 
-    def _run_new_job(self, cwd, job, text):
-        cmd = [self.claude_bin, "-p", "--output-format", "json"] + self.claude_args
-        print(f"[msg] job {job['id']} 新会话 (cwd={cwd}) 开始: {job['text']}", flush=True)
-        self._exec(job, cmd, cwd, text)
-        print(f"[msg] job {job['id']} {job['status']} 新会话={job['result_session_id']}"
-              + (f": {job['error']}" if job["error"] else ""), flush=True)
+    def _run_new_job(self, cwd, job, text, selected_model=None, cwd_key=None):
+        try:
+            cmd = [self.claude_bin, "-p", "--output-format", "json"]
+            cmd += model_args(self.claude_args, selected_model)
+            print(f"[msg] job {job['id']} 新会话 (cwd={cwd}) 开始: {job['text']}", flush=True)
+            self._exec(job, cmd, cwd, text)
+            sid = job.get("result_session_id")
+            if sid and selected_model is not None:
+                try:
+                    self.preferences.bind(sid, selected_model)
+                except ValueError as e:
+                    job["preference_error"] = str(e)
+            print(f"[msg] job {job['id']} {job['status']} 新会话={sid}"
+                  + (f": {job['error']}" if job["error"] else ""), flush=True)
+        finally:
+            if cwd_key:
+                with self.lock:
+                    self.new_cwd_busy.discard(cwd_key)
 
-    def _new_job(self, sid, text):
+    def _new_job(self, sid, text, selected_model=None):
         job = {"id": secrets.token_hex(6), "session": sid, "status": "queued",
                "started_at": now_ts(), "finished_at": None, "text": clip(text, 200),
+               "requested_model": selected_model,
                "result": None, "error": None, "result_session_id": None}
         with self.lock:
             self.jobs[job["id"]] = job
@@ -317,14 +404,28 @@ class Monitor:
                 self.jobs.pop(old, None)
         return job
 
-    def host_session(self, cwd, resume_id, text, force=False):
-        """启动并托管一个常驻 claude 进程；resume_id 为空则新建会话。返回 (http_code, body)。"""
+    def host_session(self, cwd, resume_id, text, force=False, model=UNSET):
+        with self.lock:
+            sess = self.by_sid(resume_id) if resume_id else None
+        target = cwd or (sess.cwd if sess else None)
+        if not isinstance(target, str) or not target or not os.path.isdir(target):
+            return 400, {"error": f"cwd unavailable: {target}"}
+        with self.cc_switch.operation(target):
+            return self._host_session_locked(cwd, resume_id, text, force, model)
+
+    def _host_session_locked(self, cwd, resume_id, text, force=False, model=UNSET):
+        """启动并托管常驻进程；resume_id 为空则新建会话。"""
+        try:
+            selected = validate_model(self.preferences.get(resume_id) if model is UNSET and resume_id
+                                     else None if model is UNSET else model)
+        except ValueError as e:
+            return 400, {"error": str(e)}
         with self.lock:
             sess = self.by_sid(resume_id) if resume_id else None
             if resume_id and not sess:
                 return 404, {"error": "session not found"}
             old = self.hosted_by_sid.get(resume_id) if resume_id else None
-            if old and old.alive():
+            if old and old.proc and old.proc.poll() is None:
                 return 409, {"error": "session is already hosted", "hosted_id": old.hid}
             if resume_id and resume_id in self.busy:
                 return 409, {"error": "a remote message is already running for this session"}
@@ -334,14 +435,22 @@ class Monitor:
             if sess and sess.summary(self.stale_after)["state"] == "working" and not force:
                 return 409, {"error": "session is working (maybe open in a terminal); "
                                       "close it first, or pass force=true"}
-        h = Hosted(self, cwd, resume_id)
+        if model is not UNSET and resume_id:
+            try:
+                self.preferences.set(resume_id, selected)
+            except ValueError as e:
+                return 500, {"error": str(e)}
+        h = Hosted(self, cwd, resume_id, selected)
         try:
             code, resp = h.start(text)
         except FileNotFoundError:
             return 500, {"error": f"找不到命令 {self.claude_bin!r}，请用 --claude-bin 指定路径"}
         except Exception as e:
             return 500, {"error": str(e)}
-        self.hosted[h.hid] = h
+        with self.lock:
+            self.hosted[h.hid] = h
+            if resume_id:
+                self.hosted_by_sid[resume_id] = h
         resp["hosted_id"] = h.hid
         print(f"[hosted] {h.hid} 启动 (cwd={cwd}, resume={resume_id or '新会话'})", flush=True)
         return code, resp
@@ -545,22 +654,35 @@ class Hosted:
     所以原有的监听逻辑无需改动。
     """
 
-    def __init__(self, mon, cwd, resume_id=None):
+    def __init__(self, mon, cwd, resume_id=None, selected_model=None):
         self.mon, self.cwd, self.resume_id = mon, cwd, resume_id
         self.hid = "h-" + secrets.token_hex(4)
         self.session_id = resume_id
+        self.selected_model = selected_model
+        self.process_model = selected_model if selected_model is not None else default_model(mon.claude_args)
         self.proc = None
-        self.lock = threading.Lock()
-        self.pending = deque()          # (text, job)
+        self.stderr_thread = None
+        self.lock = threading.RLock()
+        self.ready = threading.Condition(self.lock)
+        self.write_lock = threading.Lock()
+        self.pending = deque()          # (text, job, model)
         self.current = None             # 正在执行的 job
+        self.processing = False          # 正在控制握手/切换模型或等待本轮结果
         self.status = "starting"        # starting | running | exited
         self.returncode = None
         self.turns = 0
         self.started_at = now_ts()
         self.stderr_tail = deque(maxlen=30)
+        self.control_timeout = 60
+        self.control_seq = 0
+        self.control_waiters = {}
+        self.initialized = False
+        self.stopping = False
+        self.control_failed = False
+        self.needs_rehost = False
 
     def alive(self):
-        return self.proc is not None and self.status == "running"
+        return self.proc is not None and self.status == "running" and not self.stopping
 
     def _sess(self):
         with self.mon.lock:
@@ -571,38 +693,114 @@ class Hosted:
                "--output-format", "stream-json", "--verbose"]
         if self.resume_id:
             cmd += ["--resume", self.resume_id]
-        cmd += self.mon.claude_args
-        # 用二进制管道自己处理编码和换行，避免 Windows 把 \n 改成 \r\n、或用 gbk 编码
+        cmd += model_args(self.mon.claude_args, self.selected_model)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, cwd=self.cwd)
         self.status = "running"
         threading.Thread(target=self._read_out, daemon=True).start()
-        threading.Thread(target=self._read_err, daemon=True).start()
-        return self.send(first_text)
+        self.stderr_thread = threading.Thread(target=self._read_err, daemon=True)
+        self.stderr_thread.start()
+        threading.Thread(target=self._send_loop, daemon=True).start()
+        return self.send(first_text, self.selected_model)
 
-    def send(self, text):
-        if self.status == "exited":
-            return 409, {"error": "hosted process has exited"}
-        job = self.mon._new_job(self.session_id or self.hid, text)
-        with self.lock:
-            self.pending.append((text, job))
-            self._pump()
+    def send(self, text, model=None):
+        if self.needs_rehost:
+            return 409, {"error": "项目 local 配置已更改；请退出托管后重新托管以加载新配置"}
+        if self.status == "exited" or self.stopping or self.control_failed:
+            return 409, {"error": "hosted process is stopping or cannot safely continue; rehost it"}
+        try:
+            model = validate_model(model)
+        except ValueError as e:
+            return 400, {"error": str(e)}
+        job = self.mon._new_job(self.session_id or self.hid, text, model)
+        with self.ready:
+            if self.status == "exited" or self.stopping or self.control_failed:
+                job.update(status="failed", error="hosted process is stopping", finished_at=now_ts())
+                return 409, {"error": job["error"]}
+            self.pending.append((text, job, model))
+            self.ready.notify_all()
         return 202, {"job_id": job["id"], "status": job["status"], "hosted": self.hid}
 
-    def _pump(self):
-        """调用时已持有 self.lock。上一轮没结束就不发，等 result 再发。"""
-        if self.current is not None or not self.pending:
-            return
-        text, job = self.pending.popleft()
-        msg = {"type": "user", "message": {"role": "user", "content": text}}
-        try:
-            self.proc.stdin.write((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+    def _write(self, obj):
+        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        with self.write_lock:
+            self.proc.stdin.write(data)
             self.proc.stdin.flush()
+
+    def _control(self, subtype, **params):
+        with self.lock:
+            self.control_seq += 1
+            request_id = f"monitor-{self.hid}-{self.control_seq}"
+            event = threading.Event()
+            self.control_waiters[request_id] = {"event": event}
+        try:
+            self._write({"type": "control_request", "request_id": request_id,
+                         "request": {"subtype": subtype, **params}})
         except (BrokenPipeError, OSError) as e:
-            job.update(status="failed", error=f"写入失败: {e}", finished_at=now_ts())
-            return
-        job["status"] = "running"
-        self.current = job
+            with self.lock:
+                self.control_waiters.pop(request_id, None)
+            raise RuntimeError(f"控制请求写入失败: {e}") from e
+        if not event.wait(self.control_timeout):
+            with self.lock:
+                self.control_waiters.pop(request_id, None)
+            raise TimeoutError(f"控制请求超时: {subtype}")
+        with self.lock:
+            waiter = self.control_waiters.pop(request_id, {})
+        if waiter.get("error"):
+            raise RuntimeError(f"控制请求失败: {waiter['error']}")
+        return waiter.get("response", {})
+
+    def _send_loop(self):
+        try:
+            self._control("initialize", hooks=None)
+            self.initialized = True
+            while True:
+                with self.ready:
+                    while not self.pending and not self.stopping and self.status != "exited":
+                        self.ready.wait()
+                    if self.stopping or self.status == "exited":
+                        break
+                    text, job, model = self.pending.popleft()
+                    self.processing = True
+                try:
+                    target = model if model is not None else default_model(self.mon.claude_args)
+                    if target != self.process_model:
+                        self._control("set_model", model=target)
+                        self.process_model = target
+                    with self.ready:
+                        self.current = job
+                        job["status"] = "running"
+                    self._write({"type": "user", "message": {"role": "user", "content": text}})
+                except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
+                    job.update(status="failed", error=str(e), finished_at=now_ts())
+                    with self.ready:
+                        if self.current is job:
+                            self.current = None
+                        self.processing = False
+                        self.control_failed = isinstance(e, (TimeoutError, BrokenPipeError, OSError)) or "控制" in str(e)
+                        if self.control_failed:
+                            self.stopping = True
+                        self.ready.notify_all()
+                    if self.control_failed:
+                        break
+                    continue
+                with self.ready:
+                    self.ready.wait_for(lambda: self.current is not job or self.stopping or self.status == "exited")
+                    if self.current is job:
+                        self.current = None
+        except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
+            self.control_failed = True
+            self.stopping = True
+            print(f"[hosted] {self.hid} 控制失败: {e}", flush=True)
+        finally:
+            with self.ready:
+                self.processing = False
+                for _, job, _ in self.pending:
+                    job.update(status="failed", error="托管进程无法安全发送后续消息", finished_at=now_ts())
+                self.pending.clear()
+                self.ready.notify_all()
+            if self.control_failed and self.proc and self.proc.poll() is None:
+                self.proc.terminate()
 
     def _read_out(self):
         for raw in self.proc.stdout:
@@ -613,21 +811,47 @@ class Hosted:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if obj.get("type") == "system" and obj.get("subtype") == "init":
+            if obj.get("type") == "control_response":
+                response = obj.get("response") or {}
+                with self.ready:
+                    waiter = self.control_waiters.get(response.get("request_id"))
+                    if waiter:
+                        if response.get("subtype") == "success":
+                            waiter["response"] = response.get("response") or {}
+                        else:
+                            waiter["error"] = response.get("error") or "Claude 返回未知控制响应"
+                        waiter["event"].set()
+            elif obj.get("type") == "system" and obj.get("subtype") == "init":
                 self._on_init(obj.get("session_id"))
             elif obj.get("type") == "result":
                 self._on_result(obj)
             # 其余事件（assistant / thinking 等）转录文件里已有，这里不处理
         rc = self.proc.wait()
-        with self.lock:
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        if self.stderr_thread and self.stderr_thread is not threading.current_thread():
+            self.stderr_thread.join(timeout=1)
+        try:
+            if self.proc.stdout and not self.proc.stdout.closed:
+                self.proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+        with self.ready:
             self.status, self.returncode = "exited", rc
-            dead = ([self.current] if self.current else []) + [j for _, j in self.pending]
+            self.processing = False
+            dead = ([self.current] if self.current else []) + [j for _, j, _ in self.pending]
             self.current = None
             self.pending.clear()
             tail = " | ".join(list(self.stderr_tail)[-3:])
+            for waiter in self.control_waiters.values():
+                waiter["error"] = "claude 进程已退出"
+                waiter["event"].set()
             for job in dead:
                 job.update(status="failed", finished_at=now_ts(),
                            error=job["error"] or f"claude 进程已退出 (code {rc}) {tail}")
+            self.ready.notify_all()
         print(f"[hosted] {self.hid} 退出 code={rc} 会话={self.session_id}"
               + (f" stderr: {tail}" if tail else ""), flush=True)
         sess = self._sess()
@@ -635,20 +859,33 @@ class Hosted:
             self.mon.emit(sess, "hosted_exited", {"hosted": self.hid, "returncode": rc})
 
     def _read_err(self):
-        for raw in self.proc.stderr:
-            self.stderr_tail.append(raw.decode("utf-8", "replace").rstrip())
+        try:
+            for raw in self.proc.stderr:
+                self.stderr_tail.append(raw.decode("utf-8", "replace").rstrip())
+        finally:
+            try:
+                self.proc.stderr.close()
+            except (OSError, ValueError):
+                pass
 
     def _on_init(self, sid):
         if not sid:
             return
         self.session_id = sid
-        self.mon.hosted_by_sid[sid] = self
-        if self.resume_id:
-            self.mon.hosted_by_sid[self.resume_id] = self
+        with self.mon.lock:
+            self.mon.hosted_by_sid[sid] = self
+            if self.resume_id:
+                self.mon.hosted_by_sid[self.resume_id] = self
+        if self.selected_model is not None:
+            try:
+                self.mon.preferences.bind(sid, self.selected_model)
+            except ValueError:
+                pass
 
     def _on_result(self, obj):
-        with self.lock:
+        with self.ready:
             job, self.current = self.current, None
+            self.processing = False
             self.turns += 1
             if job:
                 job["result"] = obj.get("result")
@@ -657,7 +894,7 @@ class Hosted:
                     job["error"] = clip(obj.get("result") or obj.get("subtype") or "error", 500)
                 job["status"] = "failed" if job["error"] else "done"
                 job["finished_at"] = now_ts()
-            self._pump()
+            self.ready.notify_all()
         print(f"[hosted] {self.hid} 第 {self.turns} 轮完成 job={job['id'] if job else '-'}"
               + (" 失败: " + job["error"] if job and job["error"] else ""), flush=True)
         sess = self._sess()
@@ -670,6 +907,12 @@ class Hosted:
     def stop(self, kill=False):
         if self.proc is None or self.status == "exited":
             return
+        with self.ready:
+            self.stopping = True
+            self.ready.notify_all()
+            for _, job, _ in self.pending:
+                job.update(status="failed", error="托管进程退出中，消息未发送", finished_at=now_ts())
+            self.pending.clear()
         try:
             if kill:
                 self.proc.terminate()
@@ -684,7 +927,8 @@ class Hosted:
     def info(self):
         return {"hosted_id": self.hid, "session_id": self.session_id, "cwd": self.cwd,
                 "status": self.status, "pid": self.proc.pid if self.proc else None,
-                "busy": self.current is not None, "queued": len(self.pending),
+                "busy": self.current is not None or self.processing, "queued": len(self.pending),
+                "needs_rehost": self.needs_rehost,
                 "turns": self.turns, "returncode": self.returncode,
                 "started_at": self.started_at, "stderr_tail": list(self.stderr_tail)}
 
@@ -811,6 +1055,7 @@ def make_handler(mon, refresh_interval):
                     h = mon.hosted_by_sid.get(it["id"])
                     it["hosted"] = bool(h and h.alive())
                     it["hosted_id"] = h.hid if h else None
+                    it["selected_model"] = mon.preferences.get(it["id"])
                 return self._json(items)
             if u.path.startswith("/sessions/") and u.path.endswith("/messages"):
                 sid = u.path.split("/")[2]
@@ -847,12 +1092,21 @@ def make_handler(mon, refresh_interval):
                     if not s:
                         return self._json({"error": "not found"}, 404)
                     d = s.detail(mon.stale_after, mon.project_of(s, mon.project_map()))
+                d["selected_model"] = mon.preferences.get(sid)
                 h = mon.hosted_by_sid.get(sid)
                 d["hosted"] = bool(h and h.alive())
                 d["hosted_id"] = h.hid if h else None
                 return self._json(d)
             if u.path.startswith("/static/"):
                 return self._static(u.path[len("/static/"):])
+            if u.path == "/cc-switch":
+                cwd = parse_qs(u.query).get("cwd", [""])[0]
+                if not mon.known_project_cwd(cwd):
+                    return self._json({"error": "目标目录不属于已监控项目"}, 400)
+                try:
+                    return self._json(mon.cc_switch.status(cwd))
+                except SwitchError as e:
+                    return self._json({"error": e.message}, e.code)
             if u.path == "/hosted":
                 return self._json([h.info() for h in mon.hosted.values()])
             if u.path.startswith("/jobs/"):
@@ -869,37 +1123,102 @@ def make_handler(mon, refresh_interval):
             except (ValueError, json.JSONDecodeError):
                 return None
 
+        def _safe_json_write(self):
+            if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+                self._json({"error": "Content-Type 必须为 application/json"}, 415)
+                return False
+            site = self.headers.get("Sec-Fetch-Site", "").lower()
+            if site == "cross-site":
+                self._json({"error": "拒绝跨站写入请求"}, 403)
+                return False
+            origin = self.headers.get("Origin")
+            if origin:
+                parsed = urlparse(origin)
+                host = self.headers.get("Host", "")
+                if parsed.netloc.lower() != host.lower():
+                    self._json({"error": "Origin 与当前服务不匹配"}, 403)
+                    return False
+            return True
+
         def do_POST(self):
             u = urlparse(self.path)
             print(f"[http] {self.command} {self.path} 收到", flush=True)   # 请求到达即记录，响应见 log_request
+            if u.path == "/cc-switch/local":
+                if not self._safe_json_write():
+                    return
+                body = self._read_body()
+                if not isinstance(body, dict):
+                    return self._json({"error": "invalid JSON body"}, 400)
+                cwd, profile = body.get("cwd"), body.get("profile")
+                if not mon.known_project_cwd(cwd):
+                    return self._json({"error": "目标目录不属于已监控项目"}, 400)
+                target = Path(cwd).expanduser().resolve()
+                with mon.cc_switch.operation(cwd):
+                    with mon.lock:
+                        busy = (any(s.cwd and path_is_within(Path(s.cwd).expanduser().resolve(), target)
+                                    and s.id in mon.busy for s in mon.sessions.values())
+                                or any(path_is_within(p, target) for p in mon.new_cwd_busy))
+                        hosts = list(mon.hosted.values())
+                    busy = busy or any(h.cwd and path_is_within(Path(h.cwd).expanduser().resolve(), target)
+                                       and (h.current or h.pending or h.processing) for h in hosts)
+                    if busy:
+                        return self._json({"error": "该目录有消息正在执行或排队，请完成后再切换配置"}, 409)
+                    try:
+                        result = mon.cc_switch.apply(cwd, profile, body.get("revision"),
+                                                     confirm=body.get("confirm") is True)
+                    except SwitchError as e:
+                        return self._json({"error": e.message}, e.code)
+                    for h in hosts:
+                        try:
+                            if path_is_within(Path(h.cwd).expanduser().resolve(), target) and h.status != "exited":
+                                h.needs_rehost = True
+                        except OSError:
+                            continue
+                    return self._json(result)
             if u.path == "/hosted":
                 body = self._read_body()
-                if body is None:
+                if not isinstance(body, dict):
                     return self._json({"error": "invalid JSON body"}, 400)
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
                     return self._json({"error": "body must contain \"text\" (first message)"}, 400)
                 code, resp = mon.host_session(body.get("cwd"), body.get("resume_id"),
-                                              text, bool(body.get("force")))
+                                              text, bool(body.get("force")), body.get("model", UNSET))
                 return self._json(resp, code)
             if u.path == "/new":
                 body = self._read_body()
-                if body is None:
+                if not isinstance(body, dict):
                     return self._json({"error": "invalid JSON body"}, 400)
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
                     return self._json({"error": "body must contain \"text\" (first message)"}, 400)
-                code, resp = mon.new_session(body.get("cwd"), text)
+                code, resp = mon.new_session(body.get("cwd"), text, body.get("model", UNSET))
                 return self._json(resp, code)
             parts = u.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "model":
+                if not self._safe_json_write():
+                    return
+                body = self._read_body()
+                if not isinstance(body, dict) or "model" not in body:
+                    return self._json({"error": "body must contain model (string or null)"}, 400)
+                with mon.lock:
+                    sess = mon.by_sid(parts[1])
+                if not sess:
+                    return self._json({"error": "session not found"}, 404)
+                try:
+                    selected = mon.preferences.set(parts[1], body.get("model"))
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                return self._json({"selected_model": selected})
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "message":
                 body = self._read_body()
-                if body is None:
+                if not isinstance(body, dict):
                     return self._json({"error": "invalid JSON body"}, 400)
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
                     return self._json({"error": "body must be {\"text\": \"...\"}"}, 400)
-                code, resp = mon.send_message(parts[1], text, bool(body.get("force")))
+                code, resp = mon.send_message(parts[1], text, bool(body.get("force")),
+                                              body.get("model", UNSET))
                 return self._json(resp, code)
             self._json({"error": "not found"}, 404)
 

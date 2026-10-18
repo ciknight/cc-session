@@ -80,6 +80,11 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
          border:1px dashed var(--bd);border-radius:6px;padding:4px 8px;max-width:100%}
 .msg.tool,.msg.system{display:flex;flex-direction:column;align-items:flex-start}
 .info-panel{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 14px;margin:10px 0}
+.model-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
+.model-controls input{min-width:180px;max-width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px}
+.model-controls input[hidden]{display:none}
+.config-path{overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:12px;margin:3px 0}
+button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 /* 移动端：抽屉式侧栏 */
 #menu{display:none}
 #mask{display:none}
@@ -170,6 +175,155 @@ function md(text){
   return `<pre>${esc(text)}</pre>`;
 }
 
+/* ---------- 模型选择 / 项目 local 配置（不展示配置正文） ---------- */
+const modelDrafts = Object.create(null), ccStates = Object.create(null);
+function modelDraft(key, selected = null){
+  return modelDrafts[key] ||= {value: selected, custom: selected || "", status: "", version: 0};
+}
+function modelControlsHtml(){
+  return `<div class="model-controls"><label class="ctl">Web 选择
+    <select id="modelsel" aria-label="Web 模型选择"><option value="">默认（清除 Web 覆盖）</option>
+      <option value="opus">opus</option><option value="sonnet">sonnet</option><option value="haiku">haiku</option>
+      <option value="custom">自定义 ID</option></select></label>
+    <input id="modelcustom" aria-label="自定义模型 ID" placeholder="完整或自定义模型 ID" maxlength="256" hidden>
+    <span class="mut" id="modelst" role="status"></span></div>`;
+}
+function updateModelSt(key){
+  if(!panelMatch(key)) return;
+  const el = document.getElementById("modelst");
+  if(el) el.textContent = modelDraft(key).status;
+}
+async function saveModel(key){
+  const s = modelDraft(key);
+  s.version++;
+  if(s.saving) return;
+  s.saving = true;
+  try{
+    for(;;){
+      const version = s.version, model = s.value;
+      s.status = "保存中…"; updateModelSt(key);
+      try{
+        const r = await fetchT("/sessions/" + encodeURIComponent(key) + "/model", {
+          method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({model}),
+        });
+        const j = await r.json();
+        if(!r.ok || j.error) throw Error(j.error || "HTTP " + r.status);
+        s.status = "已保存，下次发送生效";
+      }catch(e){ s.status = "保存失败：" + e.message + "（可重选后重试）"; }
+      if(version === s.version) break; // 串行合并编辑，较早请求不能盖过最后的选择
+    }
+  }finally{ s.saving = false; updateModelSt(key); }
+}
+function bindModel(key, selected){
+  const s = modelDraft(key, selected), sel = document.getElementById("modelsel"), input = document.getElementById("modelcustom");
+  sel.value = s.choice || (s.value === null ? "" : ["opus", "sonnet", "haiku"].includes(s.value) ? s.value : "custom");
+  input.hidden = sel.value !== "custom"; input.value = s.custom;
+  const edit = save => {
+    if(!panelMatch(key)) return;
+    s.choice = sel.value;
+    input.hidden = sel.value !== "custom";
+    s.custom = input.value;
+    s.value = sel.value === "custom" ? input.value : sel.value || null;
+    if(sel.value === "custom" && !input.value){
+      s.status = "请输入自定义模型 ID"; updateModelSt(key); return;
+    }
+    if(save && !key.startsWith("new:")) saveModel(key);
+    else if(key.startsWith("new:")){ s.status = "随首次发送提交"; updateModelSt(key); }
+  };
+  sel.onchange = () => edit(true);
+  input.oninput = () => edit(false); // 刷新不覆盖尚未失焦的自定义编辑
+  input.onchange = () => edit(true);
+  updateModelSt(key);
+}
+function modelSnapshot(key){
+  const value = modelDraft(key).value;
+  if(value !== null && (!value || value.length > 256 || value.trim() !== value || /[\x00-\x1f\x7f]/.test(value))){
+    modelDraft(key).status = "请输入有效模型 ID（最多 256 字符，无首尾空白或控制字符）";
+    updateModelSt(key); return undefined;
+  }
+  return value;
+}
+function ccHtml(){
+  return `<details class="fold" id="ccpanel"><summary>项目 local 配置 · cc-switch</summary>
+    <div class="mut" id="ccbody" aria-live="polite"></div></details>`;
+}
+function ccMatch(cwd){
+  const el = document.getElementById("ccpanel");
+  if(!el || el.ccCwd !== cwd || !curPanel) return false;
+  return el.ccPanel === curPanel.type + ":" + curPanel.key;
+}
+function bindCc(cwd){
+  const el = document.getElementById("ccpanel");
+  el.ccCwd = cwd; el.ccPanel = curPanel.type + ":" + curPanel.key;
+  const s = ccStates[cwd] ||= {};
+  el.open = !!s.open;
+  el.ontoggle = () => {
+    if(!ccMatch(cwd)) return;
+    s.open = el.open;
+    if(el.open && !s.data && !s.pending) loadCc(cwd);
+  };
+  renderCc(cwd);
+}
+function renderCc(cwd){
+  if(!ccMatch(cwd)) return;
+  const s = ccStates[cwd], d = s.data;
+  const body = document.getElementById("ccbody");
+  body.innerHTML = `<div class="config-path">目录：${esc(d?.target_cwd || cwd)}</div>` +
+    (d ? `<div class="config-path">目标文件：${esc(d.target_path || "未提供")}</div>
+      <div>当前 profile：${esc(d.current_profile || "未设置")}</div>
+      <div class="model-controls"><select id="ccprofile" aria-label="local profile"></select>
+        <button class="back" id="ccapply">应用 local</button><button class="back" id="ccrefresh">刷新</button></div>
+      <div>${esc(!d.installed ? d.reason || "未安装 cc-switch，无法切换" : !d.available ? d.reason || "当前目录不可用" : "仅写入该目录 local；同目录会话共享。")}</div>` :
+      `<button class="back" id="ccrefresh">加载配置状态</button>`) +
+    `<div role="status" style="white-space:pre-wrap">${esc(s.pending ? "操作中…" : s.message || "")}</div>`;
+  const refresh = document.getElementById("ccrefresh");
+  refresh.disabled = !!s.pending; refresh.onclick = () => loadCc(cwd);
+  if(!d) return;
+  const sel = document.getElementById("ccprofile");
+  // 用 textContent / value 填入名称，不把外部名称拼进 HTML 属性
+  for(const name of d.profiles || []){
+    const option = document.createElement("option"); option.value = name; option.textContent = name; sel.appendChild(option);
+  }
+  s.profile = (d.profiles || []).includes(s.profile) ? s.profile : (d.profiles || []).includes(d.current_profile) ? d.current_profile : d.profiles?.[0] || "";
+  sel.value = s.profile;
+  sel.disabled = !!s.pending || !d.installed || !d.available;
+  sel.onchange = () => { if(ccMatch(cwd)) s.profile = sel.value; };
+  const apply = document.getElementById("ccapply");
+  apply.disabled = !!s.pending || !d.installed || !d.available || !s.profile || !d.revision || !d.target_path;
+  apply.onclick = () => applyCc(cwd);
+}
+async function loadCc(cwd){
+  const s = ccStates[cwd] ||= {};
+  if(s.pending) return;
+  s.pending = true; s.message = ""; renderCc(cwd);
+  try{
+    const r = await fetchT("/cc-switch?cwd=" + encodeURIComponent(cwd));
+    const d = await r.json();
+    if(!r.ok || d.error) throw Error(d.error || "HTTP " + r.status);
+    s.data = d;
+  }catch(e){ s.data = null; s.message = "加载失败：" + e.message; }
+  finally{ s.pending = false; renderCc(cwd); }
+}
+async function applyCc(cwd){
+  const s = ccStates[cwd], d = s?.data;
+  if(!d?.installed || !d.available || s.pending || !(d.profiles || []).includes(s.profile) || !d.target_path || !d.revision) return;
+  const profile = s.profile, revision = d.revision;
+  if(!window.confirm(`应用 profile：${profile}\n目标目录：${d.target_cwd}\n目标文件：${d.target_path}\n\n将整文件覆盖 local 配置；原文件存在时先自动备份。\n同目录的其他会话共享此配置。\n已有 Hosted 托管进程不会重启，也不会热切换；请退出后重新托管以加载。\n\n确定应用？`)) return;
+  s.pending = true; s.message = ""; renderCc(cwd);
+  try{
+    const r = await fetchT("/cc-switch/local", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({cwd, profile, confirm: true, revision})}, 60000);
+    const j = await r.json();
+    if(!r.ok || j.error) throw Error((j.error || "HTTP " + r.status) + (r.status === 409 ? "；请刷新状态后重新确认" : ""));
+    s.data = j;
+    s.message = "local 已写入，已有托管进程未重启，请退出后重新托管。" +
+      (j.backed_up ? "\n已备份原文件" + (j.backup_path ? "：" + j.backup_path : "") : "\n原文件不存在，无需备份。");
+  }catch(e){
+    s.message = "应用失败：" + e.message + "\n磁盘配置可能已改变，请刷新核实后再操作。";
+    s.data = null; // 不允许用旧 revision 再次确认
+  }finally{ s.pending = false; renderCc(cwd); }
+}
+
 /* ---------- 分组 ---------- */
 function groupByProject(){
   const groups = new Map();
@@ -207,6 +361,7 @@ function renderSessionList(p){
     <h2 style="font-size:16px;margin:4px 0">${esc(projName(p.cwd))}
       <span class="mut">${esc(p.cwd)} · ${p.sessions.length} 会话 · 输出合计 ${fmtTok(p.out)} tok</span>
       <button class="back" id="newp" style="float:right">＋ 新建会话</button></h2>
+    ${ccHtml()}
     ${p.sessions.map(s => `
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
@@ -224,6 +379,7 @@ function renderSessionList(p){
         <div class="mut" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.last_user_message || "")}</div>
       </div>`).join("")}`;
   curPanel = {type: "list", key: p.cwd};
+  bindCc(p.cwd);
 }
 
 /* ---------- 渲染：会话详情 + 对话 ---------- */
@@ -232,7 +388,7 @@ function infoHtml(d){
   const tools = Object.entries(d.tool_uses || {}).map(([k, v]) => `<span class="chip">${esc(k)} ×${v}</span>`).join("");
   return `
     <div class="grid">
-      <span>模型 <b>${esc(d.model || "?")}</b></span>
+      <span>最近响应 <b>${esc(d.model || "?")}</b></span>
       <span>分支 <b>${esc(d.git_branch || "?")}</b></span>
       <span>版本 <b>${esc(d.version || "?")}</b></span>
       <span>消息 <b>${d.user_msgs}/${d.assistant_msgs}</b></span>
@@ -296,6 +452,9 @@ async function renderConversation(id, force){
       // 不动发送区，自动刷新不会打断正在输入的内容
       const badge = document.getElementById("statebadge");
       if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
+      // 同面板 keep 分支只更新历史信息，模型输入和 local 控件不重建。
+      document.getElementById("infopanel").innerHTML = infoHtml(d);
+      updateModelSt(id);
       if(force || convCache.id !== id || convCache.size !== m.size){
         const nearTop = main.scrollTop < 80;   // 倒序后最新消息在顶部
         convCache = {id, size: m.size};
@@ -315,7 +474,9 @@ async function renderConversation(id, force){
         ${esc(sessTitle(d))}
         <span class="mut">${esc(d.cwd || "")}</span></h2>
       <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
+      ${ccHtml()}
       <div class="info-panel">
+        ${modelControlsHtml()}
         <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
           style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
         <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -334,6 +495,8 @@ async function renderConversation(id, force){
     document.getElementById("msgbox").value = draft;
     bindSendBox(id, d);
     curPanel = {type: "conv", key: id};
+    bindModel(id, d.selected_model);
+    bindCc(d.cwd);
     updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
     main.scrollTop = 0;
   }catch(e){ /* 下次刷新重试 */ }
@@ -390,6 +553,8 @@ function renderNewSession(p){
     <h2 style="font-size:16px;margin:8px 0">新建会话 <span class="mut">${esc(p.cwd)}</span></h2>
     <div class="info-panel">
       <div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>
+      ${ccHtml()}
+      ${modelControlsHtml()}
       <textarea id="msgbox" rows="3" placeholder="输入首条消息…"
         style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
       <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -403,6 +568,8 @@ function renderNewSession(p){
   document.getElementById("msgbox").value = draft;
   bindNewBox(p);
   curPanel = {type: "new", key: p.cwd};
+  bindModel("new:" + p.cwd, null);
+  bindCc(p.cwd);
   updateSendSt("new:" + p.cwd);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
 }
 
@@ -414,10 +581,13 @@ function bindNewBox(p){
     if(!text) return;
     const useHost = document.getElementById("hostcb").checked;
     const key = "new:" + p.cwd;
-    sendJobs[key] = {status: "sending"};
+    const selectedModel = modelSnapshot(key);
+    if(selectedModel === undefined) return;
+    sendJobs[key] = {status: "sending", requested_model: selectedModel};
     updateSendSt(key);
     let sid = null;
     const enterSession = () => {   // 拿到新 session id 后切换到对话视图
+      modelDrafts[sid] = {...modelDraft(key), value: selectedModel};
       sendJobs[sid] = sendJobs[key] || sendJobs[sid];   // 任务状态改挂到新会话 id 名下
       delete sendJobs[key];
       if(view.new && view.project === p.cwd){
@@ -429,7 +599,7 @@ function bindNewBox(p){
     try{
       const r = await fetchT(useHost ? "/hosted" : "/new", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({cwd: p.cwd, text}),
+        body: JSON.stringify({cwd: p.cwd, text, model: selectedModel}),
       }, 30000);
       const j = await r.json();
       if(r.status !== 202){
@@ -499,15 +669,17 @@ function bindSendBox(id, d){
     const text = document.getElementById("msgbox").value.trim();
     if(!text) return;
     const force = document.getElementById("forcecb").checked;
+    const selectedModel = modelSnapshot(id);
+    if(selectedModel === undefined) return;
     // 已托管的会话 /sessions/<id>/message 会自动路由到常驻进程，无需再 POST /hosted
     const useHost = document.getElementById("hostcb").checked
       && !(d.hosted || sessions.find(s => s.id === id)?.hosted);
-    sendJobs[id] = {status: "sending"};
+    sendJobs[id] = {status: "sending", requested_model: selectedModel};
     updateSendSt(id);
     try{
       const r = await fetchT(useHost ? "/hosted" : "/sessions/" + encodeURIComponent(id) + "/message", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(useHost ? {resume_id: id, text, force} : {text, force}),
+        body: JSON.stringify(useHost ? {resume_id: id, text, force, model: selectedModel} : {text, force, model: selectedModel}),
       }, 30000);
       const j = await r.json();
       if(r.status !== 202){
