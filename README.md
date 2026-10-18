@@ -45,7 +45,6 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
 - local 是目录级配置，同目录的其他会话也会受到后续启动影响。已有托管进程不会自动重启；应用后需退出托管并重新托管才能加载。会话模型选择、服务环境变量仍可能覆盖 profile 的模型设置。
 - 会话详情输入框按 Enter 发送，Shift+Enter 换行；输入法 composition 期间按 Enter 不会发送。新建会话首条输入框的键盘行为不变。
 - 主版服务默认监听 `0.0.0.0` 且没有身份认证。只能在可信网络使用；模型/配置接口不是凭据管理接口。不要将服务暴露给不可信网络。
-- `claude_session_monitor.py` 是独立部署的精简单文件版本，当前不支持 Web 模型选择和 cc-switch local UI。
 
 ## 接口
 
