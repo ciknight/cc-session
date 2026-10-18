@@ -36,11 +36,12 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
 
 ## 网页模型与项目配置
 
-- 会话详情中的“Web 选择”按 session ID 保存。选项包含默认和自定义模型 ID，以及从 `~/.cc-switch/profiles/*.json` 解析出的 profile 模型选项：显示名称取 profile 的 `name`，缺失或无效时使用文件名；模型 ID 优先取 `env.ANTHROPIC_MODEL`，该字段缺失时才取顶层 `model`。普通（非托管）会话将模型 ID 作为后续消息的 `--model` 参数；托管会话在轮次边界通过 `set_model` 切换。只保存和发送模型 ID，不应用 profile 的 local 配置，也不控制其他终端里的进程。
-- profile 解析只向前端提供模型选项的 `name` 和 `model` 字段；配置正文和 credentials 不传到前端。“最近响应”来自会话转录，表示最后一次实际记录的模型，与下一条消息的选择分开显示。显式 Web 选择优先于服务级 `--claude-args` 中的 `--model`；清除 Web 选择后恢复服务配置/Claude 默认规则。
+- 会话详情中的“模型选择”按 session ID 保存。选项包含默认和自定义模型 ID，以及仅从当前会话（新建时为目标项目）`cwd/.claude/settings.local.json` 的 `env` 中读取的 `OPUS_MODEL`、`SONNET_MODEL`、`HAIKU_MODEL`、`FABLE_MODEL` 对应值；各字段缺失时兼容 `ANTHROPIC_DEFAULT_<系列>_MODEL`。选项显示“系列: 模型 ID”；不读取其他 profile 或全局配置，不将通用 `env.ANTHROPIC_MODEL` 或顶层 `model` 当作系列模型。local 文件不存在、损坏或无有效系列字段时，仅保留默认和自定义选项。普通（非托管）会话将模型 ID 作为后续消息的 `--model` 参数；托管会话在轮次边界通过 `set_model` 切换。只保存和发送模型 ID，不应用 profile 的 local 配置，也不控制其他终端里的进程。
+- local 配置解析只向前端提供模型选项的 `name` 和 `model` 字段；配置正文和 credentials 不传到前端。“最近响应”来自会话转录，表示最后一次实际记录的模型，与下一条消息的选择分开显示。显式 Web 选择优先于服务级 `--claude-args` 中的 `--model`；清除 Web 选择后恢复服务配置/Claude 默认规则。
 - 托管会话在轮次边界通过 stream-json `set_model` 控制请求切换。控制失败或超时后不会把消息悄悄发给旧模型，托管进程需要退出并重新托管。
-- cc-switch local 配置控件仅在项目会话列表展示（会话详情和新建会话页不显示），且仅在已安装并可通过 PATH 找到 `cc-switch` 时启用。使用 cc-switch 的 `local <profile>` 命令写入显示的准确目录下 `.claude/settings.local.json`；服务端为模型选项解析 profile 文件，但不会把配置正文或 credentials 传到前端。
+- cc-switch local 配置控件仅在项目会话列表展示（会话详情和新建会话页不显示），且仅在已安装并可通过 PATH 找到 `cc-switch` 时启用。使用 cc-switch 的 `local <profile>` 命令写入显示的准确目录下 `.claude/settings.local.json`；服务端仅列出 profile 文件名供配置切换，模型选项则读取当前目录 local 配置，不会把配置正文或 credentials 传到前端。
 - cc-switch local 会整体覆盖目标文件，不合并原文件；应用前需确认，原文件会先备份到当前 Claude 配置目录下 `claude-sessions/backups/`。应用失败时保留备份，刷新检查磁盘状态后可人工恢复。配置目录不是默认 `~/.claude` 时会禁用切换，因为 cc-switch 不支持 `CLAUDE_CONFIG_DIR`。
+- cc-switch 调用失败时，服务终端会输出 `[cc-switch]` 安全诊断（失败阶段、退出码、系统错误号和可识别的原因类别）；浏览器也会提示非零退出码。CLI 原始输出和异常原文可能包含凭据，默认不记录、不返回。
 - local 是目录级配置，同目录的其他会话也会受到后续启动影响。已有托管进程不会自动重启；应用后需退出托管并重新托管才能加载。会话模型选择、服务环境变量仍可能覆盖 profile 的模型设置。
 - 会话详情输入框按 Enter 发送，Shift+Enter 换行；输入法 composition 期间按 Enter 不会发送。新建会话首条输入框的键盘行为不变。
 - 主版服务默认监听 `0.0.0.0` 且没有身份认证。只能在可信网络使用；模型/配置接口不是凭据管理接口。不要将服务暴露给不可信网络。

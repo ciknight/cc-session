@@ -88,6 +88,31 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(json.load(response), result)
         apply.assert_called_once_with(str(self.project), "safe", "rev1", confirm=True)
 
+    def test_profile_apply_failure_returns_safe_error_and_logs_exit_code(self):
+        from cc_switch import CCSwitch
+        import io
+        import subprocess
+
+        home = self.root / "home"
+        profiles = home / ".cc-switch" / "profiles"
+        profiles.mkdir(parents=True)
+        (profiles / "safe.json").write_text("{}", encoding="utf-8")
+        self.mon.cc_switch = CCSwitch(home / ".claude", home=home)
+        output = io.StringIO()
+        with (patch("cc_switch.shutil.which", return_value="cc-switch"),
+              patch("cc_switch.subprocess.run", return_value=subprocess.CompletedProcess(
+                  [], 3, stdout="secret-stdout", stderr="secret-stderr")),
+              patch("sys.stdout", output)):
+            with self.assertRaises(HTTPError) as error:
+                self.request("/cc-switch/local", {
+                    "cwd": str(self.project), "profile": "safe", "confirm": True, "revision": "absent",
+                }, {"Content-Type": "application/json"})
+            result = json.load(error.exception)
+        self.assertEqual(error.exception.code, 500)
+        self.assertEqual(set(result), {"error"})
+        self.assertIn("退出码=3", output.getvalue())
+        self.assertNotIn("secret", json.dumps(result) + output.getvalue())
+
     def test_profile_apply_rejects_cross_origin_before_delegation(self):
         with patch.object(self.mon.cc_switch, "apply") as apply:
             with self.assertRaises(HTTPError) as error:

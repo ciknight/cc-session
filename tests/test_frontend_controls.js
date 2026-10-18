@@ -111,6 +111,8 @@ test('会话模型控件保留默认和自定义，但不硬编码常规模型',
   const controls = b.run('modelControlsHtml()');
   assert.match(controls, /默认（清除 Web 覆盖）/);
   assert.match(controls, /自定义模型 ID/);
+  assert.match(controls, /aria-label="模型选择"/);
+  assert.doesNotMatch(controls, /Web 选择|Web 模型选择/);
   assert.doesNotMatch(controls, /<option value="(?:opus|sonnet|haiku)">/);
 });
 
@@ -130,6 +132,26 @@ test('profile 名称安全显示，选择后只将模型 ID POST 到偏好接口
   for(let i=0;i<8;i++) await Promise.resolve();
   assert.deepEqual(requests, [['/sessions/sid/model',{model:'vendor-sonnet'}]]);
   assert.equal(b.run('modelDraft("sid").value'),'vendor-sonnet');
+});
+
+test('四系列选项显示模型值，相同 ID 的不同系列仍可见并提交真实 ID', async () => {
+  const requests=[];
+  const b=boot(async(url, opts)=>{requests.push([url,JSON.parse(opts.body)]); return response({});});
+  b.run(`curPanel={type:"conv",key:"sid"}; modelDraft("sid", null);
+    updateModelOptions("sid", [
+      {name:"团队 · Opus: shared-id",model:"shared-id"},
+      {name:"团队 · Sonnet: shared-id",model:"shared-id"},
+      {name:"团队 · Haiku: fast-id",model:"fast-id"},
+      {name:"团队 · Fable: reasoning-id",model:"reasoning-id"}
+    ]); bindModel("sid", null);`);
+  const select=b.node('modelsel');
+  assert.deepEqual(select.options.filter(o=>o.dataset.kind==='profile').map(o=>o.textContent), [
+    '团队 · Opus: shared-id','团队 · Sonnet: shared-id','团队 · Haiku: fast-id','团队 · Fable: reasoning-id',
+  ]);
+  select.value='profile:3';
+  select.onchange();
+  for(let i=0;i<8;i++) await Promise.resolve();
+  assert.deepEqual(requests, [['/sessions/sid/model',{model:'reasoning-id'}]]);
 });
 
 test('profile ID 与自定义选择使用独立 key，选择恢复及自定义提交不混淆', async () => {

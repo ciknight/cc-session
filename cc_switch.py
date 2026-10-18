@@ -26,6 +26,37 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ABSENT = "absent"
 
 
+def _log_failure(stage, *, returncode=None, error=None, stderr=None):
+    """仅记录白名单摘要；CLI 输出和异常原文可能含完整配置与凭据。"""
+    fields = [f"[cc-switch] {stage}"]
+    if returncode is not None:
+        fields.append(f"退出码={returncode}")
+    if error is not None:
+        fields.append(f"异常类型={type(error).__name__}")
+        for key in ("errno", "winerror"):
+            value = getattr(error, key, None)
+            if isinstance(value, int):
+                fields.append(f"{key}={value}")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    if isinstance(stderr, str):
+        text = stderr.lower()
+        # 只将已知错误映射为固定提示，绝不复制原始匹配内容。
+        reasons = (
+            (("is not recognized as an internal or external command", "不是内部或外部命令"), "命令无法识别"),
+            (("enoent", "no such file or directory"), "文件或命令不存在"),
+            (("eacces", "eperm", "permission denied", "access is denied"), "访问被拒绝"),
+            (("syntaxerror", "invalid json", "unexpected token"), "配置或脚本解析失败"),
+        )
+        reason = next((hint for patterns, hint in reasons if any(p in text for p in patterns)),
+                      "未识别的 CLI 错误（原始输出已隐藏）")
+        fields.append(f"原因={reason}")
+    try:
+        print("；".join(fields), flush=True)
+    except (OSError, ValueError):
+        pass  # 诊断输出失败不得覆盖原来的切换错误。
+
+
 class CCSwitch:
     def __init__(self, claude_dir, home=None, command="cc-switch", timeout=30):
         self.claude_dir = Path(claude_dir).expanduser().resolve()
@@ -83,7 +114,9 @@ class CCSwitch:
                 raise SwitchError(503, "cc-switch 安装路径含不安全的命令行字符，请使用 PowerShell shim")
             shell = os.environ.get("COMSPEC", "cmd.exe")
             # 该 .cmd 是 PATH 中解析出的已安装命令，profile 已限于安全文件名。
-            return [shell, "/d", "/s", "/c", f'"{path}" local {profile}']
+            # CMD 命令体必须保留双层引号，不能让 subprocess 再按 argv 转义。
+            prefix = subprocess.list2cmdline([shell, "/d", "/s", "/c"])
+            return f'{prefix} ""{path}" local {profile}"'
         return [str(path), "local", profile]
 
     def status(self, cwd):
@@ -100,30 +133,8 @@ class CCSwitch:
                 )
                 if binary:
                     profiles = [p.stem for p in profile_files]
-                for profile_path in profile_files:
-                    try:
-                        data = json.loads(profile_path.read_text(encoding="utf-8"))
-                    except (OSError, UnicodeError, json.JSONDecodeError):
-                        continue
-                    if not isinstance(data, dict):
-                        continue
-                    name = data.get("name")
-                    if not isinstance(name, str) or not name:
-                        name = profile_path.stem
-                    env = data.get("env")
-                    if isinstance(env, dict) and "ANTHROPIC_MODEL" in env:
-                        model = env["ANTHROPIC_MODEL"]
-                    else:
-                        model = data.get("model")
-                    try:
-                        model = validate_model(model)
-                    except ValueError:
-                        continue
-                    if model is not None:
-                        model_options.append({"name": name, "model": model})
         except OSError:
             profiles = []
-            model_options = []
         available = self.claude_dir == (self.home / ".claude").resolve()
         reason = None
         if not binary:
@@ -136,8 +147,21 @@ class CCSwitch:
         if target.exists():
             try:
                 value = json.loads(target.read_text(encoding="utf-8"))
-                if isinstance(value, dict) and isinstance(value.get("_ccSwitchProfile"), str):
-                    current = value["_ccSwitchProfile"]
+                if isinstance(value, dict):
+                    if isinstance(value.get("_ccSwitchProfile"), str):
+                        current = value["_ccSwitchProfile"]
+                    env = value.get("env")
+                    if isinstance(env, dict):
+                        # 仅取当前目录 local 配置，不读取其他 profile 或全局配置的模型。
+                        for family in ("Opus", "Sonnet", "Haiku", "Fable"):
+                            key = f"{family.upper()}_MODEL"
+                            model = env.get(key) if key in env else env.get(f"ANTHROPIC_DEFAULT_{key}")
+                            try:
+                                model = validate_model(model)
+                            except ValueError:
+                                continue
+                            if model is not None:
+                                model_options.append({"name": f"{family}: {model}", "model": model})
             except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
         return {"installed": bool(binary), "available": bool(binary and available and profiles),
@@ -202,16 +226,21 @@ class CCSwitch:
                                       stdin=subprocess.DEVNULL, capture_output=True, timeout=self.timeout,
                                       text=True, encoding="utf-8", errors="replace", check=False)
             except subprocess.TimeoutExpired as exc:
+                _log_failure("执行超时", error=exc)
                 raise SwitchError(504, "cc-switch 执行超时；目标配置可能已改变，请刷新核实") from exc
             except OSError as exc:
+                _log_failure("无法启动命令", error=exc)
                 raise SwitchError(503, "无法运行已安装的 cc-switch 命令") from exc
             if proc.returncode:
-                raise SwitchError(500, "cc-switch 切换失败；目标配置可能已改变，请刷新核实")
+                _log_failure("CLI 执行失败", returncode=proc.returncode, stderr=proc.stderr)
+                raise SwitchError(500, f"cc-switch 切换失败（退出码 {proc.returncode}，详见服务端日志）；目标配置可能已改变，请刷新核实")
             try:
                 data = json.loads(target.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                _log_failure("目标配置无法读取或解析", error=exc)
                 raise SwitchError(500, "cc-switch 已退出，但目标配置无法验证；请刷新核实") from exc
             if not isinstance(data, dict) or data.get("_ccSwitchProfile") != profile:
+                _log_failure("目标 profile 不匹配")
                 raise SwitchError(500, "cc-switch 已退出，但目标 profile 与请求不一致；请刷新核实")
             result = self.status(str(project))
             result.update(backed_up=backed_up, backup_path=str(backup_path) if backup_path else None,

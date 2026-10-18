@@ -187,8 +187,8 @@ function modelChoiceFor(key, model){
   return index < 0 ? customModelChoice : profileModelChoice(index);
 }
 function modelControlsHtml(){
-  return `<div class="model-controls"><label class="ctl">Web 选择
-    <select id="modelsel" aria-label="Web 模型选择"><option value="default" data-kind="default">默认（清除 Web 覆盖）</option>
+  return `<div class="model-controls"><label class="ctl">模型选择
+    <select id="modelsel" aria-label="模型选择"><option value="default" data-kind="default">默认（清除 Web 覆盖）</option>
       <option value="custom" data-kind="custom">自定义 ID</option></select></label>
     <input id="modelcustom" aria-label="自定义模型 ID" placeholder="完整或自定义模型 ID" maxlength="256" hidden>
     <span class="mut" id="modelst" role="status"></span></div>`;
@@ -202,8 +202,10 @@ function updateModelOptions(key, options){
   const customValue = input.value;
   const unique = [], seen = new Set();
   for(const item of Array.isArray(options) ? options : []){
-    if(!item || typeof item.name !== "string" || typeof item.model !== "string" || !item.model || seen.has(item.model)) continue;
-    seen.add(item.model); unique.push({name: item.name, model: item.model});
+    if(!item || typeof item.name !== "string" || typeof item.model !== "string" || !item.model) continue;
+    const identity = JSON.stringify([item.name, item.model]);
+    if(seen.has(identity)) continue;
+    seen.add(identity); unique.push({name: item.name, model: item.model});
   }
   modelProfileOptions[key] = unique;
   const savedProfileChoice = state.value !== null && unique.some(item => item.model === state.value)
@@ -240,7 +242,7 @@ async function loadModelOptions(key, cwd){
     if(isCurrent()) updateModelOptions(key, data.model_options);
   }catch(e){
     if(!isCurrent()) return;
-    modelDraft(key).status = "profile 模型选项未加载，可使用默认或自定义模型 ID";
+    modelDraft(key).status = "local 配置模型选项未加载，可使用默认或自定义模型 ID";
     updateModelSt(key);
   }
 }
