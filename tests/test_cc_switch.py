@@ -22,6 +22,94 @@ class CCSwitchTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_status_returns_sanitized_profile_model_options(self):
+        profiles = self.home / ".cc-switch" / "profiles"
+        (profiles / "alias.json").write_text(
+            json.dumps({"name": "工作模型", "model": "sonnet",
+                        "env": {"ANTHROPIC_MODEL": "vendor-model"}, "api_key": "secret",
+                        "endpoint": "https://endpoint-sentinel.invalid"}),
+            encoding="utf-8",
+        )
+        (profiles / "fallback.json").write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+        with patch("cc_switch.shutil.which", return_value="cc-switch"):
+            result = self.app.status(str(self.project))
+
+        self.assertEqual(result["model_options"], [
+            {"name": "工作模型", "model": "vendor-model"},
+            {"name": "fallback", "model": "opus"},
+        ])
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("api_key", serialized)
+        self.assertNotIn("ANTHROPIC_MODEL", serialized)
+        self.assertNotIn('"env"', serialized)
+        self.assertNotIn("endpoint-sentinel", serialized)
+        self.assertNotIn('"endpoint"', serialized)
+
+    def test_status_skips_invalid_profile_models_without_invalid_env_fallback(self):
+        profiles = self.home / ".cc-switch" / "profiles"
+        (profiles / "invalid.json").write_text(json.dumps({"name": "无模型"}), encoding="utf-8")
+        (profiles / "bad-env.json").write_text(
+            json.dumps({"model": "should-not-fallback", "env": {"ANTHROPIC_MODEL": 7}}),
+            encoding="utf-8",
+        )
+        (profiles / "empty-env.json").write_text(
+            json.dumps({"model": "haiku", "env": {}}), encoding="utf-8"
+        )
+        with patch("cc_switch.shutil.which", return_value="cc-switch"):
+            result = self.app.status(str(self.project))
+
+        self.assertEqual(result["model_options"], [{"name": "empty-env", "model": "haiku"}])
+
+    def test_status_skips_malformed_and_non_object_profiles_and_falls_back_for_names(self):
+        profiles = self.home / ".cc-switch" / "profiles"
+        (profiles / "malformed.json").write_text("{not json", encoding="utf-8")
+        (profiles / "non-object.json").write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        (profiles / "empty-name.json").write_text(
+            json.dumps({"name": "", "model": "sonnet"}), encoding="utf-8"
+        )
+        (profiles / "non-string-name.json").write_text(
+            json.dumps({"name": 12, "model": "opus"}), encoding="utf-8"
+        )
+        with patch("cc_switch.shutil.which", return_value="cc-switch"):
+            result = self.app.status(str(self.project))
+
+        self.assertEqual(result["model_options"], [
+            {"name": "empty-name", "model": "sonnet"},
+            {"name": "non-string-name", "model": "opus"},
+        ])
+
+    def test_status_ignores_profile_read_error_without_exposing_exception(self):
+        profiles = self.home / ".cc-switch" / "profiles"
+        failing_profile = profiles / "read-error.json"
+        failing_profile.write_text(json.dumps({"model": "sonnet"}), encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path == failing_profile:
+                raise OSError("endpoint-read-error-sentinel")
+            return original_read_text(path, *args, **kwargs)
+
+        with (patch("cc_switch.shutil.which", return_value="cc-switch"),
+              patch.object(Path, "read_text", autospec=True, side_effect=read_text)):
+            result = self.app.status(str(self.project))
+
+        self.assertEqual(result["model_options"], [])
+        self.assertNotIn("endpoint-read-error-sentinel", json.dumps(result))
+
+    def test_model_options_remain_available_when_cc_switch_is_not_installed(self):
+        profiles = self.home / ".cc-switch" / "profiles"
+        (profiles / "model.json").write_text(
+            json.dumps({"name": "本地模型", "model": "vendor-model-id"}), encoding="utf-8"
+        )
+        with patch("cc_switch.shutil.which", return_value=None):
+            result = self.app.status(str(self.project))
+
+        self.assertEqual(result["model_options"], [{"name": "本地模型", "model": "vendor-model-id"}])
+        self.assertFalse(result["installed"])
+        self.assertFalse(result["available"])
+        self.assertEqual(result["profiles"], [])
+
     def test_status_only_lists_profile_names_and_revision(self):
         target = self.project / ".claude" / "settings.local.json"
         target.parent.mkdir()

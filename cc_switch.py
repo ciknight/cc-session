@@ -1,4 +1,4 @@
-"""对已安装 cc-switch CLI 的受限调用，不读取 profile 正文或凭据。"""
+"""对已安装 cc-switch CLI 的受限调用，仅向调用方暴露安全摘要。"""
 import hashlib
 import json
 import os
@@ -9,6 +9,8 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+from session_preferences import validate_model
 
 
 class SwitchError(Exception):
@@ -88,12 +90,40 @@ class CCSwitch:
         project, target = self._target(cwd)
         binary = self._binary()
         profiles = []
+        model_options = []
         try:
-            if binary and self.profile_dir.is_dir():
-                profiles = sorted(p.stem for p in self.profile_dir.glob("*.json")
-                                  if p.is_file() and not p.is_symlink() and _NAME.fullmatch(p.stem))
+            if self.profile_dir.is_dir():
+                profile_files = sorted(
+                    (p for p in self.profile_dir.glob("*.json")
+                     if p.is_file() and not p.is_symlink() and _NAME.fullmatch(p.stem)),
+                    key=lambda p: p.stem,
+                )
+                if binary:
+                    profiles = [p.stem for p in profile_files]
+                for profile_path in profile_files:
+                    try:
+                        data = json.loads(profile_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    name = data.get("name")
+                    if not isinstance(name, str) or not name:
+                        name = profile_path.stem
+                    env = data.get("env")
+                    if isinstance(env, dict) and "ANTHROPIC_MODEL" in env:
+                        model = env["ANTHROPIC_MODEL"]
+                    else:
+                        model = data.get("model")
+                    try:
+                        model = validate_model(model)
+                    except ValueError:
+                        continue
+                    if model is not None:
+                        model_options.append({"name": name, "model": model})
         except OSError:
             profiles = []
+            model_options = []
         available = self.claude_dir == (self.home / ".claude").resolve()
         reason = None
         if not binary:
@@ -111,8 +141,8 @@ class CCSwitch:
             except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
         return {"installed": bool(binary), "available": bool(binary and available and profiles),
-                "reason": reason, "profiles": profiles, "current_profile": current,
-                "target_cwd": str(project), "target_path": str(target),
+                "reason": reason, "profiles": profiles, "model_options": model_options,
+                "current_profile": current, "target_cwd": str(project), "target_path": str(target),
                 "revision": self._revision(target)}
 
     def operation(self, cwd):

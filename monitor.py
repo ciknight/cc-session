@@ -123,6 +123,7 @@ class Session:
         self.task_seq = 0
         self.pending_create = {}     # tool_use_id -> subject
         self.subagents = []          # Agent 工具调用: {type, description, ts}
+        self.active_agents = set()    # 尚未收到匹配 tool_result 的 Agent tool_use id
         self.tool_uses = Counter()   # 工具名 -> 次数
         self.tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
         self.user_msgs = 0
@@ -139,6 +140,8 @@ class Session:
         state = self.state
         if self.last_event_ts and now_ts() - self.last_event_ts > stale_after:
             state = "stale"
+        elif self.active_agents:
+            state = "working"
         done = sum(1 for t in self.tasks.values() if t["status"] == "completed")
         return {
             "id": self.id,
@@ -165,7 +168,7 @@ class Session:
     def detail(self, stale_after, project=None):
         d = self.summary(stale_after, project)
         d["tasks"] = list(self.tasks.values())
-        d["subagents"] = list(self.subagents)
+        d["subagents"] = sorted(self.subagents, key=lambda sub: sub.get("ts", 0), reverse=True)
         d["tool_uses"] = dict(self.tool_uses.most_common())
         d["recent_events"] = list(self.recent)
         return d
@@ -551,6 +554,8 @@ class Monitor:
         sess.tool_uses[name] += 1
         self.emit(sess, "tool_use", {"tool": name, "input": clip(inp, 200)})
         if name == "Agent":
+            if tid:
+                sess.active_agents.add(tid)
             sub = {"type": inp.get("subagent_type") or "general-purpose",
                    "description": clip(inp.get("description", ""), 120),
                    "ts": now_ts()}
@@ -575,6 +580,7 @@ class Monitor:
                                                  "subject": task["subject"]})
 
     def _on_tool_result(self, sess, b):
+        sess.active_agents.discard(b.get("tool_use_id"))
         if b.get("is_error"):
             self.emit(sess, "tool_error", {"tool_use_id": b.get("tool_use_id"),
                                            "error": clip(b.get("content", ""), 200)})

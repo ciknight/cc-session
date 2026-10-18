@@ -36,12 +36,13 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
 
 ## 网页模型与项目配置
 
-- 会话详情中的“Web 选择”按 session ID 保存，支持默认、`opus`、`sonnet`、`haiku` 或自定义模型 ID；它只影响通过看板发起的后续消息，不控制其他终端里的进程。
-- “最近响应”来自会话转录，表示最后一次实际记录的模型，与下一条消息的选择分开显示。显式 Web 选择优先于服务级 `--claude-args` 中的 `--model`；清除 Web 选择后恢复服务配置/Claude 默认规则。
+- 会话详情中的“Web 选择”按 session ID 保存。选项包含默认和自定义模型 ID，以及从 `~/.cc-switch/profiles/*.json` 解析出的 profile 模型选项：显示名称取 profile 的 `name`，缺失或无效时使用文件名；模型 ID 优先取 `env.ANTHROPIC_MODEL`，该字段缺失时才取顶层 `model`。普通（非托管）会话将模型 ID 作为后续消息的 `--model` 参数；托管会话在轮次边界通过 `set_model` 切换。只保存和发送模型 ID，不应用 profile 的 local 配置，也不控制其他终端里的进程。
+- profile 解析只向前端提供模型选项的 `name` 和 `model` 字段；配置正文和 credentials 不传到前端。“最近响应”来自会话转录，表示最后一次实际记录的模型，与下一条消息的选择分开显示。显式 Web 选择优先于服务级 `--claude-args` 中的 `--model`；清除 Web 选择后恢复服务配置/Claude 默认规则。
 - 托管会话在轮次边界通过 stream-json `set_model` 控制请求切换。控制失败或超时后不会把消息悄悄发给旧模型，托管进程需要退出并重新托管。
-- 项目 local profile 切换仅在已安装且可通过 PATH 找到 `cc-switch` 时启用。使用 cc-switch 的 `local <profile>` 命令写入显示的准确目录下 `.claude/settings.local.json`；不会读取 profile 正文或向浏览器传递凭据。
+- cc-switch local 配置控件仅在项目会话列表展示（会话详情和新建会话页不显示），且仅在已安装并可通过 PATH 找到 `cc-switch` 时启用。使用 cc-switch 的 `local <profile>` 命令写入显示的准确目录下 `.claude/settings.local.json`；服务端为模型选项解析 profile 文件，但不会把配置正文或 credentials 传到前端。
 - cc-switch local 会整体覆盖目标文件，不合并原文件；应用前需确认，原文件会先备份到当前 Claude 配置目录下 `claude-sessions/backups/`。应用失败时保留备份，刷新检查磁盘状态后可人工恢复。配置目录不是默认 `~/.claude` 时会禁用切换，因为 cc-switch 不支持 `CLAUDE_CONFIG_DIR`。
 - local 是目录级配置，同目录的其他会话也会受到后续启动影响。已有托管进程不会自动重启；应用后需退出托管并重新托管才能加载。会话模型选择、服务环境变量仍可能覆盖 profile 的模型设置。
+- 会话详情输入框按 Enter 发送，Shift+Enter 换行；输入法 composition 期间按 Enter 不会发送。新建会话首条输入框的键盘行为不变。
 - 主版服务默认监听 `0.0.0.0` 且没有身份认证。只能在可信网络使用；模型/配置接口不是凭据管理接口。不要将服务暴露给不可信网络。
 - `claude_session_monitor.py` 是独立部署的精简单文件版本，当前不支持 Web 模型选择和 cc-switch local UI。
 
@@ -57,7 +58,7 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
 | `GET /events` | SSE 实时事件流（`?session=<id>` 可过滤） |
 | `GET /healthz` | 健康检查 |
 | `POST /sessions/<id>/model` | 保存会话 Web 模型选择：`{"model":"sonnet"}`；传 `null` 清除覆盖 |
-| `GET /cc-switch?cwd=<目录>` | 获取该已监控目录的 cc-switch 可用状态、profile 名称及目标文件摘要 |
+| `GET /cc-switch?cwd=<目录>` | 获取该已监控目录的 cc-switch 可用状态、profile 名称、仅含 `name`/`model` 的安全模型选项及目标文件摘要 |
 | `POST /cc-switch/local` | 确认后备份并调用已安装 cc-switch：`{"cwd":"<目录>","profile":"<名称>","confirm":true,"revision":"<摘要>"}` |
 
 现有 `POST /sessions/<id>/message`、`POST /new`、`POST /hosted` 可选接受 `model` 字符串或 `null`。省略时使用该会话已保存的 Web 选择；新会话创建时通过该字段指定首轮模型。任务响应中的 `requested_model` 是本次提交的选择，不能当作服务端确认的实际响应模型。
@@ -74,9 +75,11 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
 
 会话状态：
 
-- `working` — 最近有活动，且最后一个事件不是"助手完成回复"
-- `idle` — 助手已完成回复（`stop_reason=end_turn`），等待用户输入
-- `stale` — 超过 `--stale` 秒没有任何更新（动态计算，不存状态）
+- `working` — 最近有活动，且最后一个事件不是"助手完成回复"；Agent 工具调用在收到与其 tool-use ID 匹配的 `tool_result` 前均视为活动，因此主助手轮次结束后仍可能处于 working。
+- `idle` — 助手已完成回复（`stop_reason=end_turn`），等待用户输入，且没有未完成的 Agent 工具调用。
+- `stale` — 超过 `--stale` 秒没有任何更新（动态计算，不存状态）；即使仍有未完成的 Agent 工具调用，若活动事件超过 stale 阈值，状态也为 stale。
+
+会话详情中的子代理记录按最新优先展示。
 
 ## 架构
 
@@ -104,7 +107,7 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
   `/sessions/<id>/messages` 时增量读取新增内容，保留半行并缓存序列化结果（`Monitor.msg_cache`）；
   跳过 sidechain（子代理对话）和非错误工具结果。
 - **会话模型选择独立于转录**：`session_preferences.py` 按 sid 保存 Web 覆盖；`Session.model` 仍表示最近实际响应模型。
-- **local profile 只通过已安装 cc-switch 应用**：`cc_switch.py` 仅列举名称、校验目标并先备份；不读取配置正文或自行实现 profile 合并。
+- **local profile 只通过已安装 cc-switch 应用**：`cc_switch.py` 为模型选项解析 profile JSON 并只输出 `name`/`model` 字段；local 配置仍由 cc-switch 应用，服务不自行实现 profile 合并，也不把配置正文或 credentials 传到前端。
 - **项目归并**：`<proj>/.claude/worktrees/<name>` 和 `<proj>/.worktrees/<name>` 视为属于 `<proj>`；
   `project_map()` 进一步把子目录里的会话归并到最外层祖先项目（如 `<proj>/web` → `<proj>`），
   看板按项目分组依赖此逻辑。

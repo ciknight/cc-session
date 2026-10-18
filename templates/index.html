@@ -176,17 +176,73 @@ function md(text){
 }
 
 /* ---------- 模型选择 / 项目 local 配置（不展示配置正文） ---------- */
-const modelDrafts = Object.create(null), ccStates = Object.create(null);
+const modelDrafts = Object.create(null), modelProfileOptions = Object.create(null), modelOptionRequests = Object.create(null), ccStates = Object.create(null);
 function modelDraft(key, selected = null){
   return modelDrafts[key] ||= {value: selected, custom: selected || "", status: "", version: 0};
 }
+const defaultModelChoice = "default", customModelChoice = "custom";
+function profileModelChoice(index){ return "profile:" + index; }
+function modelChoiceFor(key, model){
+  const index = (modelProfileOptions[key] || []).findIndex(item => item.model === model);
+  return index < 0 ? customModelChoice : profileModelChoice(index);
+}
 function modelControlsHtml(){
   return `<div class="model-controls"><label class="ctl">Web 选择
-    <select id="modelsel" aria-label="Web 模型选择"><option value="">默认（清除 Web 覆盖）</option>
-      <option value="opus">opus</option><option value="sonnet">sonnet</option><option value="haiku">haiku</option>
-      <option value="custom">自定义 ID</option></select></label>
+    <select id="modelsel" aria-label="Web 模型选择"><option value="default" data-kind="default">默认（清除 Web 覆盖）</option>
+      <option value="custom" data-kind="custom">自定义 ID</option></select></label>
     <input id="modelcustom" aria-label="自定义模型 ID" placeholder="完整或自定义模型 ID" maxlength="256" hidden>
     <span class="mut" id="modelst" role="status"></span></div>`;
+}
+function updateModelOptions(key, options){
+  const sel = document.getElementById("modelsel"), input = document.getElementById("modelcustom");
+  if(!sel || !input || !panelMatch(key)) return;
+  const state = modelDraft(key);
+  const selectedOption = Array.from(sel.options).find(option => option.value === sel.value);
+  const selectedKind = selectedOption?.dataset?.kind;
+  const customValue = input.value;
+  const unique = [], seen = new Set();
+  for(const item of Array.isArray(options) ? options : []){
+    if(!item || typeof item.name !== "string" || typeof item.model !== "string" || !item.model || seen.has(item.model)) continue;
+    seen.add(item.model); unique.push({name: item.name, model: item.model});
+  }
+  modelProfileOptions[key] = unique;
+  const savedProfileChoice = state.value !== null && unique.some(item => item.model === state.value)
+    ? modelChoiceFor(key, state.value) : null;
+  let selected = selectedKind === "custom"
+    ? (!state.touched && savedProfileChoice ? savedProfileChoice : customModelChoice)
+    : selectedKind === "profile" || state.value !== null
+      ? (savedProfileChoice || customModelChoice) : defaultModelChoice;
+  const add = (label, value, kind, model = "") => {
+    const option = document.createElement("option");
+    option.textContent = label; option.value = value; option.dataset.kind = kind;
+    if(model) option.dataset.model = model;
+    sel.appendChild(option);
+  };
+  sel.replaceChildren();
+  add("默认（清除 Web 覆盖）", defaultModelChoice, "default");
+  for(let i = 0; i < unique.length; i++){
+    const item = unique[i]; add(item.name, profileModelChoice(i), "profile", item.model);
+  }
+  add("自定义 ID", customModelChoice, "custom");
+  if(selected.startsWith("profile:") && !Array.from(sel.options).some(option => option.value === selected)) selected = customModelChoice;
+  sel.value = selected;
+  input.value = customValue;
+  input.hidden = selected !== customModelChoice;
+}
+async function loadModelOptions(key, cwd){
+  const generation = modelOptionRequests[key] = (modelOptionRequests[key] || 0) + 1;
+  const isCurrent = () => modelOptionRequests[key] === generation && panelMatch(key);
+  try{
+    const r = await fetchT("/cc-switch?cwd=" + encodeURIComponent(cwd || ""));
+    if(!r.ok) throw Error("HTTP " + r.status);
+    const data = await r.json();
+    if(!Array.isArray(data.model_options)) throw Error("响应缺少模型选项");
+    if(isCurrent()) updateModelOptions(key, data.model_options);
+  }catch(e){
+    if(!isCurrent()) return;
+    modelDraft(key).status = "profile 模型选项未加载，可使用默认或自定义模型 ID";
+    updateModelSt(key);
+  }
 }
 function updateModelSt(key){
   if(!panelMatch(key)) return;
@@ -216,23 +272,24 @@ async function saveModel(key){
 }
 function bindModel(key, selected){
   const s = modelDraft(key, selected), sel = document.getElementById("modelsel"), input = document.getElementById("modelcustom");
-  sel.value = s.choice || (s.value === null ? "" : ["opus", "sonnet", "haiku"].includes(s.value) ? s.value : "custom");
-  input.hidden = sel.value !== "custom"; input.value = s.custom;
+  sel.value = s.value === null ? defaultModelChoice : modelChoiceFor(key, s.value);
+  input.hidden = sel.value !== customModelChoice; input.value = s.custom;
   const edit = save => {
     if(!panelMatch(key)) return;
-    s.choice = sel.value;
-    input.hidden = sel.value !== "custom";
+    const option = Array.from(sel.options).find(item => item.value === sel.value);
+    const kind = option?.dataset?.kind;
+    input.hidden = kind !== "custom";
     s.custom = input.value;
-    s.value = sel.value === "custom" ? input.value : sel.value || null;
-    if(sel.value === "custom" && !input.value){
+    s.value = kind === "custom" ? input.value : kind === "profile" ? option.dataset.model : null;
+    if(kind === "custom" && !input.value){
       s.status = "请输入自定义模型 ID"; updateModelSt(key); return;
     }
     if(save && !key.startsWith("new:")) saveModel(key);
     else if(key.startsWith("new:")){ s.status = "随首次发送提交"; updateModelSt(key); }
   };
-  sel.onchange = () => edit(true);
-  input.oninput = () => edit(false); // 刷新不覆盖尚未失焦的自定义编辑
-  input.onchange = () => edit(true);
+  sel.onchange = () => { s.touched = true; edit(true); };
+  input.oninput = () => { s.touched = true; edit(false); }; // 异步选项加载不覆盖尚未失焦的自定义编辑
+  input.onchange = () => { s.touched = true; edit(true); };
   updateModelSt(key);
 }
 function modelSnapshot(key){
@@ -474,7 +531,6 @@ async function renderConversation(id, force){
         ${esc(sessTitle(d))}
         <span class="mut">${esc(d.cwd || "")}</span></h2>
       <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
-      ${ccHtml()}
       <div class="info-panel">
         ${modelControlsHtml()}
         <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
@@ -496,7 +552,7 @@ async function renderConversation(id, force){
     bindSendBox(id, d);
     curPanel = {type: "conv", key: id};
     bindModel(id, d.selected_model);
-    bindCc(d.cwd);
+    loadModelOptions(id, d.cwd);
     updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
     main.scrollTop = 0;
   }catch(e){ /* 下次刷新重试 */ }
@@ -553,7 +609,6 @@ function renderNewSession(p){
     <h2 style="font-size:16px;margin:8px 0">新建会话 <span class="mut">${esc(p.cwd)}</span></h2>
     <div class="info-panel">
       <div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>
-      ${ccHtml()}
       ${modelControlsHtml()}
       <textarea id="msgbox" rows="3" placeholder="输入首条消息…"
         style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
@@ -569,7 +624,7 @@ function renderNewSession(p){
   bindNewBox(p);
   curPanel = {type: "new", key: p.cwd};
   bindModel("new:" + p.cwd, null);
-  bindCc(p.cwd);
+  loadModelOptions("new:" + p.cwd, p.cwd);
   updateSendSt("new:" + p.cwd);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
 }
 
@@ -588,6 +643,7 @@ function bindNewBox(p){
     let sid = null;
     const enterSession = () => {   // 拿到新 session id 后切换到对话视图
       modelDrafts[sid] = {...modelDraft(key), value: selectedModel};
+      modelProfileOptions[sid] = modelProfileOptions[key] || [];
       sendJobs[sid] = sendJobs[key] || sendJobs[sid];   // 任务状态改挂到新会话 id 名下
       delete sendJobs[key];
       if(view.new && view.project === p.cwd){
@@ -648,6 +704,13 @@ function bindNewBox(p){
 function bindSendBox(id, d){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
+  const box = document.getElementById("msgbox");
+  if(box) box.addEventListener("keydown", event => {
+    if(event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229){
+      event.preventDefault();
+      btn.click();
+    }
+  });
   const un = document.getElementById("unhostbtn");
   if(un) un.onclick = async () => {
     if(!d.hosted_id) return;

@@ -55,14 +55,14 @@ class ExecutionTests(unittest.TestCase):
         self.mon.claude_args = ["--model=haiku", "--verbose"]
         completed = subprocess.CompletedProcess([], 0, json.dumps({"result": "ok"}), "")
         with patch.object(monitor.subprocess, "run", return_value=completed) as run:
-            code, response = self.mon.send_message("existing", "hello", model="custom")
+            code, response = self.mon.send_message("existing", "hello", model="vendor-model-7")
             self.assertEqual(code, 202)
             job = self.wait_done(response["job_id"])
-        self.assertEqual(job["requested_model"], "custom")
+        self.assertEqual(job["requested_model"], "vendor-model-7")
         cmd = run.call_args.args[0]
-        self.assertEqual(cmd[-1], "--model=custom")
+        self.assertEqual(cmd[-1], "--model=vendor-model-7")
         self.assertNotIn("--model=haiku", cmd)
-        self.assertEqual(self.mon.preferences.get("existing"), "custom")
+        self.assertEqual(self.mon.preferences.get("existing"), "vendor-model-7")
 
     def test_hosted_queue_keeps_model_snapshot(self):
         host, first = self.start_host(text="slow")
