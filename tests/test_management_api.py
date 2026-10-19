@@ -1,4 +1,5 @@
 import json
+import queue
 import tempfile
 import threading
 import unittest
@@ -121,6 +122,34 @@ class ManagementAPITests(unittest.TestCase):
                 }, {"Content-Type": "application/json", "Origin": "http://evil.invalid"})
         self.assertEqual(error.exception.code, 403)
         apply.assert_not_called()
+
+    def test_emit_transient_does_not_touch_recent_or_webhook(self):
+        self.mon.first_scan_done = True
+        self.mon.webhook = "http://invalid.example/hook"
+        q = queue.Queue()
+        self.mon.subscribers.append(q)
+        self.mon.emit(self.sess, "turn_delta", {"text": "hi"}, transient=True)
+        self.assertEqual(list(self.sess.recent), [])
+        event = q.get_nowait()
+        self.assertEqual(event["type"], "turn_delta")
+        self.assertEqual(event["seq"], 1)
+
+    def test_sse_connection_starts_with_snapshot(self):
+        response = urlopen(self.base + "/events", timeout=5)
+        lines = []
+        try:
+            while True:
+                line = response.readline().decode().rstrip("\n")
+                lines.append(line)
+                if line == "" and any(x.startswith("data:") for x in lines):
+                    break
+        finally:
+            response.close()
+        self.assertIn("event: snapshot", lines)
+        data = json.loads([x for x in lines if x.startswith("data:")][0][5:])
+        self.assertIn("sessions", data["data"])
+        self.assertIn("interactions", data["data"])
+        self.assertIsInstance(data["seq"], int)
 
     def test_interactions_endpoint(self):
         hosted = type("H", (), {"hid": "h1", "session_id": "sid-1"})()

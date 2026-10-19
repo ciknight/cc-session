@@ -217,6 +217,12 @@ class Monitor:
         self.webhook = webhook
         self.permission_timeout = permission_timeout
         self.interactions = {}       # request_id -> Interaction
+        self.hook_interactions = {}  # session+tool_use -> Interaction（AskUserQuestion 去重）
+        self.http_port = 0
+        self.hook_token = ""
+        self.event_seq = 0
+        self.event_lock = threading.Lock()
+        self.msg_lock = threading.Lock()
         self.lock = threading.Lock()
         self.subscribers = []      # list of queue.Queue
         self.first_scan_done = False
@@ -562,17 +568,24 @@ class Monitor:
         return 200, inter.public()
 
     # ---------- 事件分发 ----------
-    def emit(self, sess, kind, data):
+    def next_seq(self):
+        with self.event_lock:
+            self.event_seq += 1
+            return self.event_seq
+
+    def emit(self, sess, kind, data, transient=False):
         if not self.first_scan_done:   # 首次扫描只回放历史状态，不推送
             return
-        ev = {"ts": now_ts(), "session": sess.id, "type": kind, "data": data}
-        sess.recent.append(ev)
+        ev = {"ts": now_ts(), "seq": self.next_seq(),
+              "session": sess.id if sess else None, "type": kind, "data": data}
+        if not transient and sess is not None:
+            sess.recent.append(ev)
         for q in list(self.subscribers):
             try:
                 q.put_nowait(ev)
             except queue.Full:
                 pass
-        if self.webhook:
+        if self.webhook and not transient:
             threading.Thread(target=self._post, args=(ev,), daemon=True).start()
 
     def _post(self, ev):
@@ -1866,14 +1879,57 @@ def make_handler(mon, refresh_interval):
             self.end_headers()
             self.wfile.write(body)
 
+        def _snapshot(self, only):
+            if only:
+                with mon.lock:
+                    s = mon.by_sid(only)
+                    detail = (s.detail(mon.stale_after, mon.project_of(s, mon.project_map()))
+                              if s else None)
+                h = mon.hosted_by_sid.get(only)
+                data = {
+                    "session": detail,
+                    "interactions": mon.pending_interactions(only),
+                    "live": {
+                        "session_id": only,
+                        "active": bool(h and h.alive()
+                                       and (h.current or h.processing)),
+                        "text": getattr(h, "stream_text", "") if h else "",
+                    },
+                }
+            else:
+                with mon.lock:
+                    pmap = mon.project_map()
+                    sessions = sorted(
+                        (s.summary(mon.stale_after, mon.project_of(s, pmap))
+                         for s in mon.unique_sessions()),
+                        key=lambda x: x["last_input_at"] or x["last_event_at"],
+                        reverse=True)
+                    counts = Counter(i.session_id for i in mon.interactions.values()
+                                     if i.state == "pending")
+                for item in sessions:
+                    item["pending_interactions"] = counts.get(item["id"], 0)
+                    h = mon.hosted_by_sid.get(item["id"])
+                    item["hosted"] = bool(h and h.alive())
+                    item["hosted_id"] = h.hid if h else None
+                data = {"sessions": sessions, "interactions": mon.pending_interactions()}
+            return {"ts": now_ts(), "seq": mon.next_seq(), "session": only,
+                    "type": "snapshot", "data": data}
+
         def _sse(self, only):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             q = queue.Queue(maxsize=1000)
             mon.subscribers.append(q)
             try:
+                self.wfile.write(b"retry: 3000\n\n")
+                snap = self._snapshot(only)
+                self.wfile.write(
+                    f"id: {snap['seq']}\nevent: snapshot\ndata: "
+                    f"{json.dumps(snap, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
                 while True:
                     try:
                         ev = q.get(timeout=15)
@@ -1883,7 +1939,9 @@ def make_handler(mon, refresh_interval):
                         continue
                     if only and ev["session"] != only:
                         continue
-                    self.wfile.write(f"event: {ev['type']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.write(
+                        f"id: {ev.get('seq', 0)}\nevent: {ev['type']}\ndata: "
+                        f"{json.dumps(ev, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
