@@ -139,6 +139,15 @@ class SessionStateTests(unittest.TestCase):
                   origin={"kind": "coordinator"}, timestamp=self.timestamp(self.now))
         self.assertIsNone(self.sess.last_input_ts)
 
+    def test_sdk_and_typed_prompt_sources_are_real_input(self):
+        for i, source in enumerate(("sdk", "typed", "queued")):
+            self.line("user", [{"type": "text", "text": "real"}],
+                      promptSource=source, timestamp=self.timestamp(self.now + i))
+            self.assertEqual(self.sess.last_input_ts, self.now + i)
+        self.line("user", [{"type": "text", "text": "system"}],
+                  promptSource="system", timestamp=self.timestamp(self.now + 10))
+        self.assertEqual(self.sess.last_input_ts, self.now + 2, "system 注入不应推进 last_input")
+
     def test_pending_tool_keeps_working_after_end_turn(self):
         self.line("user", [{"type": "text", "text": "go"}])
         self.line("assistant", [{"type": "tool_use", "id": "tool-1", "name": "Bash",

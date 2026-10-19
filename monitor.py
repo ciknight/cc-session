@@ -11,6 +11,10 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
   GET /sessions               所有会话概览（?full=1 时含任务、子代理、最近事件等完整信息）
   GET /sessions/<id>          按 id 取单个会话完整信息
   GET /sessions/<id>/messages 按需解析该会话的完整对话（带缓存，跳过 sidechain 子代理对话）
+  GET /interactions           待审批的权限请求（?session=<id> 可过滤）
+  POST /interactions/<id>/respond 审批 {"behavior":"allow|deny","scope":"once|always"}
+  POST /sessions/<id>/interrupt   中断托管会话当前回合并清空排队消息
+  POST /sessions/<id>/approval    设置审批模式 {"approval":"ask|auto|full"}
   GET /static/<file>          前端静态资源（marked / DOMPurify）
   GET /events                 SSE 实时事件流（?session=<id> 可过滤）
   GET /healthz                健康检查
@@ -26,11 +30,14 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
 
 托管会话（常驻 claude 进程，后续消息直接写 stdin，不再每次重启）:
   POST /hosted                 {"resume_id": "<已有会话id>" 或 "cwd": "<新建会话的目录>",
-                               "text": "第一条消息", "force": false}
+                               "text": "第一条消息", "force": false,
+                               "approval": "ask|auto|full"}
                                之后给该会话 POST /sessions/<id>/message 会自动走常驻进程，
                                模型忙时消息排队，一轮结束再发下一条
-  GET /hosted                  托管进程列表（状态、是否忙、排队数、轮数）
+  GET /hosted                  托管进程列表（状态、是否忙、排队数、审批模式、轮数）
   DELETE /hosted/<hid>         正常退出（做完当前一轮）；加 ?kill=1 立即终止
+  托管进程带 --permission-prompt-tool stdio：ask 模式在网页审批，auto 交给 CLI，
+  full 自动放行；超时（--permission-timeout，默认 300 秒）自动拒绝。
   注意: 要托管已有会话，先在终端里把它退出，避免两个进程同时写一个会话。
 
 接口无鉴权，发消息/托管可远程执行 claude，请只在可信网络内暴露。
@@ -41,9 +48,10 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
   工具调用统计、子代理(Agent 工具)列表、任务清单(TaskCreate/TaskUpdate 或 tasks 目录)
 
 会话状态:
-  working  最近有活动，且最后一个事件不是"助手完成回复"
-  idle     助手已完成回复（stop_reason=end_turn），等待用户输入
-  stale    超过 --stale 秒没有任何更新
+  working  有用户输入/工具调用/子代理活动，或仍有未完成的工具调用
+  idle     收到 system/turn_duration（回退：从未出现该标记时才用 stop_reason=end_turn）
+  stale    超过 --stale 秒没有任何内容事件
+  双时钟: last_input_ts 只由真实用户输入推进；last_event_ts 取最后一条带时间戳的事件。
 
 用法:
   python monitor.py                      # 监听默认目录
@@ -650,7 +658,7 @@ class Monitor:
             sess.tokens["cache_creation"] += usage.get("cache_creation_input_tokens", 0)
             ctx = (usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
                    + usage.get("cache_read_input_tokens", 0) + usage.get("output_tokens", 0))
-            if ctx > 0:
+            if ctx > 0 and not sidechain:
                 sess.context_tokens = ctx
             blocks = content if isinstance(content, list) else []
             for b in blocks:
@@ -759,6 +767,8 @@ class Monitor:
             return
         with self.lock:
             for sess in self.sessions.values():
+                if sess.is_subagent:
+                    continue
                 d = troot / sess.id
                 if not d.is_dir():
                     continue
@@ -918,6 +928,8 @@ class Hosted:
                     if self.stopping or self.status == "exited":
                         break
                     text, job, model = self.pending.popleft()
+                    self.current = job
+                    job["status"] = "running"
                     self.processing = True
                 try:
                     target = model if model is not None else default_model(self.mon.claude_args)
@@ -925,10 +937,13 @@ class Hosted:
                         self._control("set_model", model=target)
                         self.process_model = target
                     with self.ready:
-                        self.current = job
-                        job["status"] = "running"
+                        cancelled = (self.interrupting or self.stopping
+                                     or self.status == "exited")
+                    if cancelled:
+                        self._finish_job(job, "cancelled")
+                        continue
                     self._write({"type": "user", "uuid": job.get("command_uuid"),
-                             "message": {"role": "user", "content": text}})
+                                 "message": {"role": "user", "content": text}})
                 except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
                     job.update(status="failed", error=str(e), finished_at=now_ts())
                     with self.ready:
@@ -1047,6 +1062,8 @@ class Hosted:
             return
         old = self.session_id
         self.session_id = sid
+        if old and old != sid and not self.resume_id:
+            print(f"[hosted] {self.hid} session id 不一致: 预生成 {old}, init {sid}", flush=True)
         with self.mon.lock:
             self.mon.hosted_by_sid[sid] = self
             if self.resume_id:
@@ -1205,6 +1222,11 @@ class Hosted:
             if job:
                 self._finish_job(job, "failed")
             return 500, {"error": f"中断写入失败: {exc}"}
+        with self.mon.lock:
+            waiting = [i for i in self.mon.interactions.values()
+                       if i.hosted_id == self.hid]
+        for inter in waiting:
+            inter.resolve("deny", reason="回合已中断", state="cancelled")
         if job:
             threading.Timer(30.0, lambda: self._finish_job(job, "cancelled")).start()
         else:
@@ -1215,6 +1237,11 @@ class Hosted:
     def stop(self, kill=False):
         if self.proc is None or self.status == "exited":
             return
+        with self.mon.lock:
+            waiting = [i for i in self.mon.interactions.values()
+                       if i.hosted_id == self.hid]
+        for inter in waiting:
+            inter.resolve("deny", reason="托管进程正在退出", state="cancelled")
         with self.ready:
             self.stopping = True
             self.ready.notify_all()
@@ -1350,7 +1377,13 @@ def classify_user_line(o, blocks):
     if o.get("isMeta"):
         return "meta_tool" if o.get("sourceToolUseID") else "meta"
     origin = o.get("origin")
-    if (isinstance(origin, dict) and origin.get("kind")) or o.get("promptSource"):
+    if isinstance(origin, dict):
+        kind = origin.get("kind")
+        # human 是真人输入；peer/coordinator/task-notification 等是注入内容
+        if kind and kind != "human":
+            return "injected"
+    # promptSource=typed/sdk/queued 都是真人输入，只有 system 是系统注入
+    if o.get("promptSource") == "system":
         return "injected"
     for b in blocks:
         if isinstance(b, dict) and b.get("type") == "text":

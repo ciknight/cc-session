@@ -462,6 +462,8 @@ function infoHtml(d){
       <span>版本 <b>${esc(d.version || "?")}</b></span>
       <span>消息 <b>${d.user_msgs}/${d.assistant_msgs}</b></span>
       <span>token 输入 <b>${fmtTok(t.input)}</b> 输出 <b>${fmtTok(t.output)}</b> 缓存 <b>${fmtTok(t.cache_read)}</b></span>
+      <span>上下文 <b>${fmtTok(d.context_tokens)}</b></span>
+      <span>最近输入 <b>${d.last_input_at ? new Date(d.last_input_at*1000).toLocaleString() : "?"}</b></span>
       <span>开始 <b>${d.first_event_at ? new Date(d.first_event_at*1000).toLocaleString() : "?"}</b></span>
     </div>
     ${tools ? `<details class="fold"><summary>工具调用 (${Object.keys(d.tool_uses).length} 种)</summary><div>${tools}</div></details>` : ""}

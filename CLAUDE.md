@@ -37,7 +37,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
 4. **远程发消息/托管**（`send_message` + `Hosted`）：`POST /sessions/<id>/message` 用
    `claude -p --resume` 跑一轮（异步 job，`GET /jobs/<id>` 查询）；`POST /hosted` 启动
    stream-json 双向的常驻 claude 进程，消息写 stdin、忙时排队，已托管会话的
-   message 请求自动路由到常驻进程。接口无鉴权，不要暴露到不可信网络。
+   message 请求自动路由到常驻进程。托管进程带 `--permission-prompt-tool stdio`，
+   权限请求经 `/interactions` 审批；`POST /sessions/<id>/interrupt` 中断当前回合。
+   接口无鉴权，不要暴露到不可信网络。
 
 ### 关键设计决策
 
@@ -48,15 +50,28 @@ uv run monitor.py --webhook http://localhost:3000/hook
   `~/.claude/tasks/<sid>/*.json` 目录存在时以它为准（`_merge_task_dirs`）。
 - **对话消息按需增量提取**（`parse_msg_line`）：不随轮询解析，只在请求
   `/sessions/<id>/messages` 时解析；`Monitor.msg_cache` 记录每个文件的读取 offset、
-  半行 buffer、已解析消息和序列化字节，后续请求只解析新增部分；
-  跳过 sidechain（子代理对话）和非错误工具结果。
+  半行 buffer、已解析消息、tool_use 索引和序列化字节，后续请求只解析新增部分；
+  跳过 sidechain（子代理对话）。工具结果合并行级 `toolUseResult`（diff/stdout/图片），
+  `isMeta` 分 boilerplate / sourceToolUseID / origin 注入三种语义。
+- **子代理会话**：额外扫描 `projects/<proj>/<parent>/subagents/agent-*.jsonl`，
+  id 为 `<parent>::agent-<hash>`，默认不在 `/sessions` 返回（`?include_subagents=1`），
+  只读、不能发消息或托管。
 - **worktree 归并**（`project_root`）：`<proj>/.claude/worktrees/<name>` 视为属于 `<proj>`，
   看板按项目分组依赖此逻辑。
-- **状态机**：`working`（有活动且助手未完成回复）/ `idle`（`stop_reason=end_turn`）/
-  `stale`（超过 `--stale` 秒无更新，在 `summary()` 输出时动态计算，不存状态）。
+- **状态机**：`working`（有活动且助手未完成回复）/ `idle`（`system/turn_duration`；
+  该会话从未出现该标记时才回退到 `stop_reason=end_turn`）/ `stale`（超过 `--stale`
+  秒无内容事件，在 `summary()` 输出时动态计算）。
+- **双时钟**：`last_input_ts` 只由真实用户输入推进（排除 tool_result、isMeta、
+  origin/promptSource 注入、中断标记），`last_event_ts` 是最后一条带时间戳的转录事件；
+  列表按 `last_input_ts` 排序、回退 `last_event_ts`。
+- **托管审批**：模式为 `ask`/`auto`/`full`，持久化在
+  `~/.claude/claude-sessions/approvals.json`；`ask` 等待网页响应（`--permission-timeout`
+  默认 300 秒，超时自动拒绝），`auto` 交给 CLI 权限模式，`full` 由服务自动放行。
+  回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底。
 
 ### 前端
 
 `templates/index.html` 是自包含 SPA：左侧项目列表、右侧会话卡片/对话视图，
-对话用 marked + DOMPurify 渲染 markdown（用户气泡 / 助手 markdown / 工具调用紧凑行），
+对话用 marked + DOMPurify 渲染 markdown（用户气泡 / 助手 markdown / 可折叠工具结果与 diff），
 自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
+对话视图顶部显示待审批卡片，发送区提供中断按钮和审批模式选择。
