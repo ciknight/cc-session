@@ -84,6 +84,13 @@ for line in sys.stdin:
                                             "destination": "session",
                                             "rules": [{"toolName": "Edit"}]}],
                 "decision_reason": "writes a file"}})
+        elif text == "plan":
+            pending_permission_uuid = uuid
+            emit({"type": "control_request", "request_id": "req-1", "request": {
+                "subtype": "can_use_tool", "tool_name": "ExitPlanMode",
+                "tool_use_id": "plan-1",
+                "input": {"plan": "# Plan\nDo the thing"},
+                "permission_suggestions": []}})
         elif text == "api-retry":
             emit({"type": "system", "subtype": "api_retry", "attempt": 1,
                   "max_retries": 10, "error_status": 503,

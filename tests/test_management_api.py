@@ -1,7 +1,9 @@
 import json
 import queue
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -123,6 +125,14 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(error.exception.code, 403)
         apply.assert_not_called()
 
+    def wait_for(self, cond, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
+
     def _write_transcript(self, count):
         lines = []
         for i in range(count):
@@ -182,6 +192,70 @@ class ManagementAPITests(unittest.TestCase):
         self.assertIn("sessions", data["data"])
         self.assertIn("interactions", data["data"])
         self.assertIsInstance(data["seq"], int)
+
+    def test_choice_requires_all_answers(self):
+        hosted = type("H", (), {"hid": None, "session_id": "sid-1"})()
+        inter = monitor.Interaction("c1", hosted, {"tool_name": "AskUserQuestion"},
+                                    kind="choice",
+                                    questions=[{"question": "Q1"}])
+        self.mon.interactions["c1"] = inter
+        code, _ = self.mon.respond_interaction("c1", {"behavior": "allow"})
+        self.assertEqual(code, 400)
+        code, _ = self.mon.respond_interaction(
+            "c1", {"behavior": "allow", "answers": {"Q1": "A"}})
+        self.assertEqual(code, 200)
+        self.assertEqual(inter.answers, {"Q1": "A"})
+
+    def test_hook_client_round_trip(self):
+        self.mon.http_port = self.server.server_port
+        self.mon.hook_token = "tok"
+        result = subprocess.run(
+            self.mon.hook_command(), shell=True,
+            input=json.dumps({"tool_name": "Bash"}),
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {})
+
+    def test_hook_requires_token(self):
+        self.mon.hook_token = "tok"
+        with self.assertRaises(HTTPError) as error:
+            self.request("/hook/PreToolUse", {"tool_name": "AskUserQuestion"},
+                         {"Content-Type": "application/json"})
+        self.assertEqual(error.exception.code, 401)
+
+    def test_hook_non_question_returns_empty(self):
+        self.mon.hook_token = "tok"
+        result = json.load(self.request(
+            "/hook/PreToolUse", {"tool_name": "Bash"},
+            {"Content-Type": "application/json", "X-Monitor-Token": "tok"}))
+        self.assertEqual(result, {})
+
+    def test_hook_blocks_until_answered(self):
+        self.mon.hook_token = "tok"
+        payload = {"session_id": "sid-1", "tool_use_id": "t1",
+                   "tool_name": "AskUserQuestion",
+                   "tool_input": {"questions": [
+                       {"question": "Q1", "options": [{"label": "A"}]}]}}
+        box = {}
+
+        def call():
+            box["resp"] = json.load(self.request(
+                "/hook/PreToolUse", payload,
+                {"Content-Type": "application/json", "X-Monitor-Token": "tok"}))
+
+        thread = threading.Thread(target=call)
+        thread.start()
+        self.assertTrue(self.wait_for(
+            lambda: self.mon.pending_interactions("sid-1")))
+        inter = self.mon.pending_interactions("sid-1")[0]
+        self.assertEqual(inter["kind"], "choice")
+        code, _ = self.mon.respond_interaction(
+            inter["id"], {"behavior": "allow", "answers": {"Q1": "A"}})
+        self.assertEqual(code, 200)
+        thread.join(timeout=5)
+        self.assertEqual(
+            box["resp"]["hookSpecificOutput"]["updatedInput"]["answers"],
+            {"Q1": "A"})
 
     def test_interactions_endpoint(self):
         hosted = type("H", (), {"hid": "h1", "session_id": "sid-1"})()

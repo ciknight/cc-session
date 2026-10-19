@@ -36,7 +36,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
    **首次扫描只回放不推送**（`first_scan_done` 标志）。
 3. **HTTP 层**（`make_handler`，`ThreadingHTTPServer` + `BaseHTTPRequestHandler`）：
    `GET /` 渲染看板模板，`/sessions`、`/sessions/<id>`、`/sessions/<id>/messages` 返回 JSON，
-   `/events` 是 SSE 流，`/static/` 提供静态文件。
+   `/events` 是 SSE 流（连接先发 `snapshot`，随后推增量），`/static/` 提供静态文件。
+   `/sessions/<id>/messages` 支持 `limit`（默认 100）、`before`、`from` 分页。
+   托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
 4. **远程发消息/托管**（`send_message` + `Hosted`）：`POST /sessions/<id>/message` 用
    `claude -p --resume` 跑一轮（异步 job，`GET /jobs/<id>` 查询）；`POST /hosted` 启动
    stream-json 双向的常驻 claude 进程，消息写 stdin、忙时排队，已托管会话的
@@ -53,7 +55,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
   `~/.claude/tasks/<sid>/*.json` 目录存在时以它为准（`_merge_task_dirs`）。
 - **对话消息按需增量提取**（`parse_msg_line`）：不随轮询解析，只在请求
   `/sessions/<id>/messages` 时解析；`Monitor.msg_cache` 记录每个文件的读取 offset、
-  半行 buffer、已解析消息、tool_use 索引和序列化字节，后续请求只解析新增部分；
+  半行 buffer、已解析消息和 tool_use 索引，后续请求只解析新增部分；
   跳过 sidechain（子代理对话）。工具结果合并行级 `toolUseResult`（diff/stdout/图片），
   `isMeta` 分 boilerplate / sourceToolUseID / origin 注入三种语义。
 - **子代理会话**：额外扫描 `projects/<proj>/<parent>/subagents/agent-*.jsonl`，
@@ -73,6 +75,15 @@ uv run monitor.py --webhook http://localhost:3000/hook
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有
   `completed/cancelled/discarded/refused/dropped` 结束回合。
+- **流式文本**：托管进程带 `--include-partial-messages`；`stream_event` 的
+  `text_delta` 按 job 聚合，约 80ms 节流发 `turn_delta`（transient，不进 recent/webhook），
+  回合结束发最终文本并清空。
+- **网页问答**：托管启动时用内联 `--settings` 注册 AskUserQuestion 的 PreToolUse hook，
+  command 为 `python monitor.py hook --port <port> --token <token>`；
+  `/hook/PreToolUse` 只接受回环地址和每次启动随机生成的令牌。
+- **前端实时更新**：EventSource 全局 + 单会话两路，按 `seq` 去重；连接先收 `snapshot`，
+  断线重连后全量对账；SSE 事件触发节流刷新，保留定时轮询兜底。
+  对话只加载最近 100 条，向上滚动加载更早。
 
 ### 前端
 

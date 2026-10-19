@@ -496,3 +496,21 @@ test('对话分页状态渲染与加载更早按钮', () => {
   b.run('convState.hasMore=false; renderConvList();');
   assert.doesNotMatch(b.node('conv').innerHTML,/loadearlier/);
 });
+test('计划与选择卡片渲染及答案收集', () => {
+  const b=boot();
+  const plan=b.run('interactionsHtml([{id:"p1",kind:"plan",' +
+    'preview:{kind:"text",text:"# Plan"}}])');
+  assert.match(plan,/批准计划/); assert.match(plan,/继续规划/);
+  assert.match(plan,/keep planning/);
+  const choice=b.run('interactionsHtml([{id:"c1",kind:"choice",questions:[' +
+    '{question:"Q1",multiSelect:true,options:[{label:"A"},{label:"B"}]}]}])');
+  assert.match(choice,/checkbox/); assert.match(choice,/Q1/);
+  assert.match(choice,/data-act="choice-submit"/);
+  const free=b.run('collectChoiceAnswers({querySelectorAll:()=>[' +
+    '{dataset:{q:"Q1"},querySelector:()=>({value:"custom"}),querySelectorAll:()=>[]}]})');
+  assert.equal(JSON.stringify(free), JSON.stringify({Q1:'custom'}));
+  const picked=b.run('collectChoiceAnswers({querySelectorAll:()=>[' +
+    '{dataset:{q:"Q1"},querySelector:()=>null,' +
+    'querySelectorAll:()=>[{dataset:{label:"A"}},{dataset:{label:"B"}}]}]})');
+  assert.equal(JSON.stringify(picked), JSON.stringify({Q1:'A, B'}));
+});

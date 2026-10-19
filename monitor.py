@@ -10,14 +10,19 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
   GET /                       网页看板：左侧项目列表，右侧会话列表/对话视图，自动刷新可开关
   GET /sessions               所有会话概览（?full=1 时含任务、子代理、最近事件等完整信息）
   GET /sessions/<id>          按 id 取单个会话完整信息
-  GET /sessions/<id>/messages 按需解析该会话的完整对话（带缓存，跳过 sidechain 子代理对话）
+  GET /sessions/<id>/messages 按需解析对话；?limit=100&before=N 向前分页，?from=N 增量追加
   GET /interactions           待审批的权限请求（?session=<id> 可过滤）
   POST /interactions/<id>/respond 审批 {"behavior":"allow|deny","scope":"once|always"}
   POST /sessions/<id>/interrupt   中断托管会话当前回合并清空排队消息
   POST /sessions/<id>/approval    设置审批模式 {"approval":"ask|auto|full"}
   GET /static/<file>          前端静态资源（marked / DOMPurify）
-  GET /events                 SSE 实时事件流（?session=<id> 可过滤）
+  GET /events                 SSE 实时事件流（?session=<id> 可过滤；首帧为 snapshot，
+                              流式文本为 transient turn_delta）
+  POST /hook/PreToolUse       AskUserQuestion 的 hook 回调（仅回环 + X-Monitor-Token）
   GET /healthz                健康检查
+
+hook 子命令（由托管进程的内联 --settings 调用，不面向用户）:
+  python monitor.py hook --port <port> --token <token>
 
 远程发消息:
   POST /sessions/<id>/message  给会话发消息 {"text": "...", "force": false}，返回 job_id。
@@ -38,6 +43,7 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
   DELETE /hosted/<hid>         正常退出（做完当前一轮）；加 ?kill=1 立即终止
   托管进程带 --permission-prompt-tool stdio：ask 模式在网页审批，auto 交给 CLI，
   full 自动放行；超时（--permission-timeout，默认 300 秒）自动拒绝。
+  ExitPlanMode 显示计划卡片；AskUserQuestion 通过 PreToolUse hook 在网页回答。
   注意: 要托管已有会话，先在终端里把它退出，避免两个进程同时写一个会话。
 
 接口无鉴权，发消息/托管可远程执行 claude，请只在可信网络内暴露。
@@ -60,6 +66,7 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
 """
 import argparse
 import difflib
+import hmac
 import json
 import os
 import queue
@@ -513,6 +520,11 @@ class Monitor:
         return code, resp
 
     # ---------- 权限审批 ----------
+    def hook_command(self):
+        args = [sys.executable, str(Path(__file__).resolve()), "hook",
+                "--port", str(self.http_port), "--token", self.hook_token]
+        return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
     def pending_interactions(self, sid=None):
         with self.lock:
             items = [i.public() for i in self.interactions.values()
@@ -562,6 +574,18 @@ class Monitor:
                 return 409, {"error": "interaction already resolved"}
             if scope == "always" and not inter.allow_always:
                 return 400, {"error": "该请求不允许始终允许"}
+            if inter.kind == "choice" and behavior == "allow":
+                answers = body.get("answers")
+                if not isinstance(answers, dict):
+                    return 400, {"error": "choice 必须提供 answers"}
+                normalized = {}
+                for question in inter.questions:
+                    text = question.get("question")
+                    answer = answers.get(text)
+                    if not isinstance(answer, str) or not answer.strip():
+                        return 400, {"error": f"缺少问题答案: {text}"}
+                    normalized[text] = answer.strip()
+                inter.answers = normalized
             reason = body.get("reason")
             reason = clip(reason, 500) if isinstance(reason, str) else None
             if not inter.resolve(behavior, scope, reason):
@@ -903,6 +927,15 @@ class Hosted:
             cmd += ["--session-id", self.session_id]
         if self.approval == "auto" and not _arg_present(self.mon.claude_args, "--permission-mode"):
             cmd += ["--permission-mode", "auto"]
+        if self.mon.http_port and self.mon.hook_token:
+            if _arg_present(self.mon.claude_args, "--settings"):
+                print(f"[hosted] 检测到 --settings，跳过 AskUserQuestion hook 注册", flush=True)
+            else:
+                settings = {"hooks": {"PreToolUse": [{
+                    "matcher": "AskUserQuestion",
+                    "hooks": [{"type": "command", "command": self.mon.hook_command(),
+                               "timeout": 604800}]}]}}
+                cmd += ["--settings", json.dumps(settings, separators=(",", ":"))]
         cmd += model_args(self.mon.claude_args, self.selected_model)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, cwd=self.cwd)
@@ -1415,8 +1448,12 @@ def strip_ansi(text):
 
 
 def permission_preview(tool_name, tool_input):
-    """为审批卡片生成 diff / 命令 / JSON 预览。"""
+    """为审批卡片生成 diff / 命令 / 计划 / JSON 预览。"""
     ti = tool_input or {}
+    if tool_name == "ExitPlanMode":
+        plan = ti.get("plan")
+        text = plan if isinstance(plan, str) else json.dumps(ti, ensure_ascii=False)
+        return {"kind": "text", "text": clip(text, 8000)}
     if tool_name == "Write":
         path = ti.get("file_path") or ti.get("path") or "new file"
         diff = "\n".join(difflib.unified_diff(
@@ -1436,12 +1473,13 @@ def permission_preview(tool_name, tool_input):
 
 
 class Interaction:
-    """一次等待用户回答的权限请求。"""
+    """一次等待用户回答的权限 / 计划 / 问题交互。"""
 
-    def __init__(self, request_id, hosted, request):
+    def __init__(self, request_id, hosted, request, session_id=None,
+                 kind=None, questions=None):
         self.id = request_id
-        self.hosted_id = hosted.hid
-        self.session_id = hosted.session_id
+        self.hosted_id = getattr(hosted, "hid", None)
+        self.session_id = session_id or getattr(hosted, "session_id", None)
         self.request = request
         self.tool_name = request.get("tool_name") or ""
         self.tool_use_id = request.get("tool_use_id")
@@ -1451,6 +1489,9 @@ class Interaction:
                             if isinstance(s, dict) and s.get("behavior") == "allow"]
         self.allow_always = bool(self.suggestions) and not request.get("suppress_always_allow_rule")
         self.preview = permission_preview(self.tool_name, self.tool_input)
+        self.kind = kind or ("plan" if self.tool_name == "ExitPlanMode" else "permission")
+        self.questions = questions or []
+        self.answers = None
         self.created_at = now_ts()
         self.event = threading.Event()
         self.behavior = None
@@ -1477,6 +1518,7 @@ class Interaction:
                 "tool_name": self.tool_name, "tool_use_id": self.tool_use_id,
                 "tool_input": self.tool_input, "preview": self.preview,
                 "reason": self.reason, "allow_always": self.allow_always,
+                "kind": self.kind, "questions": self.questions,
                 "created_at": self.created_at, "state": self.state,
                 "behavior": self.behavior, "scope": self.scope,
                 "resolved_at": self.resolved_at}
@@ -1619,6 +1661,28 @@ def parse_msg_line(ln, clip_len=8000):
     if parts:
         return {"role": role, "ts": _parse_iso(o.get("timestamp")), "parts": parts}
     return None
+
+
+def hook_client(argv):
+    """Claude Code PreToolUse hook 的客户端：转发给本机服务并回写结果。"""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--token", required=True)
+    ap.add_argument("--event", default="PreToolUse")
+    args = ap.parse_args(argv)
+    payload = sys.stdin.read()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{args.port}/hook/{args.event}",
+            data=payload.encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "X-Monitor-Token": args.token})
+        with urllib.request.urlopen(req, timeout=3600) as resp:
+            sys.stdout.write(resp.read().decode("utf-8"))
+    except Exception:
+        # 服务不可达时 fail-open，让 CLI 回落到自身行为
+        sys.stdout.write("{}")
+    return 0
 
 
 def make_handler(mon, refresh_interval):
@@ -1822,9 +1886,68 @@ def make_handler(mon, refresh_interval):
                     return False
             return True
 
+        def _handle_hook(self, event):
+            peer = self.client_address[0]
+            if peer not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                return self._json({"error": "forbidden"}, 403)
+            token = self.headers.get("X-Monitor-Token", "")
+            if not mon.hook_token or not hmac.compare_digest(token, mon.hook_token):
+                return self._json({"error": "unauthorized"}, 401)
+            payload = self._read_body()
+            if not isinstance(payload, dict):
+                return self._json({})
+            if event != "PreToolUse" or payload.get("tool_name") != "AskUserQuestion":
+                return self._json({})
+            sid = payload.get("session_id")
+            tool_use_id = payload.get("tool_use_id")
+            tool_input = payload.get("tool_input") or {}
+            questions = tool_input.get("questions") or []
+            key = f"{sid}\x00{tool_use_id}"
+            with mon.lock:
+                hosted = mon.hosted_by_sid.get(sid)
+            with mon.lock:
+                inter = mon.hook_interactions.get(key)
+                if inter is None or inter.state != "pending":
+                    inter = Interaction("hook-" + secrets.token_hex(8), hosted,
+                                        {"tool_name": "AskUserQuestion",
+                                         "tool_use_id": tool_use_id,
+                                         "input": tool_input},
+                                        session_id=sid, kind="choice",
+                                        questions=questions)
+                    mon.interactions[inter.id] = inter
+                    mon.hook_interactions[key] = inter
+                    emit_pending = True
+                else:
+                    emit_pending = False
+            if emit_pending:
+                sess = mon.by_sid(sid)
+                if sess:
+                    mon.emit(sess, "interaction_pending", inter.public())
+            timeout = mon.permission_timeout if mon.permission_timeout > 0 else 3600
+            inter.event.wait(timeout)
+            if inter.state == "pending":
+                inter.resolve("deny", reason="审批超时，已自动跳过", state="timed_out")
+            with mon.lock:
+                mon.interactions.pop(inter.id, None)
+                mon.hook_interactions.pop(key, None)
+            sess = mon.by_sid(sid)
+            if sess:
+                mon.emit(sess, "interaction_resolved", inter.public())
+            if inter.behavior == "allow" and inter.answers:
+                updated = dict(tool_input)
+                updated["answers"] = inter.answers
+                return self._json({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "allow",
+                    "permissionDecisionReason": "", "updatedInput": updated}})
+            return self._json({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": inter.message or "User skipped the question"}})
+
         def do_POST(self):
             u = urlparse(self.path)
             print(f"[http] {self.command} {self.path} 收到", flush=True)   # 请求到达即记录，响应见 log_request
+            if u.path.startswith("/hook/"):
+                return self._handle_hook(u.path[len("/hook/"):])
             if u.path == "/cc-switch/local":
                 if not self._safe_json_write():
                     return
@@ -2022,6 +2145,8 @@ def make_handler(mon, refresh_interval):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "hook":
+        return hook_client(sys.argv[2:])
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8765)
@@ -2049,6 +2174,8 @@ def main():
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print("[monitor] 警告: 接口无鉴权且可远程执行 claude，请务必只暴露在可信网络/隧道之后")
     server = ThreadingHTTPServer((args.host, args.port), make_handler(mon, args.refresh))
+    mon.http_port = server.server_port
+    mon.hook_token = secrets.token_hex(16)
     try:
         server.serve_forever()
     finally:
@@ -2062,7 +2189,8 @@ def main():
                 print(f"[hosted] {h.hid} 已随服务退出 (code {h.returncode})", flush=True)
             except Exception as e:
                 print(f"[hosted] {h.hid} 退出失败: {e}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

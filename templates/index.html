@@ -652,9 +652,40 @@ function interactionsHtml(items){
   if(!items || !items.length) return "";
   return items.map(it => {
     const preview = it.preview || {};
+    const iid = esc(it.id);
+    if(it.kind === "plan"){
+      return `<div class="inter-card" data-iid="${iid}">
+        <div><b>计划待确认</b></div>
+        <pre class="tool-out">${esc(preview.text || "")}</pre>
+        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="back" data-act="allow" data-scope="once">批准计划</button>
+          <button class="back" data-act="deny"
+            data-reason="The user wants to keep planning.">继续规划</button>
+        </div></div>`;
+    }
+    if(it.kind === "choice"){
+      const questions = (it.questions || []).map((q, qi) => {
+        const name = iid + "-q" + qi;
+        const options = (q.options || []).map(o => {
+          const type = q.multiSelect ? "checkbox" : "radio";
+          return `<label class="ctl"><input type="${type}" name="${esc(name)}" ` +
+            `data-label="${esc(o.label)}"> ${esc(o.label)}</label>`;
+        }).join("");
+        return `<div class="choice-q" data-q="${esc(q.question)}">
+          <div><b>${esc(q.question)}</b></div>${options}
+          <input class="choice-free" placeholder="其他答案（可选）" maxlength="2000">
+        </div>`;
+      }).join("");
+      return `<div class="inter-card" data-iid="${iid}" data-choice="1">
+        <div><b>需要你的选择</b></div>${questions}
+        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="back" data-act="choice-submit">提交</button>
+          <button class="back" data-act="deny">跳过</button>
+        </div></div>`;
+    }
     const body = preview.kind === "diff" ? diffHtml(preview.text)
                : `<pre>${esc(preview.text || "")}</pre>`;
-    return `<div class="inter-card" data-iid="${esc(it.id)}">
+    return `<div class="inter-card" data-iid="${iid}">
       <div><b>需要审批</b> · <code>${esc(it.tool_name)}</code></div>
       ${it.reason ? `<div class="mut">${esc(it.reason)}</div>` : ""}
       ${body}
@@ -665,6 +696,19 @@ function interactionsHtml(items){
       </div></div>`;
   }).join("");
 }
+function collectChoiceAnswers(card){
+  const answers = {};
+  if(!card || !card.querySelectorAll) return answers;
+  for(const q of card.querySelectorAll(".choice-q")){
+    const text = q.dataset.q;
+    const freeEl = q.querySelector(".choice-free");
+    const free = freeEl ? freeEl.value.trim() : "";
+    const picked = [...q.querySelectorAll("input:checked")].map(x => x.dataset.label);
+    if(free) answers[text] = free;
+    else if(picked.length) answers[text] = picked.join(", ");
+  }
+  return answers;
+}
 function renderInteractions(items){
   const el = document.getElementById("interactions");
   if(!el) return;
@@ -673,15 +717,32 @@ function renderInteractions(items){
   interCache.sig = sig;
   el.innerHTML = interactionsHtml(items);
 }
-async function respondInteraction(card, act, scope){
+async function respondInteraction(card, act, scope, reason){
   if(!card) return;
   const iid = card.dataset.iid;
+  let body;
+  if(act === "choice-submit"){
+    const answers = collectChoiceAnswers(card);
+    const total = card.querySelectorAll ? card.querySelectorAll(".choice-q").length : 0;
+    if(Object.keys(answers).length !== total){
+      if(card.insertAdjacentHTML)
+        card.insertAdjacentHTML("beforeend",
+          '<div class="terror">请回答所有问题或点击跳过</div>');
+      return;
+    }
+    body = {behavior: "allow", answers};
+  } else if(act === "deny"){
+    body = {behavior: "deny"};
+    if(reason) body.reason = reason;
+  } else {
+    body = {behavior: act, scope: scope || "once"};
+  }
   const buttons = card.querySelectorAll ? card.querySelectorAll("button") : [];
   buttons.forEach(b => b.disabled = true);
   try{
     const r = await fetchT("/interactions/" + encodeURIComponent(iid) + "/respond", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({behavior: act, scope}),
+      body: JSON.stringify(body),
     });
     const j = await r.json();
     if(!r.ok) throw Error(j.error || ("HTTP " + r.status));
@@ -1191,7 +1252,8 @@ document.getElementById("main").addEventListener("click", e => {
   const act = e.target.closest && e.target.closest("#interactions button[data-act]");
   if(act){
     const card = act.closest(".inter-card");
-    respondInteraction(card, act.dataset.act, act.dataset.scope || "once");
+    respondInteraction(card, act.dataset.act, act.dataset.scope || "once",
+                       act.dataset.reason);
     return;
   }
   if(e.target.closest("#newp")){

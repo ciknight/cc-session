@@ -1,3 +1,4 @@
+import json
 import queue
 import subprocess
 import sys
@@ -95,6 +96,43 @@ class InteractionTests(unittest.TestCase):
         code, resp = host.send("c")
         self.assertEqual(code, 429)
         self.assertIn("queue", resp["error"].lower())
+
+    def test_hosted_registers_ask_user_hook(self):
+        self.mon.http_port = 12345
+        self.mon.hook_token = "tok"
+        captured = {}
+        original = subprocess.Popen
+        fake = str(Path(__file__).with_name("fake_claude.py"))
+
+        def popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return original([sys.executable, fake] + cmd[1:], **kwargs)
+
+        with patch.object(monitor.subprocess, "Popen", side_effect=popen):
+            code, resp = self.mon.host_session(str(self.root), None, "first",
+                                               model="opus", approval="ask")
+        self.assertEqual(code, 202)
+        host = self.mon.hosted[resp["hosted_id"]]
+        self.hosts.append(host)
+        cmd = captured["cmd"]
+        settings = json.loads(cmd[cmd.index("--settings") + 1])
+        rule = settings["hooks"]["PreToolUse"][0]
+        self.assertEqual(rule["matcher"], "AskUserQuestion")
+        self.assertIn(" hook ", rule["hooks"][0]["command"])
+        self.assertIn("--token", rule["hooks"][0]["command"])
+
+    def test_exit_plan_mode_is_plan_kind(self):
+        host, job = self.start_host("plan")
+        self.assertTrue(self.wait_for(lambda: self.mon.pending_interactions("fake-session")))
+        pending = self.mon.pending_interactions("fake-session")[0]
+        self.assertEqual(pending["kind"], "plan")
+        self.assertFalse(pending["allow_always"])
+        self.assertIn("Plan", pending["preview"]["text"])
+        code, _ = self.mon.respond_interaction(
+            pending["id"], {"behavior": "deny", "reason": "keep planning"})
+        self.assertEqual(code, 200)
+        self.assertTrue(self.wait_for(
+            lambda: self.mon.jobs[job]["status"] in ("done", "failed", "cancelled")))
 
     def test_stream_text_is_aggregated_and_cleared(self):
         self.mon.first_scan_done = True
