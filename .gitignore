@@ -14,5 +14,8 @@ Thumbs.db
 # Claude Code 本地配置
 .claude/settings.local.json
 
+# 临时目录
+_tmp/
+
 # uv 项目需要提交 .python-version（覆盖全局忽略）
 !.python-version

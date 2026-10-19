@@ -68,6 +68,17 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotIn("--model=haiku", cmd)
         self.assertEqual(self.mon.preferences.get("existing"), "vendor-model-7")
 
+    def test_working_session_requires_force_for_oneshot(self):
+        self.sess.state = "working"
+        code, _ = self.mon.send_message("existing", "hello")
+        self.assertEqual(code, 409)
+        completed = subprocess.CompletedProcess([], 0, json.dumps({"result": "ok"}), "")
+        with patch.object(monitor.subprocess, "run", return_value=completed):
+            code, response = self.mon.send_message("existing", "hello", force=True)
+            self.assertEqual(code, 202)
+            job = self.wait_done(response["job_id"])
+        self.assertEqual(job["status"], "done")
+
     def test_hosted_queue_keeps_model_snapshot(self):
         host, first = self.start_host(text="slow")
         _, second = host.send("second", "sonnet")

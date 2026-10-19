@@ -86,8 +86,48 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
   border:1px solid var(--bd);border-radius:6px;padding:6px 8px;white-space:pre-wrap;
   font:12px ui-monospace,monospace}
 .diff-add{color:#16a34a}.diff-del{color:#dc2626}.diff-hunk{color:var(--acc)}
-.inter-card{background:var(--card);border:1px solid #d97706;border-radius:8px;padding:10px 12px;margin:8px 0}
-.inter-card pre{white-space:pre-wrap;max-height:240px;overflow:auto;font:12px ui-monospace,monospace}
+/* 待审批卡片：权限 / 计划 / 问答共用 */
+.inter-card{background:var(--card);border:1px solid var(--bd);border-left:3px solid #d97706;
+  border-radius:8px;padding:10px 14px;margin:10px 0}
+.inter-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.inter-kind{font-size:11px;font-weight:600;letter-spacing:.04em;color:#b45309;
+  background:rgba(217,119,6,.12);border-radius:4px;padding:1px 7px}
+.inter-tool{font:12px ui-monospace,monospace;color:var(--mut)}
+.inter-reason{font-size:12.5px;color:var(--mut);white-space:pre-wrap;margin-bottom:6px}
+.inter-card pre,.inter-preview{margin:4px 0;max-height:240px;overflow:auto;background:var(--card2);
+  border:1px solid var(--bd);border-radius:6px;padding:6px 8px;white-space:pre-wrap;
+  font:12px ui-monospace,monospace}
+.inter-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;margin-top:10px}
+.ibtn{font:inherit;font-size:13px;padding:4px 14px;border-radius:6px;cursor:pointer;
+  border:1px solid var(--bd);background:var(--card);color:var(--fg)}
+.ibtn:hover{border-color:var(--acc)}
+.ibtn.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+.ibtn.primary:hover{filter:brightness(1.08)}
+.ibtn.secondary{background:none;border-color:var(--acc);color:var(--acc)}
+.ibtn.danger{background:none;border-color:#dc2626;color:#dc2626}
+.ibtn.danger:hover{background:rgba(220,38,38,.08)}
+/* 问答：选项整行可选，选中高亮 */
+.choice-q+.choice-q{margin-top:10px;padding-top:10px;border-top:1px solid var(--bd)}
+.choice-head{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut);margin-bottom:2px}
+.choice-text{margin-bottom:6px}
+.choice-opt{position:relative;display:flex;flex-direction:column;gap:2px;width:100%;
+  margin:4px 0;padding:6px 10px;border:1px solid var(--bd);border-radius:6px;
+  background:var(--bg);cursor:pointer}
+.choice-opt:hover{border-color:var(--acc)}
+.choice-opt:has(input:checked){border-color:var(--acc);background:var(--accbg)}
+.choice-opt:focus-within{outline:2px solid var(--acc);outline-offset:1px}
+.choice-opt input{position:absolute;opacity:0;pointer-events:none}
+.opt-desc{font-size:12px;color:var(--mut)}
+.choice-free{width:100%;margin-top:6px;background:var(--bg);color:var(--fg);
+  border:1px solid var(--bd);border-radius:6px;padding:6px 8px;font:inherit;font-size:13px}
+.choice-free:focus{outline:none;border-color:var(--acc)}
+#pendingbadge,.chip.pending{border-color:rgba(217,119,6,.5);background:rgba(217,119,6,.10);
+  color:#b45309;font-weight:600}
+@media(prefers-color-scheme:dark){
+  .inter-card{border-left-color:#f59e0b}
+  .inter-kind{color:#fbbf24;background:rgba(217,119,6,.18)}
+  #pendingbadge,.chip.pending{color:#fbbf24}
+}
 .sysbody{font-size:12.5px;color:var(--mut);white-space:pre-wrap;word-break:break-word;
          border:1px dashed var(--bd);border-radius:6px;padding:4px 8px;max-width:100%}
 .msg.tool,.msg.system{display:flex;flex-direction:column;align-items:flex-start}
@@ -95,6 +135,9 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .model-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
 .model-controls input{min-width:180px;max-width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px}
 .model-controls input[hidden]{display:none}
+.composer textarea{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit}
+.composer-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:6px}
+.composer-status{white-space:pre-wrap;margin-top:4px}
 .config-path{overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:12px;margin:3px 0}
 button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 /* 移动端：抽屉式侧栏 */
@@ -131,7 +174,7 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
     </select>
   </label>
   <span class="ctl" id="updated"></span>
-  <button id="pendingbadge" class="back" style="display:none;border-color:#d97706;color:#d97706"
+  <button id="pendingbadge" class="back" style="display:none"
           title="有权限请求等待审批，点击跳转">待审批 0</button>
   <span id="err"></span>
 </header>
@@ -145,6 +188,12 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATE_ZH = {working: "工作中", idle: "空闲", stale: "无活动"};
+// <details> 的展开状态跨 innerHTML 重建保留；key 必须由内容派生且稳定
+const detailsOpen = Object.create(null);
+function detailsAttrs(key, defaultOpen = false){
+  const open = key in detailsOpen ? detailsOpen[key] : defaultOpen;
+  return ` data-dkey="${esc(key)}"` + (open ? " open" : "");
+}
 const TASK_ZH = {pending: "待办", in_progress: "进行中", completed: "已完成", deleted: "已删除"};
 
 let sessions = [];                 // 最新概览数据
@@ -157,6 +206,7 @@ let convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
 let lastSidebarSig = "", lastListSig = "";
 let esGlobal = null, esSession = null, globalSeq = 0, sessionSeq = 0;
 let listTimer = null, convTimer = null;
+let lastListLoad = 0;              // 上次 /sessions 请求开始的毫秒时间戳
 let liveText = "", liveRaf = null;
 let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
@@ -187,6 +237,32 @@ function fmtTok(n){
 const projName = cwd => (cwd || "?").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
 const sessTitle = s => (!s.title || s.title.includes("�")) ? (s.first_user_message || s.id.slice(0, 8)) : s.title;
 
+/* ---------- URL 路由 ---------- */
+// 项目根路径与会话 id 都作为单个路径段，编码后直接拼进 URL
+function routePath(v){
+  if(!v || !v.project) return "/";
+  const base = "/p/" + encodeURIComponent(v.project);
+  if(v.session) return base + "/s/" + encodeURIComponent(v.session);
+  if(v.new) return base + "/new";
+  return base;
+}
+function parseRoute(pathname){
+  if(!pathname) return null;
+  const parts = pathname.split("/").filter(Boolean);
+  if(parts.length < 2 || parts.length > 4 || parts[0] !== "p") return null;
+  let project;
+  try{ project = decodeURIComponent(parts[1]); }catch{ return null; }
+  if(!project) return null;
+  if(parts.length === 2) return {project, session: null, new: false};
+  if(parts.length === 3 && parts[2] === "new") return {project, session: null, new: true};
+  if(parts.length === 4 && parts[2] === "s"){
+    let session;
+    try{ session = decodeURIComponent(parts[3]); }catch{ return null; }
+    return session ? {project, session, new: false} : null;
+  }
+  return null;
+}
+
 function md(text){
   if(window.marked){
     const html = marked.parse(text);
@@ -212,6 +288,43 @@ function modelControlsHtml(){
       <option value="custom" data-kind="custom">自定义 ID</option></select></label>
     <input id="modelcustom" aria-label="自定义模型 ID" placeholder="完整或自定义模型 ID" maxlength="256" hidden>
     <span class="mut" id="modelst" role="status"></span></div>`;
+}
+// 会话页和新建会话页共用同一个输入对话框，避免两套 textarea/按钮/键盘行为
+function composerHtml(mode, d){
+  const isNew = mode === "new";
+  d = d || {};
+  return `<div class="info-panel composer">
+    ${isNew ? '<div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>' : ""}
+    ${modelControlsHtml()}
+    <textarea id="msgbox" rows="3" placeholder="${isNew ? "输入首条消息…" : "给该会话发消息…"}"></textarea>
+    <div class="composer-actions">
+      <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
+      ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断</button>
+      <label class="ctl" id="approvalwrap">审批
+        <select id="approvalsel" aria-label="托管审批模式">
+          <option value="auto">自动</option>
+          <option value="ask">询问</option>
+          <option value="full">全部允许</option>
+        </select></label>
+      <label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
+        <input type="checkbox" id="forcecb" checked> 工作状态下也发送</label>`}
+      <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
+        <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
+      ${!isNew && d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
+        <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
+    </div>
+    <div class="mut composer-status" id="sendst"></div>
+  </div>`;
+}
+function bindComposerKeys(key){
+  const btn = document.getElementById("sendbtn"), box = document.getElementById("msgbox");
+  if(!btn || !box) return;
+  box.addEventListener("keydown", event => {
+    if(event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229){
+      event.preventDefault();
+      btn.click();
+    }
+  });
 }
 function updateModelOptions(key, options){
   const sel = document.getElementById("modelsel"), input = document.getElementById("modelcustom");
@@ -412,9 +525,15 @@ const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_
   "remote_message_done", "hosted_exited"];
 const raf = window.requestAnimationFrame || (fn => setTimeout(fn, 16));
 
+function listGap(){ return +ival.value || DEFAULT_IVAL; }
 function scheduleListRefresh(){
+  // SSE 事件驱动的刷新也受用户设置的间隔约束，否则活跃会话会把 5s 设置变成每 800ms 一次
   clearTimeout(listTimer);
-  listTimer = setTimeout(() => { if(!document.hidden) load(); }, 800);
+  const wait = Math.max(0, listGap() - (Date.now() - lastListLoad));
+  listTimer = setTimeout(() => {
+    listTimer = null;
+    if(!document.hidden) load();
+  }, wait);
 }
 function scheduleConvRefresh(sid){
   if(view.session !== sid) return;
@@ -603,7 +722,7 @@ function renderSessionList(p){
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
         ${s.hosted ? '<span class="chip" title="消息直接写入常驻 claude 进程">⚙ 托管中</span>' : ""}
-        ${s.pending_interactions ? `<span class="chip" style="border-color:#d97706;color:#d97706">待审批 ${s.pending_interactions}</span>` : ""}
+        ${s.pending_interactions ? `<span class="chip pending">待审批 ${s.pending_interactions}</span>` : ""}
         <span class="stitle">${esc(sessTitle(s))}</span>
         <div class="mut">${[
           s.cwd !== s.project ? "⎇ " + projName(s.cwd) : null,
@@ -622,6 +741,7 @@ function renderSessionList(p){
 /* ---------- 渲染：会话详情 + 对话 ---------- */
 function infoHtml(d){
   const t = d.tokens || {};
+  const sid = d.id || "";
   const tools = Object.entries(d.tool_uses || {}).map(([k, v]) => `<span class="chip">${esc(k)} ×${v}</span>`).join("");
   return `
     <div class="grid">
@@ -634,10 +754,10 @@ function infoHtml(d){
       <span>最近输入 <b>${d.last_input_at ? new Date(d.last_input_at*1000).toLocaleString() : "?"}</b></span>
       <span>开始 <b>${d.first_event_at ? new Date(d.first_event_at*1000).toLocaleString() : "?"}</b></span>
     </div>
-    ${tools ? `<details class="fold"><summary>工具调用 (${Object.keys(d.tool_uses).length} 种)</summary><div>${tools}</div></details>` : ""}
-    ${d.subagents && d.subagents.length ? `<details class="fold"><summary>子代理 (${d.subagents.length})</summary><ul>` +
+    ${tools ? `<details class="fold"${detailsAttrs(`info:${sid}:tools`)}><summary>工具调用 (${Object.keys(d.tool_uses).length} 种)</summary><div>${tools}</div></details>` : ""}
+    ${d.subagents && d.subagents.length ? `<details class="fold"${detailsAttrs(`info:${sid}:subagents`)}><summary>子代理 (${d.subagents.length})</summary><ul>` +
       d.subagents.map(a => `<li><span class="chip">${esc(a.type)}</span> ${esc(a.description)}</li>`).join("") + "</ul></details>" : ""}
-    ${d.tasks && d.tasks.length ? `<details class="fold" open><summary>任务 ${d.tasks_completed}/${d.tasks_total}</summary><ul>` +
+    ${d.tasks && d.tasks.length ? `<details class="fold"${detailsAttrs(`info:${sid}:tasks`, true)}><summary>任务 ${d.tasks_completed}/${d.tasks_total}</summary><ul>` +
       d.tasks.map(x => `<li class="${x.status}">[${TASK_ZH[x.status] || x.status}] ${esc(x.subject)}</li>`).join("") + "</ul></details>" : ""}`;
 }
 
@@ -663,7 +783,8 @@ function toolPartHtml(p){
   if(p.type === "tool_note") return `<div class="sysbody">${esc(p.text)}</div>`;
   if(p.type === "error") return `<div class="terror">✗ ${esc(p.text)}</div>`;
   const notes = (p.notes || []).map(esc).join("\n");
-  return `<details class="tool-details"><summary>🔧 ${esc(p.name)}: ${esc(p.input)}</summary>` +
+  const key = p.tool_use_id ? "tool:" + p.tool_use_id : "";
+  return `<details class="tool-details"${key ? detailsAttrs(key) : ""}><summary>🔧 ${esc(p.name)}: ${esc(p.input)}</summary>` +
     (notes ? `<div class="mut">${esc(notes)}</div>` : "") + toolResultHtml(p) + `</details>`;
 }
 function convHtml(messages){
@@ -697,10 +818,11 @@ function interactionsHtml(items){
     const iid = esc(it.id);
     if(it.kind === "plan"){
       return `<div class="inter-card" data-iid="${iid}">
-        <div><b>计划待确认</b></div>
-        <pre class="tool-out">${esc(preview.text || "")}</pre>
-        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
-          <button class="back" data-act="allow" data-scope="once">批准计划</button>
+        <div class="inter-head"><span class="inter-kind">计划待确认</span>
+          <code class="inter-tool">ExitPlanMode</code></div>
+        <pre class="inter-preview">${esc(preview.text || "")}</pre>
+        <div class="inter-actions">
+          <button class="ibtn primary" data-act="allow" data-scope="once">批准计划</button>
           <button class="back" data-act="deny"
             data-reason="The user wants to keep planning.">继续规划</button>
         </div></div>`;
@@ -710,31 +832,39 @@ function interactionsHtml(items){
         const name = iid + "-q" + qi;
         const options = (q.options || []).map(o => {
           const type = q.multiSelect ? "checkbox" : "radio";
-          return `<label class="ctl"><input type="${type}" name="${esc(name)}" ` +
-            `data-label="${esc(o.label)}"> ${esc(o.label)}</label>`;
+          return `<label class="choice-opt"><input type="${type}" name="${esc(name)}" ` +
+            `data-label="${esc(o.label)}"><span>${esc(o.label)}</span>` +
+            (o.description ? `<span class="opt-desc">${esc(o.description)}</span>` : "") +
+            `</label>`;
         }).join("");
         return `<div class="choice-q" data-q="${esc(q.question)}">
-          <div><b>${esc(q.question)}</b></div>${options}
+          ${q.header ? `<div class="choice-head">${esc(q.header)}</div>` : ""}
+          <div class="choice-text"><b>${esc(q.question)}</b>${
+            q.multiSelect ? ' <span class="mut">（可多选）</span>' : ""}</div>
+          ${options}
           <input class="choice-free" placeholder="其他答案（可选）" maxlength="2000">
         </div>`;
       }).join("");
       return `<div class="inter-card" data-iid="${iid}" data-choice="1">
-        <div><b>需要你的选择</b></div>${questions}
-        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
-          <button class="back" data-act="choice-submit">提交</button>
+        <div class="inter-head"><span class="inter-kind">需要你的选择</span>
+          <code class="inter-tool">AskUserQuestion</code></div>${questions}
+        <div class="inter-actions">
+          <button class="ibtn primary" data-act="choice-submit">提交</button>
           <button class="back" data-act="deny">跳过</button>
         </div></div>`;
     }
-    const body = preview.kind === "diff" ? diffHtml(preview.text)
-               : `<pre>${esc(preview.text || "")}</pre>`;
+    const body = preview.kind === "diff"
+      ? `<pre class="inter-preview">${diffHtml(preview.text)}</pre>`
+      : `<pre class="inter-preview">${esc(preview.text || "")}</pre>`;
     return `<div class="inter-card" data-iid="${iid}">
-      <div><b>需要审批</b> · <code>${esc(it.tool_name)}</code></div>
-      ${it.reason ? `<div class="mut">${esc(it.reason)}</div>` : ""}
+      <div class="inter-head"><span class="inter-kind">需要审批</span>
+        <code class="inter-tool">${esc(it.tool_name)}</code></div>
+      ${it.reason ? `<div class="inter-reason">${esc(it.reason)}</div>` : ""}
       ${body}
-      <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
-        <button class="back" data-act="allow" data-scope="once">允许一次</button>
-        ${it.allow_always ? '<button class="back" data-act="allow" data-scope="always">始终允许</button>' : ""}
-        <button class="back" data-act="deny">拒绝</button>
+      <div class="inter-actions">
+        <button class="ibtn primary" data-act="allow" data-scope="once">允许一次</button>
+        ${it.allow_always ? '<button class="ibtn secondary" data-act="allow" data-scope="always">始终允许</button>' : ""}
+        <button class="ibtn danger" data-act="deny">拒绝</button>
       </div></div>`;
   }).join("");
 }
@@ -879,36 +1009,11 @@ async function renderConversation(id, force){
           <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
           <div id="interactions"></div>
           <div id="apierr" class="apierr" style="display:none"></div>
-          <div class="info-panel">
-            ${modelControlsHtml()}
-            <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
-              style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
-            <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-              <button class="back" id="sendbtn">发送</button>
-              <button class="back" id="intbtn" disabled>中断</button>
-              <label class="ctl" id="approvalwrap">审批
-                <select id="approvalsel" aria-label="托管审批模式">
-                  <option value="ask">询问</option>
-                  <option value="auto">自动</option>
-                  <option value="full">全部允许</option>
-                </select></label>
-              <label class="ctl"><input type="checkbox" id="forcecb"> 忽略 working 强制发送</label>
-              <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
-                <input type="checkbox" id="hostcb" ${d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
-              ${d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
-                <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
-            </div>
-            <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
-          </div>
+          ${composerHtml("conv", d)}
           <h4 id="convcount">对话</h4>
           <div id="conv"></div>`;
         document.getElementById("back").onclick = () => {
-          disconnectSessionSse();
-          view.session = null;
-          convCache = {id: null, size: -1};
-          convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
-                       hasMore: false, loadingEarlier: false};
-          renderMain();
+          navigate({project: view.project, session: null, new: false});
         };
         document.getElementById("msgbox").value = draft;
         bindSendBox(id, d);
@@ -1010,7 +1115,11 @@ function updateSendSt(id){
   if(st) st.textContent = sendJobText(id);
   const btn = document.getElementById("sendbtn");
   const j = sendJobs[id];
-  if(btn) btn.disabled = !!j && ["sending", "queued", "running"].includes(j.status);
+  // 对话视图里 running/queued 仍可继续发送：托管会话会排队；新建会话必须先拿到 sid，
+  // 否则连点会创建多个新会话，所以新建面板继续锁住。
+  const newPanel = curPanel && curPanel.type === "new";
+  if(btn) btn.disabled = !!j && (j.status === "sending"
+    || (newPanel && ["queued", "running"].includes(j.status)));
 }
 
 /* ---------- 新建会话（不依赖已有历史；可选托管常驻进程或每次独立运行） ---------- */
@@ -1024,19 +1133,10 @@ function renderNewSession(p){
   main.innerHTML = `
     <button class="back" id="back">← 返回列表</button>
     <h2 style="font-size:16px;margin:8px 0">新建会话 <span class="mut">${esc(p.cwd)}</span></h2>
-    <div class="info-panel">
-      <div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>
-      ${modelControlsHtml()}
-      <textarea id="msgbox" rows="3" placeholder="输入首条消息…"
-        style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
-      <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <button class="back" id="sendbtn">创建并发送</button>
-        <label class="ctl" title="勾选后以常驻 claude 进程方式创建，之后的消息直接写进它的 stdin；不勾选则每条消息独立运行一次 claude">
-          <input type="checkbox" id="hostcb"> 托管（常驻进程，后续消息不再重启）</label>
-      </div>
-      <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
-    </div>`;
-  document.getElementById("back").onclick = () => { view.new = false; renderMain(); };
+    ${composerHtml("new", {})}`;
+  document.getElementById("back").onclick = () => {
+    navigate({project: view.project, session: null, new: false});
+  };
   document.getElementById("msgbox").value = draft;
   bindNewBox(p);
   curPanel = {type: "new", key: p.cwd};
@@ -1048,6 +1148,7 @@ function renderNewSession(p){
 function bindNewBox(p){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
+  bindComposerKeys("new:" + p.cwd);
   btn.onclick = async () => {
     const text = document.getElementById("msgbox").value.trim();
     if(!text) return;
@@ -1064,9 +1165,8 @@ function bindNewBox(p){
       sendJobs[sid] = sendJobs[key] || sendJobs[sid];   // 任务状态改挂到新会话 id 名下
       delete sendJobs[key];
       if(view.new && view.project === p.cwd){
-        view = {project: p.cwd, session: sid, new: false};
-        convCache = {id: null, size: -1};
-        renderConversation(sid, true);   // 转录尚未被轮询发现时先显示占位，稍后自动刷新补上
+        // 新建页是一次性入口，用 replace 换成会话地址，返回时直接回到项目列表
+        navigate({project: p.cwd, session: sid, new: false}, {replace: true});
       }
     };
     try{
@@ -1121,13 +1221,7 @@ function bindNewBox(p){
 function bindSendBox(id, d){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
-  const box = document.getElementById("msgbox");
-  if(box) box.addEventListener("keydown", event => {
-    if(event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229){
-      event.preventDefault();
-      btn.click();
-    }
-  });
+  bindComposerKeys(id);
   const un = document.getElementById("unhostbtn");
   if(un) un.onclick = async () => {
     if(!d.hosted_id) return;
@@ -1197,22 +1291,66 @@ function bindSendBox(id, d){
       }
       const box = document.getElementById("msgbox");
       if(box) box.value = "";
+      // 202 后立刻解除“发送中”锁定：托管会话可以继续排队，不必等整轮结束。
+      sendJobs[id] = {jobId: j.job_id, status: j.status || "queued"};
+      updateSendSt(id);
+      // 本次刚启动托管时重建一次面板，让“托管中/退出托管”控件立即出现；
+      // 已有托管或一次性消息只做软刷新，避免打断正在输入的下一条消息。
+      if(useHost) curPanel = null;
+      load();
       for(;;){
         await new Promise(f => setTimeout(f, 1500));
         const jr = await (await fetchT("/jobs/" + encodeURIComponent(j.job_id), {}, 15000)).json();
-        sendJobs[id] = {jobId: j.job_id, status: jr.status,
-                        result: jr.result, error: jr.error};
+        // 多个消息排队时只更新自己的状态，避免旧任务的轮询覆盖新任务
+        if(!sendJobs[id] || sendJobs[id].jobId === j.job_id)
+          sendJobs[id] = {jobId: j.job_id, status: jr.status,
+                          result: jr.result, error: jr.error};
         updateSendSt(id);
         if(jr.status === "running" || jr.status === "queued") continue;
         break;
       }
-      curPanel = null;   // 强制整体重渲染，更新托管标识
-      load();   // 立即拉一次最新对话
+      load();   // 软刷新最终状态，不重建输入区
     }catch(e){
       sendJobs[id] = {status: "failed", error: String(e)};
       updateSendSt(id);
     }
   };
+}
+
+/* ---------- 导航与浏览器历史 ---------- */
+function historyApi(){
+  return typeof window !== "undefined" && window.history
+    && typeof window.history.pushState === "function" ? window.history : null;
+}
+function readRoute(){
+  const loc = typeof window !== "undefined" ? window.location : null;
+  return loc ? parseRoute(loc.pathname) : null;
+}
+function syncUrl(v, replace){
+  const h = historyApi(), loc = h ? window.location : null;
+  if(!h || !loc) return;
+  const next = routePath(v);
+  if(next === loc.pathname) return;
+  try{ (replace ? h.replaceState : h.pushState).call(h, null, "", next); }catch(e){ }
+}
+function clearSessionView(){
+  disconnectSessionSse();
+  clearLiveBubble();
+  convCache = {id: null, size: -1};
+  convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
+               hasMore: false, loadingEarlier: false};
+  interCache = {id: null, sig: ""};
+}
+function navigate(next, opts){
+  next = next || {project: null, session: null, new: false};
+  const leaving = view.session !== (next.session || null);
+  view = next;
+  if(leaving) clearSessionView();
+  syncUrl(view, !!(opts && opts.replace));
+  renderMain();
+}
+function onPopState(){
+  navigate(readRoute() || {project: null, session: null, new: false});
 }
 
 /* ---------- 主渲染 ---------- */
@@ -1236,6 +1374,7 @@ function renderMain(){
     // 侧栏固定排序后，初次进入仍默认选中最近活跃的项目
     view.project = projects.length
       ? projects.reduce((a, b) => b.last > a.last ? b : a).cwd : null;
+  if(view.project) syncUrl(view, true);   // 默认项目解析后用 replace 落地址，不新增历史记录
   renderSidebar(projects);   // 更新 active 高亮
   const p = projects.find(x => x.cwd === view.project);
   const main = document.getElementById("main");
@@ -1253,6 +1392,7 @@ let loading = false;        // 上一轮 /sessions 还没回来就跳过本轮�
 async function load(){
   if(loading) return;
   loading = true;
+  lastListLoad = Date.now();
   try{
     const r = await fetch("/sessions");
     sessions = await r.json();
@@ -1275,27 +1415,21 @@ function toggleDrawer(open){
 document.getElementById("pendingbadge").onclick = () => {
   const target = sessions.find(s => s.pending_interactions > 0);
   if(!target) return;
-  view = {project: target.project, session: target.id, new: false};
-  convCache = {id: null, size: -1};
-  renderConversation(target.id, true);
+  navigate({project: target.project, session: target.id, new: false});
 };
 document.getElementById("menu").onclick = () => toggleDrawer(!asideEl.classList.contains("open"));
 maskEl.onclick = () => toggleDrawer(false);
 document.getElementById("projs").addEventListener("click", e => {
   const nb = e.target.closest(".newbtn");
   if(nb){
-    view = {project: nb.dataset.cwd, session: null, new: true};
-    convCache = {id: null, size: -1};
     toggleDrawer(false);
-    renderMain();
+    navigate({project: nb.dataset.cwd, session: null, new: true});
     return;
   }
   const item = e.target.closest(".pitem");
   if(!item) return;
-  view = {project: item.dataset.cwd, session: null};
-  convCache = {id: null, size: -1};
   toggleDrawer(false);
-  renderMain();
+  navigate({project: item.dataset.cwd, session: null, new: false});
 });
 document.getElementById("main").addEventListener("click", e => {
   const act = e.target.closest && e.target.closest("#interactions button[data-act]");
@@ -1306,28 +1440,39 @@ document.getElementById("main").addEventListener("click", e => {
     return;
   }
   if(e.target.closest("#newp")){
-    view = {project: view.project, session: null, new: true};
-    renderMain();
+    navigate({project: view.project, session: null, new: true});
     return;
   }
   const card = e.target.closest(".scard");
   if(!card) return;
-  view.session = card.dataset.id;
-  view.new = false;
-  convCache = {id: null, size: -1};
-  renderConversation(view.session, true);
+  navigate({project: view.project, session: card.dataset.id, new: false});
 });
+
+// toggle 不冒泡，用捕获阶段记录用户手动展开/折叠的 <details>
+if(document.addEventListener){
+  document.addEventListener("toggle", event => {
+    const el = event.target;
+    if(el && el.tagName === "DETAILS" && el.dataset && el.dataset.dkey)
+      detailsOpen[el.dataset.dkey] = !!el.open;
+  }, true);
+}
 
 const auto = document.getElementById("auto"), ival = document.getElementById("ival");
 auto.checked = localStorage.getItem("auto") !== "0";
 ival.value = localStorage.getItem("ival") || String(DEFAULT_IVAL);
 function resetTimer(){
   clearInterval(timer);
-  if(auto.checked) timer = setInterval(() => { if(!document.hidden) load(); }, +ival.value);
+  // 定时轮询与 SSE 事件共用同一节流入口，避免两者同时到点导致重复请求
+  if(auto.checked) timer = setInterval(scheduleListRefresh, listGap());
 }
 auto.onchange = () => { localStorage.setItem("auto", auto.checked ? "1" : "0"); resetTimer(); };
 ival.onchange = () => { localStorage.setItem("ival", ival.value); resetTimer(); };
 
+// 启动时先按地址栏恢复视图，再等首次 /sessions 数据渲染；
+// 不在数据到达前 renderMain，避免空项目列表把 URL 里的项目覆盖掉
+const bootRoute = readRoute();
+if(bootRoute) view = bootRoute;
+if(window.addEventListener) window.addEventListener("popstate", onPopState);
 if(window.marked) marked.setOptions({breaks: true});
 connectGlobalSse();
 load();

@@ -92,20 +92,31 @@ class SubagentDiscoveryTests(unittest.TestCase):
                         "message": {"content": "sub task"}}) + "\n", encoding="utf-8")
         self.mon = monitor.Monitor(600)
 
-    def test_subagent_is_discovered_and_hidden_by_default(self):
+    def test_subagent_is_lazy_loaded_and_hidden_by_default(self):
         self.mon.scan_once()
         main = self.mon.unique_sessions()
         self.assertEqual([s.id for s in main], ["parent-sid"])
-        all_sessions = self.mon.unique_sessions(include_subagents=True)
-        ids = {s.id for s in all_sessions}
+        # 默认扫描不会解析子代理，显式 include_subagents 才会加载
+        self.assertNotIn("parent-sid::agent-abc",
+                         {s.id for s in self.mon.unique_sessions(include_subagents=True)})
+        self.assertIn("parent-sid::agent-abc", self.mon.subagent_ids(self.mon.by_sid("parent-sid")))
+        self.mon.scan_subagents_once()
+        ids = {s.id for s in self.mon.unique_sessions(include_subagents=True)}
         self.assertIn("parent-sid::agent-abc", ids)
         sub = self.mon.by_sid("parent-sid::agent-abc")
         self.assertTrue(sub.is_subagent)
         self.assertEqual(sub.parent_id, "parent-sid")
         self.assertEqual(sub.agent_name, "Explore")
 
+    def test_ensure_subagent_loads_single_file(self):
+        self.mon.scan_once()
+        self.assertIsNone(self.mon.by_sid("parent-sid::agent-abc"))
+        self.assertTrue(self.mon.ensure_subagent("parent-sid::agent-abc"))
+        self.assertEqual(self.mon.by_sid("parent-sid::agent-abc").parent_id, "parent-sid")
+
     def test_send_to_subagent_is_rejected(self):
         self.mon.scan_once()
+        self.mon.ensure_subagent("parent-sid::agent-abc")
         code, _ = self.mon.send_message("parent-sid::agent-abc", "hi")
         self.assertEqual(code, 400)
 

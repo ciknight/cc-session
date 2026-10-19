@@ -41,7 +41,7 @@ hook 子命令（由托管进程的内联 --settings 调用，不面向用户）
                                模型忙时消息排队，一轮结束再发下一条
   GET /hosted                  托管进程列表（状态、是否忙、排队数、审批模式、轮数）
   DELETE /hosted/<hid>         正常退出（做完当前一轮）；加 ?kill=1 立即终止
-  托管进程带 --permission-prompt-tool stdio：ask 模式在网页审批，auto 交给 CLI，
+  托管进程带 --permission-prompt-tool stdio：ask 模式在网页审批，auto 交给 CLI（默认模式），
   full 自动放行；超时（--permission-timeout，默认 300 秒）自动拒绝。
   ExitPlanMode 显示计划卡片；AskUserQuestion 通过 PreToolUse hook 在网页回答。
   注意: 要托管已有会话，先在终端里把它退出，避免两个进程同时写一个会话。
@@ -62,10 +62,14 @@ hook 子命令（由托管进程的内联 --settings 调用，不面向用户）
 用法:
   python monitor.py                      # 监听默认目录
   python monitor.py --port 9000 --stale 600
+  python monitor.py --scan-subagents     # 启动时连带扫描子代理转录（默认懒加载）
   python monitor.py --webhook http://localhost:3000/hook   # 事件同时 POST 出去
 """
 import argparse
+import base64
+import copy
 import difflib
+import hashlib
 import hmac
 import json
 import os
@@ -86,6 +90,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from scan_cache import ScanCache
 from session_preferences import (APPROVAL_MODES, ApprovalPreferences, ModelPreferences,
                                  UNSET, default_model, model_args, validate_model)
 from cc_switch import CCSwitch, SwitchError
@@ -97,6 +102,12 @@ STATIC_DIR = Path(__file__).parent / "static"
 # 首次打开大转录时只解析尾部窗口，向前翻页时再按块加载
 MSG_TAIL_BYTES = 2 * 1024 * 1024
 MSG_CHUNK_BYTES = 1 * 1024 * 1024
+
+# 扫描缓存：保存每个转录已读到的 offset 和累计状态，重启时只解析新增字节。
+# 子代理默认不扫描；开启全量扫描时缓存体积较大，降低落盘频率。
+SCAN_CACHE_SAVE_SECONDS = 5
+SCAN_CACHE_SAVE_SUBAGENTS_SECONDS = 30
+SCAN_TAIL_SAMPLE_BYTES = 4096
 
 _jinja = Environment(
     loader=FileSystemLoader(str(TEMPLATE_DIR)),
@@ -206,6 +217,82 @@ class Session:
         self.agent_name = None
         self.state = "idle"
         self.recent = deque(maxlen=50)
+        self.tail_sample = b""        # 文件末尾 4 KiB，用于校验扫描缓存没有过期
+
+    def cache_state(self):
+        """返回可 JSON 序列化的累计状态；offset/buf 由调用方单独保存。"""
+        return {
+            "cwd": self.cwd, "title": self.title, "ai_title": self.ai_title,
+            "custom_title": self.custom_title, "model": self.model,
+            "version": self.version, "git_branch": self.git_branch,
+            "tasks": copy.deepcopy(self.tasks), "task_seq": self.task_seq,
+            "pending_create": dict(self.pending_create),
+            "subagents": copy.deepcopy(self.subagents),
+            "active_agents": sorted(self.active_agents),
+            "tool_uses": dict(self.tool_uses),
+            "tokens": dict(self.tokens),
+            "user_msgs": self.user_msgs, "assistant_msgs": self.assistant_msgs,
+            "first_ts": self.first_ts, "first_user": self.first_user,
+            "last_user": self.last_user, "last_assistant": self.last_assistant,
+            "last_event_ts": self.last_event_ts, "last_input_ts": self.last_input_ts,
+            "last_turn_end_ts": self.last_turn_end_ts,
+            "saw_turn_duration": self.saw_turn_duration,
+            "pending_tools": sorted(self.pending_tools),
+            "context_tokens": self.context_tokens,
+            "compacted_at": self.compacted_at,
+            "last_api_error": copy.deepcopy(self.last_api_error),
+            "agent_name": self.agent_name,
+            "state": self.state,
+        }
+
+    def restore_cache(self, data):
+        """从扫描缓存恢复累计状态；只做宽松校验，坏字段回退默认值。"""
+        if not isinstance(data, dict):
+            return
+        for key in ("cwd", "title", "ai_title", "custom_title", "model",
+                    "version", "git_branch", "first_user", "last_user",
+                    "last_assistant", "agent_name"):
+            value = data.get(key)
+            if isinstance(value, str) or value is None:
+                setattr(self, key, value)
+        for key in ("first_ts", "last_event_ts", "last_input_ts",
+                    "last_turn_end_ts", "compacted_at"):
+            if key not in data:
+                continue
+            value = data[key]
+            if isinstance(value, (int, float)):
+                setattr(self, key, value)
+            elif value is None and key != "last_event_ts":
+                setattr(self, key, None)
+        for key in ("user_msgs", "assistant_msgs", "task_seq", "context_tokens"):
+            value = data.get(key)
+            if isinstance(value, int) and value >= 0:
+                setattr(self, key, value)
+        self.saw_turn_duration = bool(data.get("saw_turn_duration"))
+        state = data.get("state")
+        if state in ("working", "idle"):
+            self.state = state
+        tasks = data.get("tasks")
+        if isinstance(tasks, dict):
+            self.tasks = {str(k): v for k, v in tasks.items() if isinstance(v, dict)}
+        pending_create = data.get("pending_create")
+        if isinstance(pending_create, dict):
+            self.pending_create = dict(pending_create)
+        subagents = data.get("subagents")
+        if isinstance(subagents, list):
+            self.subagents = [x for x in subagents if isinstance(x, dict)]
+        self.active_agents = {x for x in (data.get("active_agents") or []) if isinstance(x, str)}
+        self.pending_tools = {x for x in (data.get("pending_tools") or []) if isinstance(x, str)}
+        tool_uses = data.get("tool_uses")
+        if isinstance(tool_uses, dict):
+            self.tool_uses = Counter({str(k): v for k, v in tool_uses.items()
+                                      if isinstance(v, int)})
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict):
+            self.tokens = {k: tokens.get(k, 0) if isinstance(tokens.get(k, 0), int) else 0
+                           for k in ("input", "output", "cache_read", "cache_creation")}
+        error = data.get("last_api_error")
+        self.last_api_error = error if isinstance(error, dict) else None
 
     def summary(self, stale_after, project=None):
         state = self.state
@@ -285,6 +372,16 @@ class Monitor:
         self.preferences = ModelPreferences(CLAUDE_DIR / "claude-sessions" / "preferences.json")
         self.approvals = ApprovalPreferences(CLAUDE_DIR / "claude-sessions" / "approvals.json")
         self.cc_switch = CCSwitch(CLAUDE_DIR)
+        # 子代理转录默认不扫描；需要时通过 --scan-subagents 或 include_subagents=1 加载
+        self.scan_subagents = False
+        self.subagent_scan_lock = threading.Lock()
+        self.subagents_loaded_at = 0.0
+        # 扫描缓存延迟初始化：只调用 handle_line 的测试不会读写真实缓存文件
+        self.scan_cache = None
+        self.scan_cache_entries = {}
+        self.cache_dirty = False
+        self.last_cache_save = 0.0
+        self.shutdown_event = threading.Event()
 
     def by_sid(self, sid):
         """按 session id 查找；同名取最近活跃的一个。"""
@@ -539,7 +636,7 @@ class Monitor:
             except ValueError as e:
                 return 500, {"error": str(e)}
         h = Hosted(self, cwd, resume_id, selected,
-                   approval=approval or (self.approvals.get(resume_id) if resume_id else "ask"))
+                   approval=approval or (self.approvals.get(resume_id) if resume_id else "auto"))
         try:
             code, resp = h.start(text)
         except FileNotFoundError:
@@ -849,13 +946,100 @@ class Monitor:
                                            "error": clip(b.get("content", ""), 200)})
 
     # ---------- 轮询文件 ----------
-    def scan_once(self):
+    def _scan_cache_obj(self):
+        """延迟初始化扫描缓存，避免不扫描文件的测试读写真实缓存。"""
+        if self.scan_cache is None:
+            self.scan_cache = ScanCache(CLAUDE_DIR / "claude-sessions" / "scan-cache.json")
+            self.scan_cache_entries = self.scan_cache.load()
+            if self.scan_cache.error:
+                print(f"[scan-cache] {self.scan_cache.error}", flush=True)
+            else:
+                print(f"[scan-cache] 已加载 {len(self.scan_cache_entries)} 个会话状态", flush=True)
+        return self.scan_cache_entries
+
+    @staticmethod
+    def _read_tail(path, offset):
+        """读取 offset 之前的最后 4 KiB，用于校验缓存前缀未被重写。"""
+        if offset <= 0:
+            return b""
+        start = max(0, offset - SCAN_TAIL_SAMPLE_BYTES)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                return f.read(offset - start)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _new_session(sid, path, parent_id, is_subagent):
+        sess = Session(sid, path)
+        sess.is_subagent = is_subagent
+        sess.parent_id = parent_id
+        return sess
+
+    def _restore_or_new(self, path, sid, parent_id, is_subagent, size):
+        """命中有效缓存时恢复累计状态；否则返回全新的 Session。"""
+        entry = (self.scan_cache_entries or {}).get(str(path))
+        if entry and size >= entry["offset"]:
+            tail = self._read_tail(path, entry["offset"])
+            if tail is not None \
+                    and hashlib.sha256(tail).hexdigest() == entry.get("tail_sha256"):
+                try:
+                    buf = base64.b64decode(entry.get("buf", ""), validate=True)
+                except (ValueError, TypeError):
+                    return self._new_session(sid, path, parent_id, is_subagent)
+                sess = self._new_session(sid, path, parent_id, is_subagent)
+                sess.restore_cache(entry.get("session"))
+                sess.offset = entry["offset"]
+                sess.buf = buf
+                sess.tail_sample = tail
+                return sess
+        return self._new_session(sid, path, parent_id, is_subagent)
+
+    def _scan_path(self, path, sid, parent_id, is_subagent):
+        """增量读取单个转录文件；缓存命中时只解析新增字节。"""
+        key = str(path)
+        with self.lock:
+            sess = self.sessions.get(key)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                return
+            if sess is None:
+                sess = self._restore_or_new(path, sid, parent_id, is_subagent, size)
+                self.sessions[key] = sess
+                self.emit(sess, "session_discovered", {"path": str(path)})
+            if size < sess.offset:
+                # 文件被截断/重写：丢弃全部派生状态，避免二次累计
+                sess = self.sessions[key] = self._new_session(
+                    sid, path, parent_id, is_subagent)
+                self.cache_dirty = True
+            if size == sess.offset:
+                return
+            with open(path, "rb") as f:
+                f.seek(sess.offset)
+                chunk = f.read()
+                sess.offset += len(chunk)
+                if chunk:
+                    sess.tail_sample = (sess.tail_sample + chunk)[-SCAN_TAIL_SAMPLE_BYTES:]
+            data = sess.buf + chunk
+            *lines, sess.buf = data.split(b"\n")   # 最后一段可能是半行，留到下次
+            self.cache_dirty = True
+            for ln in lines:
+                if ln.strip():
+                    self.handle_line(sess, ln.decode("utf-8", "replace"))
+
+    def scan_once(self, include_subagents=None):
+        self._scan_cache_obj()
         root = CLAUDE_DIR / "projects"
         if not root.exists():
             return
+        if include_subagents is None:
+            include_subagents = self.scan_subagents
         paths = list(root.glob("*/*.jsonl"))
-        # 子代理转录：projects/<proj>/<parent-sid>/subagents/agent-*.jsonl
-        paths.extend(root.glob("*/*/subagents/agent-*.jsonl"))
+        if include_subagents:
+            # 子代理转录：projects/<proj>/<parent-sid>/subagents/agent-*.jsonl
+            paths.extend(root.glob("*/*/subagents/agent-*.jsonl"))
         for path in paths:
             is_subagent = path.parent.name == "subagents"
             if is_subagent:
@@ -865,38 +1049,111 @@ class Monitor:
                 sid = f"{parent_id}::agent-{suffix}"
             else:
                 parent_id, sid = None, path.stem
-            key = str(path)
-            with self.lock:
-                sess = self.sessions.get(key)
-                if sess is None:
-                    sess = self.sessions[key] = Session(sid, path)
-                    sess.is_subagent = is_subagent
-                    sess.parent_id = parent_id
-                    self.emit(sess, "session_discovered", {"path": str(path)})
-                try:
-                    size = path.stat().st_size
-                except OSError:
+            self._scan_path(path, sid, parent_id, is_subagent)
+        if self._merge_task_dirs():
+            self.cache_dirty = True
+        self.maybe_save_cache(force=not self.first_scan_done)
+
+    def scan_subagents_once(self, force=False):
+        """显式请求子代理时一次性加载；默认轮询不会走到这里。"""
+        with self.subagent_scan_lock:
+            now = now_ts()
+            if not force and now - self.subagents_loaded_at < 5:
+                return
+            root = CLAUDE_DIR / "projects"
+            if root.exists():
+                for path in root.glob("*/*/subagents/agent-*.jsonl"):
+                    parent_id = path.parent.parent.name
+                    stem = path.stem
+                    suffix = stem[6:] if stem.startswith("agent-") else stem
+                    self._scan_path(path, f"{parent_id}::agent-{suffix}", parent_id, True)
+            self.subagents_loaded_at = now_ts()
+            self.maybe_save_cache(force=True)
+
+    def ensure_subagent(self, sid):
+        """按 id 懒加载单个子代理转录，供 /sessions/<parent::agent-x> 使用。"""
+        if "::agent-" not in sid:
+            return False
+        parent_id, suffix = sid.split("::agent-", 1)
+        if not parent_id or not suffix or parent_id in (".", "..") \
+                or suffix in (".", "..") or "/" in parent_id or "\\" in parent_id \
+                or "/" in suffix or "\\" in suffix:
+            return False
+        with self.lock:
+            parent = self.by_sid(parent_id)
+        candidates = []
+        if parent:
+            candidates.append(parent.path.parent / parent_id / "subagents"
+                              / f"agent-{suffix}.jsonl")
+        else:
+            try:
+                for proj in (CLAUDE_DIR / "projects").iterdir():
+                    fp = proj / parent_id / "subagents" / f"agent-{suffix}.jsonl"
+                    if fp.is_file():
+                        candidates.append(fp)
+            except OSError:
+                pass
+        for path in candidates:
+            if path.is_file():
+                self._scan_path(path, sid, parent_id, True)
+        self.maybe_save_cache()
+        with self.lock:
+            return self.by_sid(sid) is not None
+
+    def subagent_ids(self, sess):
+        """列出父会话的子代理 id；只读目录，不需要解析子代理内容。"""
+        ids = set()
+        sub_dir = sess.path.parent / sess.id / "subagents"
+        try:
+            for fp in sub_dir.glob("agent-*.jsonl"):
+                stem = fp.stem
+                suffix = stem[6:] if stem.startswith("agent-") else stem
+                ids.add(f"{sess.id}::agent-{suffix}")
+        except OSError:
+            pass
+        with self.lock:
+            ids.update(s.id for s in self.sessions.values() if s.parent_id == sess.id)
+        return sorted(ids)
+
+    def maybe_save_cache(self, force=False):
+        if not self.cache_dirty or self.scan_cache is None:
+            return
+        interval = (SCAN_CACHE_SAVE_SUBAGENTS_SECONDS if self.scan_subagents
+                    else SCAN_CACHE_SAVE_SECONDS)
+        if not force and now_ts() - self.last_cache_save < interval:
+            return
+        self.save_scan_cache()
+
+    def save_scan_cache(self):
+        if self.scan_cache is None:
+            return
+        with self.lock:
+            entries = {}
+            for key, sess in self.sessions.items():
+                # 默认只缓存主会话，避免开启全量扫描时反复写数 MB 子代理状态
+                if sess.is_subagent and not self.scan_subagents:
                     continue
-                if size < sess.offset:      # 文件被截断/重写
-                    sess.offset, sess.buf = 0, b""
-                if size == sess.offset:
-                    continue
-                with open(path, "rb") as f:
-                    f.seek(sess.offset)
-                    chunk = f.read()
-                    sess.offset += len(chunk)
-                data = sess.buf + chunk
-                *lines, sess.buf = data.split(b"\n")   # 最后一段可能是半行，留到下次
-                for ln in lines:
-                    if ln.strip():
-                        self.handle_line(sess, ln.decode("utf-8", "replace"))
-        self._merge_task_dirs()
+                entries[key] = {
+                    "offset": sess.offset,
+                    "tail_sha256": hashlib.sha256(sess.tail_sample).hexdigest(),
+                    "buf": base64.b64encode(sess.buf).decode("ascii"),
+                    "session": sess.cache_state(),
+                }
+            self.cache_dirty = False
+            self.last_cache_save = now_ts()
+        try:
+            self.scan_cache.save(entries)
+            self.scan_cache_entries = self.scan_cache.files
+        except (OSError, TypeError, ValueError) as e:
+            self.cache_dirty = True
+            print(f"[scan-cache] 保存失败: {e}", flush=True)
 
     def _merge_task_dirs(self):
         """~/.claude/tasks/<sid>/*.json 若存在，以它为准校正任务列表。"""
         troot = CLAUDE_DIR / "tasks"
         if not troot.exists():
-            return
+            return False
+        changed = False
         with self.lock:
             for sess in self.sessions.values():
                 if sess.is_subagent:
@@ -907,7 +1164,7 @@ class Monitor:
                 tasks = {}
                 for fp in sorted(d.glob("*.json")):
                     try:
-                        t = json.loads(fp.read_text())
+                        t = json.loads(fp.read_text(encoding="utf-8"))
                     except Exception:
                         continue
                     if isinstance(t, dict) and "id" in t:
@@ -916,9 +1173,11 @@ class Monitor:
                                                "status": t.get("status", "pending")}
                 if tasks and tasks != sess.tasks:
                     sess.tasks = tasks
+                    changed = True
+        return changed
 
     def run(self, interval):
-        while True:
+        while not self.shutdown_event.is_set():
             try:
                 self.scan_once()
             except Exception as e:
@@ -926,7 +1185,8 @@ class Monitor:
             if not self.first_scan_done:
                 self.first_scan_done = True
                 print(f"[monitor] 初次扫描完成，发现 {len(self.sessions)} 个会话")
-            time.sleep(interval)
+            self.shutdown_event.wait(interval)
+        self.maybe_save_cache(force=True)
 
 
 class Hosted:
@@ -942,7 +1202,7 @@ class Hosted:
         self.hid = "h-" + secrets.token_hex(4)
         self.session_id = resume_id
         self.selected_model = selected_model
-        self.approval = approval or (mon.approvals.get(resume_id) if resume_id else "ask")
+        self.approval = approval or (mon.approvals.get(resume_id) if resume_id else "auto")
         self.process_model = selected_model if selected_model is not None else default_model(mon.claude_args)
         self.proc = None
         self.stderr_thread = None
@@ -1844,6 +2104,13 @@ def make_handler(mon, refresh_interval):
             self.end_headers()
             self.wfile.write(body)
 
+        def _index(self):
+            body = _jinja.get_template("index.html").render(
+                refresh_interval=refresh_interval,
+                stale_after=mon.stale_after,
+            ).encode()
+            self._raw(body, ctype="text/html; charset=utf-8")
+
         def do_GET(self):
             u = urlparse(self.path)
             if u.path == "/healthz":
@@ -1851,22 +2118,17 @@ def make_handler(mon, refresh_interval):
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
                 return self._json({"interactions": mon.pending_interactions(sid)})
-            if u.path == "/":
-                body = _jinja.get_template("index.html").render(
-                    refresh_interval=refresh_interval,
-                    stale_after=mon.stale_after,
-                ).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
+            if u.path == "/" or u.path.startswith("/p/"):
+                # /p/<项目>[/s/<会话>|/new] 都由前端路由裁决，服务端统一回模板
+                return self._index()
             if u.path == "/sessions":
                 # 默认返回概览（按项目分组所需字段齐全）；加 ?full=1 返回完整信息
                 qs = parse_qs(u.query)
                 full = qs.get("full", ["0"])[0] in ("1", "true")
                 include_subagents = qs.get("include_subagents", ["0"])[0] in ("1", "true")
+                if include_subagents:
+                    # 子代理默认懒加载；显式请求时再扫描，首次可能较慢
+                    mon.scan_subagents_once()
                 with mon.lock:
                     pmap = mon.project_map()
                     items = sorted(((s.detail if full else s.summary)(mon.stale_after, mon.project_of(s, pmap))
@@ -1896,6 +2158,7 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": "分页参数超出范围"}, 400)
                 if before is not None and frm is not None:
                     return self._json({"error": "before 与 from 不能同时使用"}, 400)
+                mon.ensure_subagent(sid)
                 with mon.lock:
                     s = mon.by_sid(sid)
                 if not s:
@@ -1961,6 +2224,7 @@ def make_handler(mon, refresh_interval):
                                             separators=(",", ":")).encode())
             if u.path.startswith("/sessions/"):
                 sid = u.path.split("/", 2)[2]
+                mon.ensure_subagent(sid)
                 with mon.lock:
                     s = mon.by_sid(sid)
                     if not s:
@@ -1969,9 +2233,7 @@ def make_handler(mon, refresh_interval):
                 d["selected_model"] = mon.preferences.get(sid)
                 d["approval"] = mon.approvals.get(sid)
                 d["interactions"] = mon.pending_interactions(sid)
-                with mon.lock:
-                    d["subagent_session_ids"] = sorted({s.id for s in mon.sessions.values()
-                                                        if s.parent_id == sid})
+                d["subagent_session_ids"] = mon.subagent_ids(s)
                 h = mon.hosted_by_sid.get(sid)
                 d["hosted"] = bool(h and h.alive())
                 d["hosted_id"] = h.hid if h else None
@@ -2181,6 +2443,7 @@ def make_handler(mon, refresh_interval):
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
                     return self._json({"error": "body must be {\"text\": \"...\"}"}, 400)
+                mon.ensure_subagent(parts[1])   # 子代理默认懒加载，保持“只读”错误语义
                 code, resp = mon.send_message(parts[1], text, bool(body.get("force")),
                                               body.get("model", UNSET))
                 return self._json(resp, code)
@@ -2302,6 +2565,8 @@ def main():
     ap.add_argument("--msg-timeout", type=int, default=600, help="单条远程消息最长执行秒数")
     ap.add_argument("--permission-timeout", type=int, default=300,
                     help="托管会话审批等待秒数，0 表示无限等待")
+    ap.add_argument("--scan-subagents", action="store_true",
+                    help="启动时扫描子代理转录（默认懒加载，仅在显式请求时读取）")
     args = ap.parse_args()
     if args.permission_timeout < 0:
         ap.error("--permission-timeout 不能为负数（0 表示无限等待）")
@@ -2311,8 +2576,11 @@ def main():
     mon.claude_bin = shutil.which(args.claude_bin) or args.claude_bin
     mon.claude_args = shlex.split(args.claude_args)
     mon.msg_timeout = args.msg_timeout
+    mon.scan_subagents = args.scan_subagents
     threading.Thread(target=mon.run, args=(args.interval,), daemon=True).start()
     print(f"[monitor] 监听 {CLAUDE_DIR / 'projects'}，HTTP http://{args.host}:{args.port}")
+    if not args.scan_subagents:
+        print("[monitor] 子代理转录懒加载（需要时用 --scan-subagents 或 include_subagents=1）")
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print("[monitor] 警告: 接口无鉴权且可远程执行 claude，请务必只暴露在可信网络/隧道之后")
     server = ThreadingHTTPServer((args.host, args.port), make_handler(mon, args.refresh))
@@ -2321,9 +2589,10 @@ def main():
     try:
         server.serve_forever()
     finally:
-        # 正常退出（含 Ctrl+C）时主动收尾托管进程：关 stdin 让它做完当前一轮再退，
-        # 兜不住的强杀场景由管道 EOF 兜底——monitor 一死内核关闭管道，claude 读到
-        # EOF 同样会自行退出，不会残留僵尸/孤儿进程
+        # 正常退出（含 Ctrl+C）时先停轮询并落盘扫描状态，再收尾托管进程。
+        mon.shutdown_event.set()
+        mon.maybe_save_cache(force=True)
+        # 关 stdin 让托管进程做完当前一轮再退；强杀场景由管道 EOF 兜底。
         server.server_close()
         for h in list(mon.hosted.values()):
             try:

@@ -62,6 +62,12 @@ class ManagementAPITests(unittest.TestCase):
             self.request("/sessions/sid-1/model", {"model": []}, {"Content-Type": "application/json"})
         self.assertEqual(invalid.exception.code, 400)
 
+    def test_spa_route_serves_index_html(self):
+        for path in ("/", "/p/demo%5Cproject"):
+            response = self.request(path)
+            self.assertEqual(response.headers.get_content_type(), "text/html")
+            self.assertIn("Claude Sessions", response.read().decode("utf-8"))
+
     def test_cc_switch_api_restricts_unknown_cwd(self):
         with patch.object(self.mon.cc_switch, "status") as status:
             with self.assertRaises(HTTPError) as error:
@@ -286,6 +292,13 @@ class ManagementAPITests(unittest.TestCase):
         result = json.load(self.request("/interactions?session=sid-1"))
         self.assertEqual(result["interactions"][0]["tool_name"], "Bash")
         self.assertEqual(result["interactions"][0]["preview"]["kind"], "text")
+
+    def test_default_approval_is_auto_but_saved_mode_wins(self):
+        detail = json.load(self.request("/sessions/sid-1"))
+        self.assertEqual(detail["approval"], "auto")
+        self.mon.approvals.set("sid-1", "ask")
+        detail = json.load(self.request("/sessions/sid-1"))
+        self.assertEqual(detail["approval"], "ask")
 
     def test_approval_endpoint_persists(self):
         response = self.request("/sessions/sid-1/approval", {"approval": "full"},

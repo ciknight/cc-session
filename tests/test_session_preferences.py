@@ -71,11 +71,11 @@ class ApprovalPreferenceTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "approvals.json"
         self.addCleanup(self.tmp.cleanup)
 
-    def test_default_ask_and_persist(self):
+    def test_default_auto_and_persist(self):
         store = prefs.ApprovalPreferences(self.path)
-        self.assertEqual(store.get("sid-1"), "ask")
-        store.set("sid-1", "full")
-        self.assertEqual(prefs.ApprovalPreferences(self.path).get("sid-1"), "full")
+        self.assertEqual(store.get("sid-1"), "auto")
+        store.set("sid-1", "ask")
+        self.assertEqual(prefs.ApprovalPreferences(self.path).get("sid-1"), "ask")
 
     def test_invalid_mode_rejected(self):
         store = prefs.ApprovalPreferences(self.path)

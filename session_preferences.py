@@ -133,7 +133,7 @@ class ApprovalPreferences:
         except (OSError, ValueError):
             self.error = "审批模式文件无法读取或格式损坏，请先修复或移走该文件"
 
-    def get(self, sid, default="ask"):
+    def get(self, sid, default="auto"):
         with self.lock:
             return self.modes.get(sid, default)
 

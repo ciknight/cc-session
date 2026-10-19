@@ -25,7 +25,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
 
 ## 架构
 
-单文件服务 `monitor.py`（约 1900 行）+ Jinja 模板 `templates/index.html` + 本地前端依赖
+主服务 `monitor.py` + 扫描缓存 `scan_cache.py` + 会话偏好 `session_preferences.py` +
+cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地前端依赖
 `static/marked.min.js`、`static/purify.min.js`（不依赖外网 CDN）。
 
 ### 数据流
@@ -60,9 +61,13 @@ uv run monitor.py --webhook http://localhost:3000/hook
   尾部窗口，`before` 翻页时按 1 MiB 块向前加载并前插；每个会话有独立解析锁。
   跳过 sidechain（子代理对话）。工具结果合并行级 `toolUseResult`（diff/stdout/图片），
   `isMeta` 分 boilerplate / sourceToolUseID / origin 注入三种语义。
-- **子代理会话**：额外扫描 `projects/<proj>/<parent>/subagents/agent-*.jsonl`，
-  id 为 `<parent>::agent-<hash>`，默认不在 `/sessions` 返回（`?include_subagents=1`），
-  只读、不能发消息或托管。
+- **子代理会话**：`projects/<proj>/<parent>/subagents/agent-*.jsonl` 默认**不扫描**（懒加载），
+  id 为 `<parent>::agent-<hash>`，默认不在 `/sessions` 返回；`?include_subagents=1`
+  或请求子代理 id 时才解析，`--scan-subagents` 可在启动时全量扫描。只读、不能发消息或托管。
+  父会话的 `subagent_count` 来自主转录的 Agent 工具调用，不依赖子代理转录。
+- **扫描缓存**：`scan_cache.py` 把每个转录的 offset、末尾 4 KiB 校验值和累计 Session 状态存到
+  `CLAUDE_DIR/claude-sessions/scan-cache.json`；重启时校验一致就只读追加字节，截断/重写/缓存损坏
+  时回退全量解析。默认只缓存主会话，开启 `--scan-subagents` 时降低落盘频率。
 - **worktree 归并**（`project_root`）：`<proj>/.claude/worktrees/<name>` 视为属于 `<proj>`，
   看板按项目分组依赖此逻辑。
 - **状态机**：`working`（有活动且助手未完成回复）/ `idle`（`system/turn_duration`；
@@ -71,9 +76,12 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - **双时钟**：`last_input_ts` 只由真实用户输入推进（排除 tool_result、isMeta、
   origin/promptSource 注入、中断标记），`last_event_ts` 是最后一条带时间戳的转录事件；
   列表按 `last_input_ts` 排序、回退 `last_event_ts`。
-- **托管审批**：模式为 `ask`/`auto`/`full`，持久化在
-  `~/.claude/claude-sessions/approvals.json`；`ask` 等待网页响应（`--permission-timeout`
-  默认 300 秒，超时自动拒绝），`auto` 交给 CLI 权限模式，`full` 由服务自动放行。
+- **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `auto`（交给 CLI 权限模式）**，持久化在
+  `~/.claude/claude-sessions/approvals.json`；已有明确保存的模式优先。`ask` 等待网页响应
+  （`--permission-timeout` 默认 300 秒，超时自动拒绝），`full` 由服务自动放行。
+- **工作时发送**：托管会话在 `working` 时消息进入 `Hosted.pending` 队列；网页发送按钮只在
+  POST 进行中防重复点击，运行/排队中仍可继续发送。非托管会话的“工作状态下也发送”默认勾选，
+  会以 `force` 绕过 working 检查；若上一条远程一次性消息仍在跑，服务返回 409。
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有
   `completed/cancelled/discarded/refused/dropped` 结束回合。
@@ -89,10 +97,16 @@ uv run monitor.py --webhook http://localhost:3000/hook
   断线重连后全量对账；SSE 事件触发节流刷新，保留定时轮询兜底。
   对话只加载最近 100 条，向上滚动加载更早；`cursor` 记录已加载末尾，
   服务端前插旧块时用响应里的 `shift` 调整，避免增量漏消息。
+- **URL 路由**：看板视图与地址栏同步，`/p/<encodeURIComponent(项目根路径)>` 是项目列表，
+  `/p/<项目>/s/<会话ID>` 是对话，`/p/<项目>/new` 是新建；`GET /p/...` 与 `/` 一样回退渲染
+  同一 SPA 模板。导航统一走 `navigate`（`pushState`），首页自动选中项目时用 `replaceState`
+  避免多余历史记录；`popstate` 重新解析地址并恢复视图。
 
 ### 前端
 
 `templates/index.html` 是自包含 SPA：左侧项目列表、右侧会话卡片/对话视图，
 对话用 marked + DOMPurify 渲染 markdown（用户气泡 / 助手 markdown / 可折叠工具结果与 diff），
 自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
-对话视图顶部显示待审批卡片，发送区提供中断按钮和审批模式选择。
+对话视图顶部显示待审批卡片，发送区提供中断按钮和审批模式选择；审批默认 `auto`，
+发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用同一个 `composerHtml`
+输入对话框；`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，刷新重建后恢复。

@@ -20,11 +20,23 @@ function boot(fetch = async () => { throw Error('unexpected fetch'); }) {
       click(){this.clickCount=(this.clickCount || 0)+1; if(this.onclick) this.onclick();}});
     return nodes.get(id);
   };
-  const context = vm.createContext({document:{getElementById:node, createElement:tag=>({tagName:tag.toUpperCase(), value:'', textContent:'', dataset:{}})}, window:{confirm:()=>true},
+  const documentListeners = {};
+  const historyCalls = [];
+  const location = {pathname: "/"};
+  const history = {
+    pushState(state, title, url){ historyCalls.push(["push", url]); location.pathname = url; },
+    replaceState(state, title, url){ historyCalls.push(["replace", url]); location.pathname = url; },
+  };
+  const context = vm.createContext({document:{
+      getElementById:node,
+      createElement:tag=>({tagName:tag.toUpperCase(), value:'', textContent:'', dataset:{}}),
+      addEventListener(type, listener){(documentListeners[type] ||= []).push(listener);},
+    }, window:{confirm:()=>true, location, history},
     localStorage:{getItem(){return null;}}, fetch, AbortController, setTimeout, clearTimeout,
     setInterval(){}, clearInterval(){}, console});
   vm.runInContext(source, context);
-  return {node, run: s => vm.runInContext(s, context), context};
+  return {node, run: s => vm.runInContext(s, context), context, documentListeners,
+          historyCalls, location};
 }
 const response = data => ({ok:true, status:200, json:async()=>data});
 test('现有会话 Enter 发送一次，Shift 与 IME Enter 不发送', async () => {
@@ -58,12 +70,75 @@ test('现有会话 Enter 发送一次，Shift 与 IME Enter 不发送', async ()
   assert.equal(b.node('sendbtn').clickCount,1);
   assert.equal(requests.filter(([url])=>url==='/sessions/sid/message').length,1);
 
+  // 新建会话复用同一个 composer，Enter 也应触发发送按钮
   const fresh=boot();
   fresh.run('bindNewBox({cwd:"/project"})');
   const newEnter={type:'keydown',key:'Enter',shiftKey:false,isComposing:false,keyCode:13,preventDefault(){this.defaultPrevented=true;}};
   fresh.node('msgbox').dispatchEvent(newEnter);
-  assert.equal(newEnter.defaultPrevented,undefined);
-  assert.equal(fresh.node('sendbtn').clickCount,undefined);
+  assert.equal(newEnter.defaultPrevented,true);
+  assert.equal(fresh.node('sendbtn').clickCount,1);
+});
+test('默认审批为自动，工作状态下发送默认勾选', () => {
+  assert.ok(html.indexOf('value="auto"') < html.indexOf('value="ask"'));
+  assert.match(html, /id="forcecb" checked/);
+});
+test('刷新时保留已展开的工具与信息折叠状态', () => {
+  const b = boot();
+  b.run('detailsOpen["tool:t1"]=true');
+  const tool = b.run('toolPartHtml({type:"tool",tool_use_id:"t1",name:"Bash",input:"ls"})');
+  assert.match(tool, /data-dkey="tool:t1"/);
+  assert.match(tool, /data-dkey="tool:t1" open/);
+  b.run('detailsOpen["tool:t2"]=false');
+  const closed = b.run('toolPartHtml({type:"tool",tool_use_id:"t2",name:"Bash",input:"ls"})');
+  assert.doesNotMatch(closed, /data-dkey="tool:t2" open/);
+
+  b.run('detailsOpen["info:sid:tools"]=true');
+  const info = b.run('infoHtml({id:"sid",tokens:{},tool_uses:{Bash:1},subagents:[],tasks:[]})');
+  assert.match(info, /data-dkey="info:sid:tools" open/);
+
+  b.run('detailsOpen["info:sid:tasks"]=false');
+  const tasksClosed = b.run('infoHtml({id:"sid",tokens:{},tool_uses:{},subagents:[],tasks:[{id:"1",subject:"x",status:"pending"}],tasks_total:1,tasks_completed:0})');
+  assert.doesNotMatch(tasksClosed, /data-dkey="info:sid:tasks" open/);
+
+  const tasksDefault = b.run('infoHtml({id:"other",tokens:{},tool_uses:{},subagents:[],tasks:[{id:"1",subject:"x",status:"pending"}],tasks_total:1,tasks_completed:0})');
+  assert.match(tasksDefault, /data-dkey="info:other:tasks" open/);
+});
+test('toggle 事件记录 details 展开状态', () => {
+  const b = boot();
+  const handler = b.documentListeners.toggle[0];
+  handler({target:{tagName:'DETAILS', dataset:{dkey:'tool:t1'}, open:true}});
+  assert.equal(b.run('detailsOpen["tool:t1"]'), true);
+  handler({target:{tagName:'DETAILS', dataset:{dkey:'tool:t1'}, open:false}});
+  assert.equal(b.run('detailsOpen["tool:t1"]'), false);
+});
+test('新建会话与对话复用同一个 composer', () => {
+  const b = boot();
+  const conv = b.run('composerHtml("conv", {hosted:false})');
+  const fresh = b.run('composerHtml("new", {})');
+  for(const markup of [conv, fresh]){
+    assert.match(markup, /id="msgbox"/);
+    assert.match(markup, /id="sendbtn"/);
+    assert.match(markup, /model-controls/);
+    assert.match(markup, /id="hostcb"/);
+  }
+  assert.match(fresh, /创建并发送/);
+  assert.match(conv, /工作状态下也发送/);
+});
+test('运行/排队中仍可发送，只有提交中的防重复点击会禁用', () => {
+  const b = boot();
+  b.run('curPanel={type:"conv",key:"sid"}');
+  for(const status of ['running', 'queued']){
+    b.run(`sendJobs["sid"]={status:${JSON.stringify(status)}}`);
+    b.run('updateSendSt("sid")');
+    assert.equal(b.node('sendbtn').disabled, false, status + ' 不应禁用发送');
+  }
+  b.run('sendJobs["sid"]={status:"sending"}');
+  b.run('updateSendSt("sid")');
+  assert.equal(b.node('sendbtn').disabled, true, '提交中应防重复点击');
+  // 新建会话在拿到 sid 前不能连续发送，否则会创建多个新会话
+  b.run('curPanel={type:"new",key:"/project"}; sendJobs["new:/project"]={status:"running"}');
+  b.run('updateSendSt("new:/project")');
+  assert.equal(b.node('sendbtn').disabled, true);
 });
 test('项目会话列表保留 local 配置，对话详情不显示或绑定 local 控件', async () => {
   const list=boot();
@@ -516,9 +591,11 @@ test('计划与选择卡片渲染及答案收集', () => {
   assert.match(plan,/批准计划/); assert.match(plan,/继续规划/);
   assert.match(plan,/keep planning/);
   const choice=b.run('interactionsHtml([{id:"c1",kind:"choice",questions:[' +
-    '{question:"Q1",multiSelect:true,options:[{label:"A"},{label:"B"}]}]}])');
+    '{question:"Q1",header:"URL 方案",multiSelect:true,' +
+    'options:[{label:"A",description:"说明 A"},{label:"B"}]}]}])');
   assert.match(choice,/checkbox/); assert.match(choice,/Q1/);
-  assert.match(choice,/data-act="choice-submit"/);
+  assert.match(choice,/URL 方案/); assert.match(choice,/说明 A/);
+  assert.match(choice,/choice-opt/); assert.match(choice,/data-act="choice-submit"/);
   const free=b.run('collectChoiceAnswers({querySelectorAll:()=>[' +
     '{dataset:{q:"Q1"},querySelector:()=>({value:"custom"}),querySelectorAll:()=>[]}]})');
   assert.equal(JSON.stringify(free), JSON.stringify({Q1:'custom'}));
@@ -526,6 +603,21 @@ test('计划与选择卡片渲染及答案收集', () => {
     '{dataset:{q:"Q1"},querySelector:()=>null,' +
     'querySelectorAll:()=>[{dataset:{label:"A"}},{dataset:{label:"B"}}]}]})');
   assert.equal(JSON.stringify(picked), JSON.stringify({Q1:'A, B'}));
+});
+test('SSE 事件触发的列表刷新遵循用户设置的间隔', async () => {
+  const requested = [];
+  const b = boot(async url => { requested.push(url); return response([]); });
+  const timers = [];
+  b.context.setTimeout = (fn, ms) => { timers.push({fn, ms}); return timers.length; };
+  b.context.clearTimeout = id => { if(id && timers[id - 1]) timers[id - 1].cancelled = true; };
+  b.node('ival').value = '5000';
+  await b.run('load()');                    // 页面首屏加载 /sessions
+  assert.deepEqual(requested, ['/sessions']);
+  timers.length = 0;
+  b.run('scheduleListRefresh()');           // 紧接着到达一条 SSE 事件
+  assert.equal(timers.length, 1);
+  assert.ok(timers[0].ms >= 4900,
+    `用户间隔 5s 时事件不应立刻刷新列表，实际排定 ${timers[0].ms}ms`);
 });
 test('API 重试横幅显示错误与重试次数，清除后隐藏', () => {
   const b=boot();
@@ -539,4 +631,53 @@ test('API 重试横幅显示错误与重试次数，清除后隐藏', () => {
   b.run('renderApiError(null)');
   assert.equal(el.textContent, '');
   assert.equal(el.style.display, 'none');
+});
+test('URL 路由可生成并解析项目/会话/新建视图', () => {
+  const b = boot();
+  const cwd = 'F:\\code\\proj one';
+  b.context.v = {project: cwd, session: null, new: false};
+  assert.equal(b.run('routePath(v)'), '/p/F%3A%5Ccode%5Cproj%20one');
+  b.context.v = {project: cwd, session: '0f3c-uuid', new: false};
+  assert.equal(b.run('routePath(v)'), '/p/F%3A%5Ccode%5Cproj%20one/s/0f3c-uuid');
+  b.context.v = {project: cwd, session: null, new: true};
+  assert.equal(b.run('routePath(v)'), '/p/F%3A%5Ccode%5Cproj%20one/new');
+  b.context.v = {project: null, session: null, new: false};
+  assert.equal(b.run('routePath(v)'), '/');
+
+  b.context.path = '/p/F%3A%5Ccode%5Cproj%20one/s/abc';
+  assert.deepEqual({...b.run('parseRoute(path)')}, {project: cwd, session: 'abc', new: false});
+  b.context.path = '/p/F%3A%5Ccode%5Cproj%20one';
+  assert.deepEqual({...b.run('parseRoute(path)')}, {project: cwd, session: null, new: false});
+  b.context.path = '/p/F%3A%5Ccode%5Cproj%20one/new';
+  assert.deepEqual({...b.run('parseRoute(path)')}, {project: cwd, session: null, new: true});
+
+  for(const bad of ['/', '/p/', '/p/x/unknown', '/p/x/s/', '/s/abc', '/p/%E0%A4%A']){
+    b.context.path = bad;
+    assert.equal(b.run('parseRoute(path)'), null, bad);
+  }
+});
+test('导航同步 URL，并在默认项目解析后替换首页地址', () => {
+  const b = boot();
+  b.context.__s = {id:'s1', project:'F:\\code\\p', cwd:'F:\\code\\p',
+                   state:'idle', tokens:{}};
+  b.run('sessions = [__s]');
+
+  b.context.__next = {project:'F:\\code\\p', session:null, new:false};
+  b.run('navigate(__next)');
+  assert.deepEqual(b.historyCalls, [['push', '/p/F%3A%5Ccode%5Cp']]);
+  assert.equal(b.location.pathname, '/p/F%3A%5Ccode%5Cp');
+
+  b.context.__next = {project:'F:\\code\\p', session:'s1', new:false};
+  b.run('navigate(__next)');
+  assert.deepEqual(b.historyCalls[1], ['push', '/p/F%3A%5Ccode%5Cp/s/s1']);
+  assert.equal(b.run('view.session'), 's1');
+
+  b.context.__next = {project:'F:\\code\\p', session:null, new:false};
+  b.run('navigate(__next)');
+  assert.equal(b.historyCalls.length, 3);
+
+  // 回到根路径：数据已加载，应自动选中项目并 replace 成项目地址
+  b.location.pathname = '/';
+  b.run('navigate({project:null, session:null, new:false})');
+  assert.deepEqual(b.historyCalls[3], ['replace', '/p/F%3A%5Ccode%5Cp']);
 });
