@@ -441,3 +441,17 @@ test('不可用 cc-switch 不执行写入，目标 pending 不互相阻塞', asy
   await b.run('applyCc("/a")');
   assert.equal(b.run('ccStates["/b"].pending'), true);
 });
+test('审批卡片与富工具结果渲染，中断按钮随托管状态启用', () => {
+  const b=boot();
+  const card=b.run('interactionsHtml([{id:"r1",tool_name:"Bash",preview:{kind:"text",text:"ls -la"},' +
+    'allow_always:true,reason:"runs a command"}])');
+  assert.match(card,/需要审批/); assert.match(card,/始终允许/); assert.match(card,/ls -la/);
+  const result=b.run('convHtml([{role:"assistant",ts:0,parts:[{type:"tool",name:"Edit",' +
+    'input:"{}",result:{kind:"diff",text:"-old"+String.fromCharCode(10)+"+new"}}]}])');
+  assert.match(result,/diff-del/); assert.match(result,/diff-add/);
+  b.run('updateHostedControls({hosted:true,hosted_busy:false,hosted_queued:2,approval:"full"})');
+  assert.equal(b.node('intbtn').disabled,true);
+  assert.equal(b.node('approvalsel').value,'full');
+  b.run('updateHostedControls({hosted:true,hosted_busy:true,approval:"ask"})');
+  assert.equal(b.node('intbtn').disabled,false);
+});

@@ -76,6 +76,16 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .abody table{border-collapse:collapse}.abody td,.abody th{border:1px solid var(--bd);padding:2px 8px;font-size:13px}
 .tool{font:12px ui-monospace,monospace;color:var(--mut);background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:2px 8px;margin:3px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
 .terror{font-size:12px;color:#dc2626;background:rgba(220,38,38,.08);border-radius:6px;padding:2px 8px;margin:3px 0}
+.tool-details{margin:3px 0;font-size:12px}
+.tool-details>summary{cursor:pointer;color:var(--mut);font-family:ui-monospace,monospace;
+  background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:2px 8px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool-out{margin:4px 0;max-height:320px;overflow:auto;background:var(--card2);
+  border:1px solid var(--bd);border-radius:6px;padding:6px 8px;white-space:pre-wrap;
+  font:12px ui-monospace,monospace}
+.diff-add{color:#16a34a}.diff-del{color:#dc2626}.diff-hunk{color:var(--acc)}
+.inter-card{background:var(--card);border:1px solid #d97706;border-radius:8px;padding:10px 12px;margin:8px 0}
+.inter-card pre{white-space:pre-wrap;max-height:240px;overflow:auto;font:12px ui-monospace,monospace}
 .sysbody{font-size:12.5px;color:var(--mut);white-space:pre-wrap;word-break:break-word;
          border:1px dashed var(--bd);border-radius:6px;padding:4px 8px;max-width:100%}
 .msg.tool,.msg.system{display:flex;flex-direction:column;align-items:flex-start}
@@ -461,6 +471,30 @@ function infoHtml(d){
       d.tasks.map(x => `<li class="${x.status}">[${TASK_ZH[x.status] || x.status}] ${esc(x.subject)}</li>`).join("") + "</ul></details>" : ""}`;
 }
 
+function diffHtml(text){
+  return String(text || "").split("\n").map(line => {
+    const cls = line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-del"
+              : line.startsWith("@@") ? "diff-hunk" : "";
+    return `<span class="${cls}">${esc(line)}</span>`;
+  }).join("\n");
+}
+function toolResultHtml(p){
+  const r = p.result;
+  if(!r) return "";
+  if(r.kind === "diff") return `<pre class="tool-out">${diffHtml(r.text)}</pre>`;
+  if(r.kind === "image") return `<div class="mut">[图片] ${esc(r.text || "")}</div>`;
+  if(r.is_error || r.kind === "error") return `<div class="terror">✗ ${esc(r.text || "")}</div>`;
+  return `<pre class="tool-out">${esc(r.text || "")}</pre>`;
+}
+function toolPartHtml(p){
+  if(p.type === "tool_result")
+    return `<div class="tool">🔧 工具结果${p.is_error ? " (错误)" : ""}</div>` + toolResultHtml(p);
+  if(p.type === "tool_note") return `<div class="sysbody">${esc(p.text)}</div>`;
+  if(p.type === "error") return `<div class="terror">✗ ${esc(p.text)}</div>`;
+  const notes = (p.notes || []).map(esc).join("\n");
+  return `<details class="tool-details"><summary>🔧 ${esc(p.name)}: ${esc(p.input)}</summary>` +
+    (notes ? `<div class="mut">${esc(notes)}</div>` : "") + toolResultHtml(p) + `</details>`;
+}
 function convHtml(messages){
   // 连续同角色合并为一组渲染
   const groups = [];
@@ -475,16 +509,69 @@ function convHtml(messages){
         return g.role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
              : g.role === "assistant" ? `<div class="abody">${md(p.text)}</div>`
              : `<div class="sysbody">${esc(p.text)}</div>`;
-      if(p.type === "tool")
-        return `<div class="tool">🔧 ${esc(p.name)}: ${esc(p.input)}</div>`;
-      if(p.type === "error")
-        return `<div class="terror">✗ ${esc(p.text)}</div>`;
+      if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
       return "";
     }).join("");
     const who = {user: "用户", assistant: "助手", tool: "工具", system: "系统"}[g.role] || g.role;
     const when = g.ts ? new Date(g.ts*1000).toLocaleString() : "";
     return `<div class="msg ${g.role}"><div class="mhead">${who} · ${when}</div>${body}</div>`;
   }).join("");
+}
+
+let interCache = {id: null, sig: ""};
+function interactionsHtml(items){
+  if(!items || !items.length) return "";
+  return items.map(it => {
+    const preview = it.preview || {};
+    const body = preview.kind === "diff" ? diffHtml(preview.text)
+               : `<pre>${esc(preview.text || "")}</pre>`;
+    return `<div class="inter-card" data-iid="${esc(it.id)}">
+      <div><b>需要审批</b> · <code>${esc(it.tool_name)}</code></div>
+      ${it.reason ? `<div class="mut">${esc(it.reason)}</div>` : ""}
+      ${body}
+      <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="back" data-act="allow" data-scope="once">允许一次</button>
+        ${it.allow_always ? '<button class="back" data-act="allow" data-scope="always">始终允许</button>' : ""}
+        <button class="back" data-act="deny">拒绝</button>
+      </div></div>`;
+  }).join("");
+}
+function renderInteractions(items){
+  const el = document.getElementById("interactions");
+  if(!el) return;
+  const sig = JSON.stringify((items || []).map(it => [it.id, it.state]));
+  if(interCache.sig === sig) return;
+  interCache.sig = sig;
+  el.innerHTML = interactionsHtml(items);
+}
+async function respondInteraction(card, act, scope){
+  if(!card) return;
+  const iid = card.dataset.iid;
+  const buttons = card.querySelectorAll ? card.querySelectorAll("button") : [];
+  buttons.forEach(b => b.disabled = true);
+  try{
+    const r = await fetchT("/interactions/" + encodeURIComponent(iid) + "/respond", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({behavior: act, scope}),
+    });
+    const j = await r.json();
+    if(!r.ok) throw Error(j.error || ("HTTP " + r.status));
+    interCache.sig = "";
+    load();
+  }catch(e){
+    if(card.insertAdjacentHTML)
+      card.insertAdjacentHTML("beforeend", `<div class="terror">${esc(e.message)}</div>`);
+    buttons.forEach(b => b.disabled = false);
+  }
+}
+function updateHostedControls(d){
+  const sel = document.getElementById("approvalsel");
+  if(sel && d && d.approval) sel.value = d.approval;
+  const intBtn = document.getElementById("intbtn");
+  if(intBtn && d){
+    intBtn.disabled = !(d.hosted && d.hosted_busy);
+    intBtn.title = d.hosted_queued ? ("队列 " + d.hosted_queued) : "";
+  }
 }
 
 let convLoading = null;     // 正在拉取对话的会话 id，防止同一会话的请求叠加
@@ -514,6 +601,8 @@ async function renderConversation(id, force){
       // 同面板 keep 分支只更新历史信息，模型输入和 local 控件不重建。
       document.getElementById("infopanel").innerHTML = infoHtml(d);
       updateModelSt(id);
+      renderInteractions(d.interactions || []);
+      updateHostedControls(d);
       if(force || convCache.id !== id || convCache.size !== m.size){
         const nearTop = main.scrollTop < 80;   // 倒序后最新消息在顶部
         convCache = {id, size: m.size};
@@ -533,12 +622,20 @@ async function renderConversation(id, force){
         ${esc(sessTitle(d))}
         <span class="mut">${esc(d.cwd || "")}</span></h2>
       <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
+      <div id="interactions"></div>
       <div class="info-panel">
         ${modelControlsHtml()}
         <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
           style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
         <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <button class="back" id="sendbtn">发送</button>
+          <button class="back" id="intbtn" disabled>中断</button>
+          <label class="ctl" id="approvalwrap">审批
+            <select id="approvalsel" aria-label="托管审批模式">
+              <option value="ask">询问</option>
+              <option value="auto">自动</option>
+              <option value="full">全部允许</option>
+            </select></label>
           <label class="ctl"><input type="checkbox" id="forcecb"> 忽略 working 强制发送</label>
           <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
             <input type="checkbox" id="hostcb" ${d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
@@ -555,6 +652,9 @@ async function renderConversation(id, force){
     curPanel = {type: "conv", key: id};
     bindModel(id, d.selected_model);
     loadModelOptions(id, d.cwd);
+    interCache = {id, sig: ""};
+    renderInteractions(d.interactions || []);
+    updateHostedControls(d);
     updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
     main.scrollTop = 0;
   }catch(e){ /* 下次刷新重试 */ }
@@ -730,6 +830,35 @@ function bindSendBox(id, d){
       un.disabled = false;
     }
   };
+  const intBtn = document.getElementById("intbtn");
+  if(intBtn) intBtn.onclick = async () => {
+    intBtn.disabled = true;
+    try{
+      const r = await fetchT("/sessions/" + encodeURIComponent(id) + "/interrupt",
+        {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+      const j = await r.json();
+      if(!r.ok) document.getElementById("sendst").textContent = "中断失败: " + (j.error || r.status);
+    }catch(e){
+      document.getElementById("sendst").textContent = "中断错误: " + e;
+    }finally{
+      intBtn.disabled = false;
+      load();
+    }
+  };
+  const approvalSel = document.getElementById("approvalsel");
+  if(approvalSel) approvalSel.onchange = async () => {
+    try{
+      const r = await fetchT("/sessions/" + encodeURIComponent(id) + "/approval", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({approval: approvalSel.value}),
+      });
+      const j = await r.json();
+      document.getElementById("sendst").textContent =
+        r.ok ? "审批模式已更新" : ("失败: " + (j.error || r.status));
+    }catch(e){
+      document.getElementById("sendst").textContent = "审批模式保存失败: " + e;
+    }
+  };
   btn.onclick = async () => {
     const text = document.getElementById("msgbox").value.trim();
     if(!text) return;
@@ -837,6 +966,12 @@ document.getElementById("projs").addEventListener("click", e => {
   renderMain();
 });
 document.getElementById("main").addEventListener("click", e => {
+  const act = e.target.closest && e.target.closest("#interactions button[data-act]");
+  if(act){
+    const card = act.closest(".inter-card");
+    respondInteraction(card, act.dataset.act, act.dataset.scope || "once");
+    return;
+  }
   if(e.target.closest("#newp")){
     view = {project: view.project, session: null, new: true};
     renderMain();
