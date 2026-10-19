@@ -19,15 +19,21 @@
 | `/p/<project>/new` | 新建会话页 |
 
 `<project>` 是项目根路径（`project_root` 的结果，与 `view.project` 一致），
-`<sessionId>` 是会话 id，二者均使用 `encodeURIComponent` 编码后作为单个路径段。
-Windows 路径示例：`/p/F%3A%5Ccode%5Cclaude-sessions/s/0f3c...`。
+`<sessionId>` 是会话 id。项目路径按目录层级展开为可读形式：反斜杠归一为 `/`，
+盘符冒号保留，只对空格、`#`、`?`、中文等会破坏 URL 的字符做百分号编码。
+Windows 示例：`/p/F:/code/claude-sessions/s/0f3c...`。
+旧格式（整条路径编码为 `%3A%5C...` 单个路径段）仍能解析，并会被规整为可读路径。
 
 ## 前端（`templates/index.html`）
 
 新增纯函数，便于在 Node vm 测试中直接调用：
 
+- `encSeg` / `projectUrlPath`：逐段编码并把项目路径展开成可读的 `/` 分隔形式。
 - `routePath(view)`：由 `{project, session, new}` 生成 URL；无项目时返回 `/`。
 - `parseRoute(pathname)`：解析 URL；非 `/p/...` 结构、空项目、非法百分号编码返回 `null`。
+  返回的 `fullProject` 保留未剥离的完整路径，供歧义消解使用。
+- `resolveViewProject(projects)`：把 URL 中的可读路径映射回系统原生 cwd；
+  若完整路径本身就是一个项目（目录名恰好是 `new` 或形如 `.../s/xxx`），优先按项目列表解析。
 - `readRoute()`：读取 `window.location.pathname` 并调用 `parseRoute`，无 `window.location`
   时返回 `null`（兼容测试环境）。
 - `syncUrl(view, replace)`：URL 与目标不一致时调用 `pushState`/`replaceState`；
@@ -60,7 +66,7 @@ Windows 路径示例：`/p/F%3A%5Ccode%5Cclaude-sessions/s/0f3c...`。
 ## 测试
 
 - 前端（`tests/test_frontend_controls.js`）：`routePath` 生成、`parseRoute` 解析
-  （项目列表/对话/新建/非法编码/根路径）。
+  （项目列表/对话/新建/非法编码/根路径/旧编码链接）、以及 `resolveViewProject` 的歧义消解。
 - 服务端（`tests/test_management_api.py`）：`GET /p/demo` 返回 `text/html` 且含
   SPA 标记。
 

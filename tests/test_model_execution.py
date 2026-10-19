@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -67,6 +68,41 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(cmd[-1], "--model=vendor-model-7")
         self.assertNotIn("--model=haiku", cmd)
         self.assertEqual(self.mon.preferences.get("existing"), "vendor-model-7")
+
+    def test_oneshot_messages_queue_while_running(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def fake_exec(self, job, cmd, cwd, text):
+            calls.append(text)
+            if text == "first":
+                started.set()
+                release.wait(5)
+            job["result"] = text
+            job["status"] = "done"
+            job["finished_at"] = monitor.now_ts()
+
+        with patch.object(monitor.Monitor, "_exec", fake_exec):
+            code, first = self.mon.send_message("existing", "first")
+            self.assertEqual(code, 202)
+            self.assertTrue(started.wait(2))
+            code, second = self.mon.send_message("existing", "second")
+            self.assertEqual(code, 202)
+            self.assertEqual(second["status"], "queued")
+            release.set()
+            end = time.time() + 5
+            while time.time() < end:
+                if (self.mon.jobs[first["job_id"]]["status"] == "done"
+                        and self.mon.jobs[second["job_id"]]["status"] == "done"):
+                    break
+                time.sleep(0.01)
+        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(self.mon.jobs[first["job_id"]]["status"], "done")
+        self.assertEqual(self.mon.jobs[second["job_id"]]["status"], "done")
+        with self.mon.lock:
+            self.assertNotIn("existing", self.mon.busy)
+            self.assertNotIn("existing", self.mon.remote_queues)
 
     def test_working_session_requires_force_for_oneshot(self):
         self.sess.state = "working"

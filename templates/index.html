@@ -186,10 +186,20 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 
 <script>
 const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
+const SEND_POLL_TIMEOUT_MS = 30 * 60 * 1000;   // 发送后跟踪 /jobs 的最长时间
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATE_ZH = {working: "工作中", idle: "空闲", stale: "无活动"};
 // <details> 的展开状态跨 innerHTML 重建保留；key 必须由内容派生且稳定
-const detailsOpen = Object.create(null);
+const detailsOpen = (() => {
+  const state = Object.create(null);
+  if(typeof sessionStorage === "undefined") return state;
+  try{ return Object.assign(state, JSON.parse(sessionStorage.getItem("detailsOpen") || "{}")); }
+  catch{ return state; }
+})();
+function saveDetailsOpen(){
+  if(typeof sessionStorage === "undefined") return;
+  try{ sessionStorage.setItem("detailsOpen", JSON.stringify(detailsOpen)); }catch{ /* 超限或隐私模式 */ }
+}
 function detailsAttrs(key, defaultOpen = false){
   const open = key in detailsOpen ? detailsOpen[key] : defaultOpen;
   return ` data-dkey="${esc(key)}"` + (open ? " open" : "");
@@ -238,29 +248,60 @@ const projName = cwd => (cwd || "?").replace(/[\\/]+$/, "").split(/[\\/]/).pop()
 const sessTitle = s => (!s.title || s.title.includes("�")) ? (s.first_user_message || s.id.slice(0, 8)) : s.title;
 
 /* ---------- URL 路由 ---------- */
-// 项目根路径与会话 id 都作为单个路径段，编码后直接拼进 URL
+// 路径按目录层级展开，保留几乎可读的字符；只转义空格、#、? 等会破坏 URL 的字符
+function encSeg(s){ return encodeURIComponent(String(s)).replace(/%3A/gi, ":"); }
+function decSeg(s){
+  try{ return decodeURIComponent(s); }catch{ return null; }
+}
+function normPath(p){
+  return String(p == null ? "" : p).replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+function sameProject(a, b){ return !!a && !!b && normPath(a) === normPath(b); }
+function projectUrlPath(cwd){
+  return normPath(cwd).split("/").filter(Boolean).map(encSeg).join("/");
+}
 function routePath(v){
   if(!v || !v.project) return "/";
-  const base = "/p/" + encodeURIComponent(v.project);
-  if(v.session) return base + "/s/" + encodeURIComponent(v.session);
+  const base = "/p/" + projectUrlPath(v.project);
+  if(v.session) return base + "/s/" + encSeg(v.session);
   if(v.new) return base + "/new";
   return base;
 }
 function parseRoute(pathname){
   if(!pathname) return null;
   const parts = pathname.split("/").filter(Boolean);
-  if(parts.length < 2 || parts.length > 4 || parts[0] !== "p") return null;
-  let project;
-  try{ project = decodeURIComponent(parts[1]); }catch{ return null; }
-  if(!project) return null;
-  if(parts.length === 2) return {project, session: null, new: false};
-  if(parts.length === 3 && parts[2] === "new") return {project, session: null, new: true};
-  if(parts.length === 4 && parts[2] === "s"){
-    let session;
-    try{ session = decodeURIComponent(parts[3]); }catch{ return null; }
-    return session ? {project, session, new: false} : null;
+  if(parts.length < 2 || parts[0] !== "p") return null;
+  const all = parts.slice(1).map(decSeg);
+  if(all.some(x => x === null)) return null;
+  let rest = parts.slice(1), session = null, isNew = false;
+  // 从右端识别 /s/<会话ID> 与 /new；项目路径本身可能包含斜杠
+  if(rest.length >= 3 && rest[rest.length - 2] === "s"){
+    session = decSeg(rest[rest.length - 1]);
+    if(session === null) return null;
+    rest = rest.slice(0, -2);
+  } else if(rest.length >= 2 && rest[rest.length - 1] === "new"){
+    isNew = true;
+    rest = rest.slice(0, -1);
   }
-  return null;
+  if(!rest.length) return null;
+  const project = rest.map(decSeg).join("/");
+  // fullProject 用于消歧：目录本身就叫 new 或形如 .../s/xxx 时优先按项目列表解析
+  return {project, session, new: isNew, fullProject: all.join("/")};
+}
+// 把 URL 中的可读路径映射回系统原生 cwd；同时处理 "项目目录名恰好是 new" 的歧义
+function resolveViewProject(projects){
+  if(!view) return;
+  if(view.fullProject){
+    const exact = projects.find(p => sameProject(p.cwd, view.fullProject));
+    if(exact){
+      view = {project: exact.cwd, session: null, new: false};
+      return;
+    }
+    delete view.fullProject;
+  }
+  if(!view.project) return;
+  const match = projects.find(p => sameProject(p.cwd, view.project));
+  if(match) view.project = match.cwd;
 }
 
 function md(text){
@@ -299,14 +340,14 @@ function composerHtml(mode, d){
     <textarea id="msgbox" rows="3" placeholder="${isNew ? "输入首条消息…" : "给该会话发消息…"}"></textarea>
     <div class="composer-actions">
       <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
-      ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断</button>
+      ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断</button>`}
       <label class="ctl" id="approvalwrap">审批
         <select id="approvalsel" aria-label="托管审批模式">
           <option value="auto">自动</option>
           <option value="ask">询问</option>
           <option value="full">全部允许</option>
         </select></label>
-      <label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
+      ${isNew ? "" : `<label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
         <input type="checkbox" id="forcecb" checked> 工作状态下也发送</label>`}
       <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
         <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
@@ -316,7 +357,7 @@ function composerHtml(mode, d){
     <div class="mut composer-status" id="sendst"></div>
   </div>`;
 }
-function bindComposerKeys(key){
+function bindComposerKeys(){
   const btn = document.getElementById("sendbtn"), box = document.getElementById("msgbox");
   if(!btn || !box) return;
   box.addEventListener("keydown", event => {
@@ -1148,11 +1189,12 @@ function renderNewSession(p){
 function bindNewBox(p){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
-  bindComposerKeys("new:" + p.cwd);
+  bindComposerKeys();
   btn.onclick = async () => {
     const text = document.getElementById("msgbox").value.trim();
     if(!text) return;
     const useHost = document.getElementById("hostcb").checked;
+    const approval = document.getElementById("approvalsel")?.value || "auto";
     const key = "new:" + p.cwd;
     const selectedModel = modelSnapshot(key);
     if(selectedModel === undefined) return;
@@ -1172,7 +1214,10 @@ function bindNewBox(p){
     try{
       const r = await fetchT(useHost ? "/hosted" : "/new", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({cwd: p.cwd, text, model: selectedModel}),
+        // 非托管 /new 不接受 approval；托管时把对话框里的选择带给首轮进程
+        body: JSON.stringify(useHost
+          ? {cwd: p.cwd, text, model: selectedModel, approval}
+          : {cwd: p.cwd, text, model: selectedModel}),
       }, 30000);
       const j = await r.json();
       if(r.status !== 202){
@@ -1180,7 +1225,13 @@ function bindNewBox(p){
         updateSendSt(key); return;
       }
       document.getElementById("msgbox").value = "";
+      const deadline = Date.now() + SEND_POLL_TIMEOUT_MS;
       for(;;){
+        if(Date.now() >= deadline){
+          sendJobs[sid || key] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
+          updateSendSt(sid || key);
+          break;
+        }
         await new Promise(f => setTimeout(f, 1500));
         // 并行跟踪：任务状态 + 托管进程的 init 事件（后者几秒内就带上新 session id，不用等首轮跑完）
         const [jrRes, hsRes] = await Promise.all([
@@ -1221,7 +1272,7 @@ function bindNewBox(p){
 function bindSendBox(id, d){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
-  bindComposerKeys(id);
+  bindComposerKeys();
   const un = document.getElementById("unhostbtn");
   if(un) un.onclick = async () => {
     if(!d.hosted_id) return;
@@ -1298,7 +1349,13 @@ function bindSendBox(id, d){
       // 已有托管或一次性消息只做软刷新，避免打断正在输入的下一条消息。
       if(useHost) curPanel = null;
       load();
+      const deadline = Date.now() + SEND_POLL_TIMEOUT_MS;
       for(;;){
+        if(Date.now() >= deadline){
+          sendJobs[id] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
+          updateSendSt(id);
+          break;
+        }
         await new Promise(f => setTimeout(f, 1500));
         const jr = await (await fetchT("/jobs/" + encodeURIComponent(j.job_id), {}, 15000)).json();
         // 多个消息排队时只更新自己的状态，避免旧任务的轮询覆盖新任务
@@ -1350,7 +1407,8 @@ function navigate(next, opts){
   renderMain();
 }
 function onPopState(){
-  navigate(readRoute() || {project: null, session: null, new: false});
+  // 地址栏已经变化，这里只恢复视图；用 replace 避免把旧格式地址再压入一条历史记录
+  navigate(readRoute() || {project: null, session: null, new: false}, {replace: true});
 }
 
 /* ---------- 主渲染 ---------- */
@@ -1363,10 +1421,12 @@ function renderPendingBadge(){
 }
 function renderMain(){
   const projects = groupByProject();
+  resolveViewProject(projects);
   renderSidebar(projects);
   document.getElementById("total").textContent = `(${sessions.length})`;
   renderPendingBadge();
   if(view.session){
+    syncUrl(view, true);   // 旧格式编码地址自动规整成可读路径
     renderConversation(view.session, false);
     return;
   }
@@ -1452,8 +1512,10 @@ document.getElementById("main").addEventListener("click", e => {
 if(document.addEventListener){
   document.addEventListener("toggle", event => {
     const el = event.target;
-    if(el && el.tagName === "DETAILS" && el.dataset && el.dataset.dkey)
+    if(el && el.tagName === "DETAILS" && el.dataset && el.dataset.dkey){
       detailsOpen[el.dataset.dkey] = !!el.open;
+      saveDetailsOpen();
+    }
   }, true);
 }
 

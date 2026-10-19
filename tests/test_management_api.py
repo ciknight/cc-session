@@ -150,6 +150,12 @@ class ManagementAPITests(unittest.TestCase):
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         self.sess.path = path
 
+    def test_sessions_include_subagents_triggers_lazy_scan(self):
+        with patch.object(self.mon, "scan_subagents_once") as scan:
+            response = self.request("/sessions?include_subagents=1")
+        scan.assert_called_once()
+        self.assertEqual([item["id"] for item in json.load(response)], ["sid-1"])
+
     def test_messages_paging_default_and_before(self):
         self._write_transcript(250)
         first = json.load(self.request("/sessions/sid-1/messages"))

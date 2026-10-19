@@ -202,6 +202,29 @@ class InteractionTests(unittest.TestCase):
         host.set_approval("ask")
         self.assertEqual(host.approval, "ask")
 
+    def test_auto_switch_from_ask_sets_and_clears_flag(self):
+        host, job = self.start_host("first", approval="ask")
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        calls = []
+        host._control = lambda subtype, **params: calls.append((subtype, params))
+        host.set_approval("auto")
+        self.assertTrue(host.added_auto_permission)
+        host.set_approval("ask")
+        self.assertFalse(host.added_auto_permission)
+        self.assertEqual(calls, [("set_permission_mode", {"mode": "auto"}),
+                                 ("set_permission_mode", {"mode": "default"})])
+
+    def test_ask_switch_keeps_user_permission_mode(self):
+        self.mon.claude_args = ["--permission-mode", "acceptEdits"]
+        host, job = self.start_host("first", approval="auto")
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        self.assertFalse(host.added_auto_permission)
+        calls = []
+        host._control = lambda subtype, **params: calls.append((subtype, params))
+        host.set_approval("ask")
+        self.assertEqual(calls, [])
+        self.assertEqual(host.approval, "ask")
+
     def test_stop_mid_turn_does_not_leave_job_running(self):
         host, job = self.start_host("slow")
         self.assertTrue(self.wait_for(lambda: host.current is not None))

@@ -119,10 +119,28 @@ test('新建会话与对话复用同一个 composer', () => {
     assert.match(markup, /id="msgbox"/);
     assert.match(markup, /id="sendbtn"/);
     assert.match(markup, /model-controls/);
+    assert.match(markup, /id="approvalsel"/);
     assert.match(markup, /id="hostcb"/);
   }
   assert.match(fresh, /创建并发送/);
   assert.match(conv, /工作状态下也发送/);
+});
+test('新建会话托管时把审批模式提交给 /hosted', async () => {
+  const requests=[];
+  const b=boot(async (url, opts={})=>{
+    if(url.startsWith('/cc-switch?')) return response({model_options:[]});
+    if(url==='/hosted'){
+      requests.push(JSON.parse(opts.body));
+      return {ok:false,status:500,json:async()=>({error:'stop'})};
+    }
+    throw Error('unexpected fetch ' + url);
+  });
+  b.run('view={project:"/project",session:null,new:true}; renderNewSession({cwd:"/project"})');
+  b.node('msgbox').value='hello';
+  b.node('hostcb').checked=true;
+  b.node('approvalsel').value='full';
+  await b.node('sendbtn').onclick();
+  assert.deepEqual(requests,[{cwd:'/project',text:'hello',model:null,approval:'full'}]);
 });
 test('运行/排队中仍可发送，只有提交中的防重复点击会禁用', () => {
   const b = boot();
@@ -367,7 +385,10 @@ test('切入 sid 时 profile options 请求仍 pending，/new 与 /hosted 都能
     assert.equal(b.node('modelsel').options.find(option=>option.value==='profile:0')?.textContent,'团队 Sonnet');
     assert.equal(b.node('modelcustom').hidden,true);
     const target=useHost?'/hosted':'/new';
-    assert.deepEqual(sent,[[target,{cwd:'/project',text:'hello',model:'vendor-model'}]]);
+    const expected=useHost
+      ? {cwd:'/project',text:'hello',model:'vendor-model',approval:'auto'}
+      : {cwd:'/project',text:'hello',model:'vendor-model'};
+    assert.deepEqual(sent,[[target,expected]]);
     oldOptionsResolve(response({model_options:[{name:'团队 Sonnet',model:'vendor-model'}]}));
     for(let i=0;i<5;i++) await Promise.resolve();
     assert.equal(b.node('modelsel').value,'profile:0');
@@ -632,29 +653,49 @@ test('API 重试横幅显示错误与重试次数，清除后隐藏', () => {
   assert.equal(el.textContent, '');
   assert.equal(el.style.display, 'none');
 });
-test('URL 路由可生成并解析项目/会话/新建视图', () => {
+test('URL 路由使用可读路径，并能解析旧编码链接', () => {
   const b = boot();
   const cwd = 'F:\\code\\proj one';
   b.context.v = {project: cwd, session: null, new: false};
-  assert.equal(b.run('routePath(v)'), '/p/F%3A%5Ccode%5Cproj%20one');
+  assert.equal(b.run('routePath(v)'), '/p/F:/code/proj%20one');
   b.context.v = {project: cwd, session: '0f3c-uuid', new: false};
-  assert.equal(b.run('routePath(v)'), '/p/F%3A%5Ccode%5Cproj%20one/s/0f3c-uuid');
+  assert.equal(b.run('routePath(v)'), '/p/F:/code/proj%20one/s/0f3c-uuid');
   b.context.v = {project: cwd, session: null, new: true};
-  assert.equal(b.run('routePath(v)'), '/p/F%3A%5Ccode%5Cproj%20one/new');
+  assert.equal(b.run('routePath(v)'), '/p/F:/code/proj%20one/new');
   b.context.v = {project: null, session: null, new: false};
   assert.equal(b.run('routePath(v)'), '/');
+  // POSIX 绝对路径不应出现 /p//home/... 这样的双斜杠
+  b.context.v = {project: '/home/me/proj', session: null, new: false};
+  assert.equal(b.run('routePath(v)'), '/p/home/me/proj');
 
+  b.context.path = '/p/F:/code/proj%20one/s/abc';
+  assert.deepEqual({...b.run('parseRoute(path)')},
+    {project: 'F:/code/proj one', session: 'abc', new: false,
+     fullProject: 'F:/code/proj one/s/abc'});
+  b.context.path = '/p/F:/code/proj%20one';
+  assert.deepEqual({...b.run('parseRoute(path)')},
+    {project: 'F:/code/proj one', session: null, new: false,
+     fullProject: 'F:/code/proj one'});
+  b.context.path = '/p/F:/code/proj%20one/new';
+  assert.deepEqual({...b.run('parseRoute(path)')},
+    {project: 'F:/code/proj one', session: null, new: true,
+     fullProject: 'F:/code/proj one/new'});
+  // 旧格式（整条路径一个编码段）仍可解析
   b.context.path = '/p/F%3A%5Ccode%5Cproj%20one/s/abc';
-  assert.deepEqual({...b.run('parseRoute(path)')}, {project: cwd, session: 'abc', new: false});
-  b.context.path = '/p/F%3A%5Ccode%5Cproj%20one';
-  assert.deepEqual({...b.run('parseRoute(path)')}, {project: cwd, session: null, new: false});
-  b.context.path = '/p/F%3A%5Ccode%5Cproj%20one/new';
-  assert.deepEqual({...b.run('parseRoute(path)')}, {project: cwd, session: null, new: true});
+  assert.equal(b.run('parseRoute(path).project'), cwd);
 
-  for(const bad of ['/', '/p/', '/p/x/unknown', '/p/x/s/', '/s/abc', '/p/%E0%A4%A']){
+  for(const bad of ['/', '/p/', '/s/abc', '/p/%E0%A4%A']){
     b.context.path = bad;
     assert.equal(b.run('parseRoute(path)'), null, bad);
   }
+
+  // 目录本身叫 new 时优先按项目列表解析
+  b.context.__projects = [{cwd: 'F:\\code\\new'}];
+  b.context.__route = {project: 'F:/code', session: null, new: true,
+                       fullProject: 'F:/code/new'};
+  b.run('view = __route; resolveViewProject(__projects)');
+  assert.equal(b.run('view.project'), 'F:\\code\\new');
+  assert.equal(b.run('view.new'), false);
 });
 test('导航同步 URL，并在默认项目解析后替换首页地址', () => {
   const b = boot();
@@ -664,12 +705,12 @@ test('导航同步 URL，并在默认项目解析后替换首页地址', () => {
 
   b.context.__next = {project:'F:\\code\\p', session:null, new:false};
   b.run('navigate(__next)');
-  assert.deepEqual(b.historyCalls, [['push', '/p/F%3A%5Ccode%5Cp']]);
-  assert.equal(b.location.pathname, '/p/F%3A%5Ccode%5Cp');
+  assert.deepEqual(b.historyCalls, [['push', '/p/F:/code/p']]);
+  assert.equal(b.location.pathname, '/p/F:/code/p');
 
   b.context.__next = {project:'F:\\code\\p', session:'s1', new:false};
   b.run('navigate(__next)');
-  assert.deepEqual(b.historyCalls[1], ['push', '/p/F%3A%5Ccode%5Cp/s/s1']);
+  assert.deepEqual(b.historyCalls[1], ['push', '/p/F:/code/p/s/s1']);
   assert.equal(b.run('view.session'), 's1');
 
   b.context.__next = {project:'F:\\code\\p', session:null, new:false};
@@ -679,5 +720,5 @@ test('导航同步 URL，并在默认项目解析后替换首页地址', () => {
   // 回到根路径：数据已加载，应自动选中项目并 replace 成项目地址
   b.location.pathname = '/';
   b.run('navigate({project:null, session:null, new:false})');
-  assert.deepEqual(b.historyCalls[3], ['replace', '/p/F%3A%5Ccode%5Cp']);
+  assert.deepEqual(b.historyCalls[3], ['replace', '/p/F:/code/p']);
 });

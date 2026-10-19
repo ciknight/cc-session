@@ -109,6 +109,9 @@ SCAN_CACHE_SAVE_SECONDS = 5
 SCAN_CACHE_SAVE_SUBAGENTS_SECONDS = 30
 SCAN_TAIL_SAMPLE_BYTES = 4096
 
+# 非托管会话的一次性消息排队上限；超出后返回 429
+REMOTE_QUEUE_LIMIT = 32
+
 _jinja = Environment(
     loader=FileSystemLoader(str(TEMPLATE_DIR)),
     autoescape=select_autoescape(["html"]),
@@ -366,6 +369,7 @@ class Monitor:
         self.msg_timeout = 600
         self.jobs = {}             # job_id -> dict
         self.busy = set()          # 正在执行远程消息的 session id
+        self.remote_queues = {}    # sid -> deque[(job, text, model)]，非托管一次性消息排队
         self.new_cwd_busy = set()  # 尚未取得 session id 的新会话目录
         self.hosted = {}           # hosted_id -> Hosted（服务托管的常驻进程）
         self.hosted_by_sid = {}    # session id -> Hosted
@@ -449,6 +453,8 @@ class Monitor:
         return model
 
     def send_message(self, sid, text, force=False, model=UNSET):
+        # 子代理默认懒加载；这里补加载以保留“只读、拒绝发送”的 400 语义
+        self.ensure_subagent(sid)
         with self.lock:
             h = self.hosted_by_sid.get(sid)
             sess = self.by_sid(sid)
@@ -484,20 +490,32 @@ class Monitor:
                 return 404, {"error": "session not found"}
             if not sess.cwd or not os.path.isdir(sess.cwd):
                 return 400, {"error": f"session cwd unavailable: {sess.cwd}"}
-            if sid in self.busy:
-                return 409, {"error": "a remote message is already running for this session"}
-            if sess.summary(self.stale_after)["state"] == "working" and not force:
-                return 409, {"error": "session is working (maybe in use in a terminal); "
-                                      "retry when idle, or pass force=true"}
-            self.busy.add(sid)
+            queued = sid in self.busy
+            if queued:
+                pending = self.remote_queues.get(sid)
+                if pending is not None and len(pending) >= REMOTE_QUEUE_LIMIT:
+                    return 429, {"error": "remote message queue is full"}
+            else:
+                if sess.summary(self.stale_after)["state"] == "working" and not force:
+                    return 409, {"error": "session is working (maybe in use in a terminal); "
+                                          "retry when idle, or pass force=true"}
+                self.busy.add(sid)
         try:
             if model is not UNSET:
                 self.preferences.set(sid, selected)
         except ValueError as e:
-            with self.lock:
-                self.busy.discard(sid)
+            if not queued:
+                with self.lock:
+                    self.busy.discard(sid)
             return 500, {"error": str(e)}
         job = self._new_job(sid, text, selected)
+        if queued:
+            with self.lock:
+                # 排队期间上一轮可能已经结束；此时直接派发，避免任务永远停在 queued
+                if sid in self.busy:
+                    self.remote_queues.setdefault(sid, deque()).append((job, text, selected))
+                    return 202, {"job_id": job["id"], "status": "queued"}
+                self.busy.add(sid)
         job["status"] = "running"
         threading.Thread(target=self._run_job, args=(sess, job, text, selected), daemon=True).start()
         return 202, {"job_id": job["id"], "status": "running"}
@@ -508,13 +526,25 @@ class Monitor:
         cmd += model_args(self.claude_args, selected_model)
         print(f"[msg] job {job['id']} 会话 {sess.id} 开始: {job['text']}", flush=True)
         self._exec(job, cmd, sess.cwd, text)
-        with self.lock:
-            self.busy.discard(sess.id)
         print(f"[msg] job {job['id']} {job['status']}"
               + (f": {job['error']}" if job["error"] else f" {clip(job['result'] or '', 120)}"), flush=True)
         self.emit(sess, "remote_message_done", {"job": job["id"], "status": job["status"],
                                                 "error": job["error"],
                                                 "result": clip(job["result"] or "", 300)})
+        next_item = None
+        with self.lock:
+            pending = self.remote_queues.get(sess.id)
+            if pending:
+                next_item = pending.popleft()
+                if not pending:
+                    self.remote_queues.pop(sess.id, None)
+            else:
+                self.busy.discard(sess.id)
+        if next_item:
+            next_job, next_text, next_model = next_item
+            next_job["status"] = "running"
+            threading.Thread(target=self._run_job,
+                             args=(sess, next_job, next_text, next_model), daemon=True).start()
 
     def _exec(self, job, cmd, cwd, text):
         """同步跑一轮 `claude -p`，把结果写进 job（status/finished_at 在此收尾）。"""
@@ -596,6 +626,9 @@ class Monitor:
         return job
 
     def host_session(self, cwd, resume_id, text, force=False, model=UNSET, approval=None):
+        # 子代理默认懒加载；补加载以保留“只读、拒绝托管”的 400 语义
+        if resume_id:
+            self.ensure_subagent(resume_id)
         with self.lock:
             sess = self.by_sid(resume_id) if resume_id else None
         target = cwd or (sess.cwd if sess else None)
@@ -1006,7 +1039,13 @@ class Monitor:
             except OSError:
                 return
             if sess is None:
-                sess = self._restore_or_new(path, sid, parent_id, is_subagent, size)
+                entry = (self.scan_cache_entries or {}).get(key)
+                if entry and size < entry["offset"]:
+                    # 缓存比当前文件还长（截断，常见于清空文件）：丢弃缓存并标记落盘
+                    sess = self._new_session(sid, path, parent_id, is_subagent)
+                    self.cache_dirty = True
+                else:
+                    sess = self._restore_or_new(path, sid, parent_id, is_subagent, size)
                 self.sessions[key] = sess
                 self.emit(sess, "session_discovered", {"path": str(path)})
             if size < sess.offset:
@@ -1016,11 +1055,18 @@ class Monitor:
                 self.cache_dirty = True
             if size == sess.offset:
                 return
-            with open(path, "rb") as f:
-                f.seek(sess.offset)
-                chunk = f.read()
-                sess.offset += len(chunk)
-                if chunk:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(sess.offset)
+                    chunk = f.read()
+            except OSError:
+                # 文件在 stat 与 open 之间被删除/轮转：跳过本次，下轮重试
+                return
+            sess.offset += len(chunk)
+            if chunk:
+                if len(chunk) >= SCAN_TAIL_SAMPLE_BYTES:
+                    sess.tail_sample = chunk[-SCAN_TAIL_SAMPLE_BYTES:]
+                else:
                     sess.tail_sample = (sess.tail_sample + chunk)[-SCAN_TAIL_SAMPLE_BYTES:]
             data = sess.buf + chunk
             *lines, sess.buf = data.split(b"\n")   # 最后一段可能是半行，留到下次
@@ -1056,6 +1102,7 @@ class Monitor:
 
     def scan_subagents_once(self, force=False):
         """显式请求子代理时一次性加载；默认轮询不会走到这里。"""
+        self._scan_cache_obj()
         with self.subagent_scan_lock:
             now = now_ts()
             if not force and now - self.subagents_loaded_at < 5:
@@ -1079,6 +1126,7 @@ class Monitor:
                 or suffix in (".", "..") or "/" in parent_id or "\\" in parent_id \
                 or "/" in suffix or "\\" in suffix:
             return False
+        self._scan_cache_obj()
         with self.lock:
             parent = self.by_sid(parent_id)
         candidates = []
@@ -1171,7 +1219,8 @@ class Monitor:
                         tasks[str(t["id"])] = {"id": str(t["id"]), "subject": t.get("subject", ""),
                                                "description": t.get("description", ""),
                                                "status": t.get("status", "pending")}
-                if tasks and tasks != sess.tasks:
+                # 目录存在但文件被清空时也要清掉旧任务；目录不存在时保留转录推断结果
+                if tasks != sess.tasks:
                     sess.tasks = tasks
                     changed = True
         return changed
@@ -1203,6 +1252,7 @@ class Hosted:
         self.session_id = resume_id
         self.selected_model = selected_model
         self.approval = approval or (mon.approvals.get(resume_id) if resume_id else "auto")
+        self.added_auto_permission = False   # 服务是否实际追加了 --permission-mode auto
         self.process_model = selected_model if selected_model is not None else default_model(mon.claude_args)
         self.proc = None
         self.stderr_thread = None
@@ -1254,6 +1304,7 @@ class Hosted:
             cmd += ["--session-id", self.session_id]
         if self.approval == "auto" and not _arg_present(self.mon.claude_args, "--permission-mode"):
             cmd += ["--permission-mode", "auto"]
+            self.added_auto_permission = True
         spawn_args = list(self.mon.claude_args)
         if self.mon.http_port and self.mon.hook_token:
             hook_settings = {"hooks": {"PreToolUse": [{
@@ -1686,9 +1737,13 @@ class Hosted:
     def set_approval(self, mode):
         if mode not in APPROVAL_MODES:
             raise ValueError("invalid approval mode")
-        target = "auto" if mode == "auto" else "default"
-        if self.approval == "auto" or mode == "auto":
-            self._control("set_permission_mode", mode=target)
+        if mode == "auto":
+            self._control("set_permission_mode", mode="auto")
+            self.added_auto_permission = True
+        elif self.approval == "auto" and self.added_auto_permission:
+            # 只有服务把 CLI 切到过 auto 时才恢复 default；不要覆盖用户 --claude-args 的权限模式
+            self._control("set_permission_mode", mode="default")
+            self.added_auto_permission = False
         self.approval = mode
 
     def interrupt(self):
@@ -2415,6 +2470,7 @@ def make_handler(mon, refresh_interval):
                 body = self._read_body()
                 if not isinstance(body, dict) or "model" not in body:
                     return self._json({"error": "body must contain model (string or null)"}, 400)
+                mon.ensure_subagent(parts[1])
                 with mon.lock:
                     sess = mon.by_sid(parts[1])
                 if not sess:
@@ -2443,7 +2499,6 @@ def make_handler(mon, refresh_interval):
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
                     return self._json({"error": "body must be {\"text\": \"...\"}"}, 400)
-                mon.ensure_subagent(parts[1])   # 子代理默认懒加载，保持“只读”错误语义
                 code, resp = mon.send_message(parts[1], text, bool(body.get("force")),
                                               body.get("model", UNSET))
                 return self._json(resp, code)

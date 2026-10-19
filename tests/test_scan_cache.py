@@ -120,6 +120,80 @@ class ScanCacheTests(unittest.TestCase):
         self.assertEqual(sess.user_msgs, 1)
         self.assertEqual(sess.last_user, "bbbb")
 
+    def test_on_demand_subagent_uses_cache_before_main_scan(self):
+        sub = self.proj / "parent-sid" / "subagents"
+        sub.mkdir(parents=True)
+        (self.proj / "parent-sid.jsonl").write_text(
+            json.dumps(self.user_line("parent"), ensure_ascii=False) + "\n", encoding="utf-8")
+        (sub / "agent-abc.jsonl").write_text(
+            json.dumps(self.user_line("sub"), ensure_ascii=False) + "\n", encoding="utf-8")
+        first = monitor.Monitor(600)
+        first.scan_subagents = True
+        first.scan_once()
+        self.assertTrue(self.cache_path.is_file())
+
+        calls = []
+        original = monitor.Monitor.handle_line
+
+        def counting(self, sess, line):
+            calls.append(sess.id)
+            return original(self, sess, line)
+
+        with patch.object(monitor.Monitor, "handle_line", counting):
+            second = monitor.Monitor(600)
+            second.scan_subagents_once()
+            third = monitor.Monitor(600)
+            self.assertTrue(third.ensure_subagent("parent-sid::agent-abc"))
+        self.assertEqual(calls, [])
+
+    def test_truncate_to_zero_updates_cache(self):
+        self.write([self.user_line("hello")])
+        first = monitor.Monitor(600)
+        first.scan_once()
+        before = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        self.assertGreater(before["files"][str(self.transcript)]["offset"], 0)
+
+        self.transcript.write_text("", encoding="utf-8")
+        second = monitor.Monitor(600)
+        second.scan_once()
+        sess = second.by_sid("sid-1")
+        self.assertEqual(sess.offset, 0)
+        self.assertEqual(sess.user_msgs, 0)
+        after = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(after["files"][str(self.transcript)]["offset"], 0)
+
+    def test_empty_task_dir_clears_tasks(self):
+        self.write([self.user_line("hello")])
+        task_dir = self.root / "config" / "tasks" / "sid-1"
+        task_dir.mkdir(parents=True)
+        task_file = task_dir / "1.json"
+        task_file.write_text(json.dumps({"id": "1", "subject": "任务", "status": "pending"},
+                                        ensure_ascii=False), encoding="utf-8")
+        mon = monitor.Monitor(600)
+        mon.scan_once()
+        self.assertEqual(mon.by_sid("sid-1").tasks["1"]["subject"], "任务")
+        task_file.unlink()
+        mon.scan_once()
+        self.assertEqual(mon.by_sid("sid-1").tasks, {})
+
+    def test_open_error_is_skipped(self):
+        self.write([self.user_line("hello")])
+        other = self.proj / "sid-2.jsonl"
+        other.write_text(json.dumps(self.user_line("other"), ensure_ascii=False) + "\n",
+                         encoding="utf-8")
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path) == str(self.transcript):
+                raise OSError("gone")
+            return real_open(path, *args, **kwargs)
+
+        mon = monitor.Monitor(600)
+        with patch.object(monitor, "open", fake_open, create=True):
+            mon.scan_once()   # 不应抛出
+        self.assertEqual(mon.by_sid("sid-1").offset, 0)
+        self.assertEqual(mon.by_sid("sid-2").user_msgs, 1)
+
     def test_corrupt_cache_falls_back_to_full_scan(self):
         self.write([self.user_line("hello")])
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)

@@ -79,9 +79,11 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 - **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `auto`（交给 CLI 权限模式）**，持久化在
   `~/.claude/claude-sessions/approvals.json`；已有明确保存的模式优先。`ask` 等待网页响应
   （`--permission-timeout` 默认 300 秒，超时自动拒绝），`full` 由服务自动放行。
-- **工作时发送**：托管会话在 `working` 时消息进入 `Hosted.pending` 队列；网页发送按钮只在
-  POST 进行中防重复点击，运行/排队中仍可继续发送。非托管会话的“工作状态下也发送”默认勾选，
-  会以 `force` 绕过 working 检查；若上一条远程一次性消息仍在跑，服务返回 409。
+- **工作时发送**：托管会话在 `working` 时消息进入 `Hosted.pending` 队列；非托管一次性消息
+  进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动派发下一条（每会话上限 32）。
+  网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“工作状态下也发送”
+  默认勾选，会以 `force` 绕过 working 检查。新建会话的托管模式也会把对话框里的审批选择
+  作为首轮 `/hosted` 的 `approval` 提交。
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有
   `completed/cancelled/discarded/refused/dropped` 结束回合。
@@ -97,10 +99,11 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
   断线重连后全量对账；SSE 事件触发节流刷新，保留定时轮询兜底。
   对话只加载最近 100 条，向上滚动加载更早；`cursor` 记录已加载末尾，
   服务端前插旧块时用响应里的 `shift` 调整，避免增量漏消息。
-- **URL 路由**：看板视图与地址栏同步，`/p/<encodeURIComponent(项目根路径)>` 是项目列表，
-  `/p/<项目>/s/<会话ID>` 是对话，`/p/<项目>/new` 是新建；`GET /p/...` 与 `/` 一样回退渲染
-  同一 SPA 模板。导航统一走 `navigate`（`pushState`），首页自动选中项目时用 `replaceState`
-  避免多余历史记录；`popstate` 重新解析地址并恢复视图。
+- **URL 路由**：看板视图与地址栏同步，`/p/<项目路径>` 是项目列表，
+  `/p/<项目路径>/s/<会话ID>` 是对话，`/p/<项目路径>/new` 是新建；项目路径保留目录层级
+  （反斜杠归一为 `/`，冒号保留，仅转义空格等特殊字符），旧的整体编码链接仍可解析。
+  `GET /p/...` 与 `/` 一样回退渲染同一 SPA 模板。导航统一走 `navigate`（`pushState`），
+  首页自动选中项目时用 `replaceState` 避免多余历史记录；`popstate` 重新解析地址并恢复视图。
 
 ### 前端
 
@@ -109,4 +112,5 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
 对话视图顶部显示待审批卡片，发送区提供中断按钮和审批模式选择；审批默认 `auto`，
 发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用同一个 `composerHtml`
-输入对话框；`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，刷新重建后恢复。
+输入对话框；`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，自动刷新/整页刷新后恢复
+（`sessionStorage`）。

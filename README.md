@@ -50,7 +50,8 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
 ## 托管、审批与发送
 
 - 托管会话的审批模式默认为 `auto`（交给 CLI 权限模式）。已有明确保存过 `ask`/`full` 的会话继续使用保存值；可在会话详情切换“询问”或“全部允许”。
-- 会话处于 `working` 时网页仍可发送消息：已托管会话进入常驻进程队列；非托管会话的“工作状态下也发送”默认勾选，会用 `force` 绕过 working 检查。非托管会话若仍有上一条远程消息在执行，服务会返回 409，需等它完成。
+- 会话处于 `working` 时网页仍可发送消息：已托管会话进入常驻进程队列；非托管会话的“工作状态下也发送”默认勾选，会用 `force` 绕过 working 检查。非托管会话的一次性消息也会按会话排队（上限 32 条），上一条结束后自动执行下一条。
+- 新建会话的“托管”模式也会读取对话框里的审批选择，并作为首轮 `/hosted` 的 `approval` 提交。
 - 中断按钮只对托管且正在执行的会话启用；排队中的消息会随中断一起取消。
 
 ## 接口
@@ -132,5 +133,7 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
 `templates/index.html` 是自包含 SPA：左侧项目列表、右侧会话卡片/对话视图，
 对话用 marked + DOMPurify 渲染 markdown（用户气泡 / 助手 markdown / 工具调用紧凑行），
 自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
-会话页和新建会话页共用 `composerHtml` 输入对话框（Enter 发送、Shift+Enter 换行）；
-工具调用、子代理、任务等 `<details>` 的展开状态记录在 `detailsOpen`，自动刷新重建后恢复。
+会话页和新建会话页共用 `composerHtml` 输入对话框（Enter 发送、Shift+Enter 换行，
+新建会话的托管模式也可选审批模式）；
+工具调用、子代理、任务等 `<details>` 的展开状态记录在 `detailsOpen`，自动刷新重建后恢复，
+并写入 `sessionStorage` 以兼容整页刷新。

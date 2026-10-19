@@ -116,9 +116,14 @@ class SubagentDiscoveryTests(unittest.TestCase):
 
     def test_send_to_subagent_is_rejected(self):
         self.mon.scan_once()
-        self.mon.ensure_subagent("parent-sid::agent-abc")
         code, _ = self.mon.send_message("parent-sid::agent-abc", "hi")
         self.assertEqual(code, 400)
+
+    def test_host_subagent_is_rejected(self):
+        self.mon.scan_once()
+        code, resp = self.mon.host_session(str(self.root), "parent-sid::agent-abc", "hi")
+        self.assertEqual(code, 400)
+        self.assertIn("子代理", resp["error"])
 
 
 if __name__ == "__main__":
