@@ -1065,12 +1065,58 @@ def _result_text(b):
     return c if isinstance(c, str) else str(c)
 
 
-def parse_msg_line(ln, clip_len=8000):
-    """把一行转录解析为一条消息（跳过子代理 sidechain 和工具结果）；无内容返回 None。
+def _patch_text(patch):
+    """把 structuredPatch 的 hunk 列表转成统一 diff 文本。"""
+    lines = []
+    for hunk in patch or []:
+        if not isinstance(hunk, dict):
+            continue
+        lines.append(f"@@ -{hunk.get('oldStart', 0)},{hunk.get('oldLines', 0)} "
+                     f"+{hunk.get('newStart', 0)},{hunk.get('newLines', 0)} @@")
+        lines.extend(str(x) for x in (hunk.get("lines") or []))
+    return "\n".join(lines)
 
-    返回 {role: user/assistant/tool/system, ts, parts: [{type: text|tool|error, ...}]}
+
+def parse_tool_result(o, block):
+    """把 tool_result 与行级 toolUseResult 合并成可展示结果。"""
+    tur = o.get("toolUseResult")
+    text = _result_text(block)
+    kind = "error" if block.get("is_error") else "text"
+    content = block.get("content")
+    if isinstance(content, list) and any(
+            isinstance(x, dict) and x.get("type") == "image" for x in content):
+        kind, text = "image", "图片"
+    if isinstance(tur, dict):
+        patch = tur.get("structuredPatch")
+        if isinstance(patch, list) and patch:
+            kind, text = "diff", _patch_text(patch)
+        elif "stdout" in tur or "stderr" in tur:
+            chunks = []
+            if tur.get("stdout"):
+                chunks.append(str(tur["stdout"]))
+            if tur.get("stderr"):
+                chunks.append("[stderr]\n" + str(tur["stderr"]))
+            if chunks:
+                text = "\n".join(chunks)
+        elif isinstance(tur.get("file"), dict):
+            f = tur["file"]
+            text = f"{f.get('filePath', '')} ({f.get('numLines', '?')} 行)"
+        elif tur.get("type") == "image":
+            kind, text = "image", str(tur.get("path") or tur.get("filePath") or "图片")
+    return {"type": "tool_result", "tool_use_id": block.get("tool_use_id"),
+            "is_error": bool(block.get("is_error")), "kind": kind,
+            "text": clip(text, 8000)}
+
+
+def parse_msg_line(ln, clip_len=8000):
+    """把一行转录解析为一条消息；无内容返回 None。
+
+    返回 {role: user/assistant/tool/system, ts, parts: [...]}。
+    parts 类型：text / tool / tool_result / tool_note。
     """
-    if b'"type"' not in ln:
+    if isinstance(ln, bytes):
+        ln = ln.decode("utf-8", "replace")
+    if '"type"' not in ln:
         return None
     try:
         o = json.loads(ln)
@@ -1082,21 +1128,31 @@ def parse_msg_line(ln, clip_len=8000):
     if typ not in ("user", "assistant"):
         return None
     content = (o.get("message") or {}).get("content")
-    parts = []
     blocks = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
-    role = classify_user_line(o, blocks) if typ == "user" else "assistant"
+    kind = classify_user_line(o, blocks) if typ == "user" else "assistant"
+    if kind == "meta":
+        return None
+    role = {"user": "user", "injected": "system", "meta_tool": "system",
+            "system": "system", "tool": "tool"}.get(kind, "assistant")
+    parts = []
     for b in blocks:
         if not isinstance(b, dict):
             continue
         bt = b.get("type")
-        if bt == "text" and b.get("text", "").strip():
-            # 系统文本（任务通知/命令输出等）截短即可，不需要全文
-            parts.append({"type": "text", "text": clip(b["text"], 500 if role == "system" else clip_len)})
+        if bt == "text" and (b.get("text") or "").strip():
+            if kind == "meta_tool":
+                parts.append({"type": "tool_note",
+                              "tool_use_id": o.get("sourceToolUseID"),
+                              "text": clip(b["text"], 3000)})
+            else:
+                # 系统文本（任务通知/命令输出等）截短即可，不需要全文
+                parts.append({"type": "text",
+                              "text": clip(b["text"], 500 if role == "system" else clip_len)})
         elif bt == "tool_use":
-            parts.append({"type": "tool", "name": b.get("name"),
-                          "input": clip(b.get("input") or {}, 200)})
-        elif bt == "tool_result" and b.get("is_error"):
-            parts.append({"type": "error", "text": clip(_result_text(b), 300)})
+            parts.append({"type": "tool", "tool_use_id": b.get("id"),
+                          "name": b.get("name"), "input": clip(b.get("input") or {}, 500)})
+        elif bt == "tool_result":
+            parts.append(parse_tool_result(o, b))
     if parts:
         return {"role": role, "ts": _parse_iso(o.get("timestamp")), "parts": parts}
     return None
@@ -1166,7 +1222,8 @@ def make_handler(mon, refresh_interval):
                 # 转录可达几十 MB，整文件重读既慢又占 CPU）
                 st = mon.msg_cache.get(sid)
                 if st is None or size < st["off"]:      # 首次或文件被截断
-                    st = mon.msg_cache[sid] = {"off": 0, "buf": b"", "msgs": [], "body": None}
+                    st = mon.msg_cache[sid] = {"off": 0, "buf": b"", "msgs": [],
+                                               "body": None, "tools": {}}
                 if size != st["off"]:
                     with open(s.path, "rb") as f:
                         f.seek(st["off"])
@@ -1174,7 +1231,30 @@ def make_handler(mon, refresh_interval):
                     *lines, st["buf"] = data.split(b"\n")   # 半行留到下次拼接
                     for ln in lines:
                         m = parse_msg_line(ln)
-                        if m:
+                        if not m:
+                            continue
+                        keep = []
+                        for part in m["parts"]:
+                            if part.get("type") == "tool":
+                                if part.get("tool_use_id"):
+                                    st["tools"][part["tool_use_id"]] = part
+                                keep.append(part)
+                            elif part.get("type") == "tool_result":
+                                target = st["tools"].get(part.get("tool_use_id"))
+                                if target is not None:
+                                    target["result"] = part
+                                else:
+                                    keep.append(part)
+                            elif part.get("type") == "tool_note":
+                                target = st["tools"].get(part.get("tool_use_id"))
+                                if target is not None:
+                                    target.setdefault("notes", []).append(part["text"])
+                                else:
+                                    keep.append({"type": "text", "text": part["text"]})
+                            else:
+                                keep.append(part)
+                        if keep:
+                            m["parts"] = keep
                             st["msgs"].append(m)
                     st["off"] = size
                     st["body"] = json.dumps({"id": sid, "size": size, "messages": st["msgs"]},
