@@ -1637,6 +1637,18 @@ def make_handler(mon, refresh_interval):
                 return self._json(items)
             if u.path.startswith("/sessions/") and u.path.endswith("/messages"):
                 sid = u.path.split("/")[2]
+                qs = parse_qs(u.query)
+                try:
+                    limit = int(qs.get("limit", ["100"])[0])
+                    before = int(qs["before"][0]) if "before" in qs else None
+                    frm = int(qs["from"][0]) if "from" in qs else None
+                except ValueError:
+                    return self._json({"error": "limit/before/from 必须是整数"}, 400)
+                if limit < 1 or limit > 500 or (before is not None and before < 0) \
+                        or (frm is not None and frm < 0):
+                    return self._json({"error": "分页参数超出范围"}, 400)
+                if before is not None and frm is not None:
+                    return self._json({"error": "before 与 from 不能同时使用"}, 400)
                 with mon.lock:
                     s = mon.by_sid(sid)
                 if not s:
@@ -1647,46 +1659,57 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": "file gone"}, 404)
                 # 增量解析：只解析上次读过后新增的部分（自动刷新每 2-3 秒来一次，
                 # 转录可达几十 MB，整文件重读既慢又占 CPU）
-                st = mon.msg_cache.get(sid)
-                if st is None or size < st["off"]:      # 首次或文件被截断
-                    st = mon.msg_cache[sid] = {"off": 0, "buf": b"", "msgs": [],
-                                               "body": None, "tools": {}}
-                if size != st["off"]:
-                    with open(s.path, "rb") as f:
-                        f.seek(st["off"])
-                        data = st["buf"] + f.read()
-                    *lines, st["buf"] = data.split(b"\n")   # 半行留到下次拼接
-                    for ln in lines:
-                        m = parse_msg_line(ln)
-                        if not m:
-                            continue
-                        keep = []
-                        for part in m["parts"]:
-                            if part.get("type") == "tool":
-                                if part.get("tool_use_id"):
-                                    st["tools"][part["tool_use_id"]] = part
-                                keep.append(part)
-                            elif part.get("type") == "tool_result":
-                                target = st["tools"].get(part.get("tool_use_id"))
-                                if target is not None:
-                                    target["result"] = part
+                with mon.msg_lock:
+                    st = mon.msg_cache.get(sid)
+                    if st is None or size < st["off"]:      # 首次或文件被截断
+                        st = mon.msg_cache[sid] = {"off": 0, "buf": b"", "msgs": [],
+                                                   "tools": {}}
+                    if size != st["off"]:
+                        with open(s.path, "rb") as f:
+                            f.seek(st["off"])
+                            data = st["buf"] + f.read()
+                        *lines, st["buf"] = data.split(b"\n")   # 半行留到下次拼接
+                        for ln in lines:
+                            m = parse_msg_line(ln)
+                            if not m:
+                                continue
+                            keep = []
+                            for part in m["parts"]:
+                                if part.get("type") == "tool":
+                                    if part.get("tool_use_id"):
+                                        st["tools"][part["tool_use_id"]] = part
+                                    keep.append(part)
+                                elif part.get("type") == "tool_result":
+                                    target = st["tools"].get(part.get("tool_use_id"))
+                                    if target is not None:
+                                        target["result"] = part
+                                    else:
+                                        keep.append(part)
+                                elif part.get("type") == "tool_note":
+                                    target = st["tools"].get(part.get("tool_use_id"))
+                                    if target is not None:
+                                        target.setdefault("notes", []).append(part["text"])
+                                    else:
+                                        keep.append({"type": "text", "text": part["text"]})
                                 else:
                                     keep.append(part)
-                            elif part.get("type") == "tool_note":
-                                target = st["tools"].get(part.get("tool_use_id"))
-                                if target is not None:
-                                    target.setdefault("notes", []).append(part["text"])
-                                else:
-                                    keep.append({"type": "text", "text": part["text"]})
-                            else:
-                                keep.append(part)
-                        if keep:
-                            m["parts"] = keep
-                            st["msgs"].append(m)
-                    st["off"] = size
-                    st["body"] = json.dumps({"id": sid, "size": size, "messages": st["msgs"]},
-                                            ensure_ascii=False, separators=(",", ":")).encode()
-                return self._raw(st["body"])
+                            if keep:
+                                m["parts"] = keep
+                                st["msgs"].append(m)
+                        st["off"] = size
+                    total = len(st["msgs"])
+                    if before is not None:
+                        start, end = max(0, before - limit), min(before, total)
+                    elif frm is not None:
+                        start, end = min(frm, total), min(frm + limit, total)
+                    else:
+                        start, end = max(0, total - limit), total
+                    payload = {"id": sid, "size": size, "total": total,
+                               "start": start, "end": end,
+                               "has_more": start > 0,
+                               "messages": st["msgs"][start:end]}
+                return self._raw(json.dumps(payload, ensure_ascii=False,
+                                            separators=(",", ":")).encode())
             if u.path.startswith("/sessions/"):
                 sid = u.path.split("/", 2)[2]
                 with mon.lock:

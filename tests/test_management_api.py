@@ -123,6 +123,38 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(error.exception.code, 403)
         apply.assert_not_called()
 
+    def _write_transcript(self, count):
+        lines = []
+        for i in range(count):
+            lines.append(json.dumps({
+                "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"content": f"m{i}"}}))
+        path = self.project / "sid-1.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.sess.path = path
+
+    def test_messages_paging_default_and_before(self):
+        self._write_transcript(250)
+        first = json.load(self.request("/sessions/sid-1/messages"))
+        self.assertEqual(first["total"], 250)
+        self.assertEqual(len(first["messages"]), 100)
+        self.assertEqual((first["start"], first["end"], first["has_more"]),
+                         (150, 250, True))
+        older = json.load(self.request("/sessions/sid-1/messages?before=150&limit=50"))
+        self.assertEqual((older["start"], older["end"]), (100, 150))
+        self.assertEqual(older["messages"][0]["parts"][0]["text"], "m100")
+        newer = json.load(self.request("/sessions/sid-1/messages?from=240"))
+        self.assertEqual([m["parts"][0]["text"] for m in newer["messages"]],
+                         [f"m{i}" for i in range(240, 250)])
+
+    def test_messages_paging_rejects_bad_params(self):
+        with self.assertRaises(HTTPError) as error:
+            self.request("/sessions/sid-1/messages?before=1&from=2")
+        self.assertEqual(error.exception.code, 400)
+        with self.assertRaises(HTTPError) as error:
+            self.request("/sessions/sid-1/messages?limit=0")
+        self.assertEqual(error.exception.code, 400)
+
     def test_emit_transient_does_not_touch_recent_or_webhook(self):
         self.mon.first_scan_done = True
         self.mon.webhook = "http://invalid.example/hook"
