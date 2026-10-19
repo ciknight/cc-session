@@ -7,6 +7,7 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
@@ -343,6 +344,30 @@ class ManagementAPITests(unittest.TestCase):
                          {"Content-Type": "application/json", "Origin": "http://evil.invalid"})
         self.assertEqual(error.exception.code, 403)
         self.assertEqual(inter.state, "pending")
+
+
+class SSEDisconnectTests(unittest.TestCase):
+    def test_client_abort_does_not_escape_handler(self):
+        # Windows 上客户端断开抛 ConnectionAbortedError(10053)，不应冒泡成 traceback
+        mon = monitor.Monitor(600)
+        handler = monitor.make_handler(mon, 3)
+
+        class AbortingWfile:
+            def write(self, data):
+                raise ConnectionAbortedError(10053, "你的主机中的软件中止了一个已建立的连接")
+
+            def flush(self):
+                pass
+
+        fake = SimpleNamespace(
+            wfile=AbortingWfile(),
+            send_response=lambda *a: None,
+            send_header=lambda *a: None,
+            end_headers=lambda *a: None,
+            _snapshot=lambda only: {"seq": 1, "session": None, "type": "snapshot", "data": {}},
+        )
+        handler._sse(fake, None)   # 不应抛出
+        self.assertEqual(mon.subscribers, [])
 
 
 if __name__ == "__main__":

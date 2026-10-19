@@ -184,6 +184,33 @@ class SessionStateTests(unittest.TestCase):
         self.assertIsNone(self.sess.last_input_ts)
         self.assertEqual(self.sess.user_msgs, 0)
 
+    def test_api_retry_is_recorded_and_cleared_by_reply(self):
+        # 上游 503 时 CLI 只写 system/api_error，不写 assistant，网页需要能看到原因
+        self.line("system", [], subtype="api_error",
+                  error={"message": "503 model temporarily unavailable"},
+                  retryAttempt=3, maxRetries=10, retryInMs=2302)
+        self.assertEqual(self.sess.state, "working")
+        err = self.sess.summary(self.mon.stale_after)["last_api_error"]
+        self.assertEqual(err["text"], "503 model temporarily unavailable")
+        self.assertEqual(err["retry_attempt"], 3)
+        self.assertEqual(err["max_retries"], 10)
+        self.assertEqual(err["retry_in_ms"], 2302)
+
+        self.line("assistant", [{"type": "text", "text": "好了"}])
+        self.assertIsNone(self.sess.last_api_error)
+
+    def test_api_retry_cleared_by_new_user_message(self):
+        self.line("system", [], subtype="api_error",
+                  error={"message": "503 busy"}, retryAttempt=1)
+        self.line("user", [{"type": "text", "text": "再试一次"}])
+        self.assertIsNone(self.sess.last_api_error)
+
+    def test_api_retry_cleared_by_interrupt_marker(self):
+        self.line("system", [], subtype="api_error",
+                  error={"message": "503 busy"}, retryAttempt=7)
+        self.line("user", [{"type": "text", "text": "[Request interrupted by user]"}])
+        self.assertIsNone(self.sess.last_api_error)
+
 
 if __name__ == "__main__":
     unittest.main()

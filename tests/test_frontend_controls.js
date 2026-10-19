@@ -514,3 +514,16 @@ test('计划与选择卡片渲染及答案收集', () => {
     'querySelectorAll:()=>[{dataset:{label:"A"}},{dataset:{label:"B"}}]}]})');
   assert.equal(JSON.stringify(picked), JSON.stringify({Q1:'A, B'}));
 });
+test('API 重试横幅显示错误与重试次数，清除后隐藏', () => {
+  const b=boot();
+  const el=b.node('apierr');
+  b.run('renderApiError({text:"503 model temporarily unavailable",ts:Date.now()/1000,' +
+    'retry_attempt:3,max_retries:10,retry_in_ms:3000})');
+  assert.match(el.textContent, /503 model temporarily unavailable/);
+  assert.match(el.textContent, /3\/10/);
+  assert.match(el.textContent, /3 秒后/);
+  assert.notEqual(el.style.display, 'none');
+  b.run('renderApiError(null)');
+  assert.equal(el.textContent, '');
+  assert.equal(el.style.display, 'none');
+});

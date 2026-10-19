@@ -76,6 +76,8 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .abody table{border-collapse:collapse}.abody td,.abody th{border:1px solid var(--bd);padding:2px 8px;font-size:13px}
 .tool{font:12px ui-monospace,monospace;color:var(--mut);background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:2px 8px;margin:3px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
 .terror{font-size:12px;color:#dc2626;background:rgba(220,38,38,.08);border-radius:6px;padding:2px 8px;margin:3px 0}
+.apierr{font-size:12px;color:#b45309;background:rgba(217,119,6,.10);border:1px solid rgba(217,119,6,.4);
+  border-radius:6px;padding:6px 10px;margin:8px 0;white-space:pre-wrap}
 .tool-details{margin:3px 0;font-size:12px}
 .tool-details>summary{cursor:pointer;color:var(--mut);font-family:ui-monospace,monospace;
   background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:2px 8px;
@@ -495,7 +497,28 @@ function applySessionDetail(d){
   if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
   const panel = document.getElementById("infopanel");
   if(panel) panel.innerHTML = infoHtml(d);
+  renderApiError(d.last_api_error);
   updateModelSt(d.id || convState.id || "");
+}
+function renderApiError(err){
+  // 上游 503/限流时 CLI 只写 system/api_error，转录里没有助手内容；
+  // 这里把服务端记录的重试状态显示出来，避免看起来像卡死
+  const el = document.getElementById("apierr");
+  if(!el) return;
+  if(!err || !err.text){
+    el.textContent = "";
+    el.style.display = "none";
+    return;
+  }
+  let tail = "";
+  // 只有最近发生的错误才算“正在重试”；重启服务回放旧转录时不显示过期的重试状态
+  const fresh = err.ts && Date.now() / 1000 - err.ts < 180;
+  if(err.retry_attempt && fresh){
+    tail = `，正在第 ${err.retry_attempt}${err.max_retries ? "/" + err.max_retries : ""} 次重试`;
+    if(err.retry_in_ms) tail += `，约 ${Math.max(1, Math.round(err.retry_in_ms / 1000))} 秒后继续`;
+  }
+  el.textContent = "⚠ 模型服务暂不可用：" + err.text + tail;
+  el.style.display = "";
 }
 function updateLiveBubble(text){
   liveText = text || "";
@@ -852,6 +875,7 @@ async function renderConversation(id, force){
             <span class="mut">${esc(d.cwd || "")}</span></h2>
           <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
           <div id="interactions"></div>
+          <div id="apierr" class="apierr" style="display:none"></div>
           <div class="info-panel">
             ${modelControlsHtml()}
             <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"

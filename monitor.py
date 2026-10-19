@@ -200,6 +200,7 @@ class Session:
         self.pending_tools = set()     # 主链上尚未回传结果/未结束的 tool_use id
         self.context_tokens = 0        # 最新一条 assistant usage 的上下文大小
         self.compacted_at = None
+        self.last_api_error = None     # 最近一次上游 API 错误/重试（system/api_error）
         self.is_subagent = False
         self.parent_id = None
         self.agent_name = None
@@ -228,6 +229,7 @@ class Session:
             "last_turn_end_at": self.last_turn_end_ts,
             "context_tokens": self.context_tokens,
             "compacted_at": self.compacted_at,
+            "last_api_error": self.last_api_error,
             "is_subagent": self.is_subagent,
             "parent_id": self.parent_id,
             "agent_name": self.agent_name,
@@ -714,11 +716,30 @@ class Monitor:
                 sess.last_turn_end_ts = ts_epoch or now_ts()
                 # turn_duration 是权威结束标记：清掉可能因中断而没有结果的 tool id
                 sess.pending_tools.clear()
+                sess.last_api_error = None
                 if not sess.active_agents:
                     self._set_idle(sess)
             elif subtype == "compact_boundary":
                 sess.compacted_at = ts_epoch or now_ts()
                 self.emit(sess, "context_compacted", {"at": sess.compacted_at})
+            elif subtype in ("api_error", "api_retry"):
+                # 上游 503/限流时 CLI 只写这些 system 行，没有 assistant 内容；
+                # 记录下来让网页能说明“为什么没反应”（重试会持续到 maxRetries）
+                err = obj.get("error")
+                if isinstance(err, dict):
+                    text = err.get("message") or err.get("formatted") or ""
+                else:
+                    text = str(err) if err else ""
+                data = {
+                    "text": clip(text or "模型服务暂时不可用", 300),
+                    "retry_attempt": obj.get("retryAttempt"),
+                    "max_retries": obj.get("maxRetries"),
+                    "retry_in_ms": obj.get("retryInMs"),
+                }
+                sess.last_api_error = {"ts": ts_epoch or now_ts(), **data}
+                # 请求还在退避重试，回合没有结束
+                self._set_working(sess)
+                self.emit(sess, "api_error", data)
             return
 
         msg = obj.get("message") or {}
@@ -738,6 +759,7 @@ class Monitor:
                                 if isinstance(b, dict) and b.get("type") == "text")
                 if text:
                     sess.user_msgs += 1
+                    sess.last_api_error = None
                     sess.last_input_ts = ts_epoch or now_ts()
                     if sess.first_user is None:
                         sess.first_user = clip(text, 80)
@@ -745,6 +767,11 @@ class Monitor:
                     self._set_working(sess)
                     self.emit(sess, "user_message", {"text": sess.last_user})
             elif sidechain or kind in ("tool", "injected", "system", "meta_tool"):
+                # 中断标记说明退避重试已经结束，别再显示“正在重试”
+                if kind == "system" and any(
+                        isinstance(b, dict) and (b.get("text") or "").lstrip().startswith("[Request interrupted")
+                        for b in blocks):
+                    sess.last_api_error = None
                 # 子代理、工具回传和注入内容都说明会话仍在活动
                 self._set_working(sess)
 
@@ -768,6 +795,7 @@ class Monitor:
                     continue
                 if b.get("type") == "text" and b.get("text") and not sidechain:
                     sess.last_assistant = clip(b["text"])
+                    sess.last_api_error = None   # 重试成功，已有正常输出
                     self.emit(sess, "assistant_message", {"text": sess.last_assistant})
                 elif b.get("type") == "tool_use":
                     self._on_tool_use(sess, b, sidechain)
@@ -2248,7 +2276,9 @@ def make_handler(mon, refresh_interval):
                         f"id: {ev.get('seq', 0)}\nevent: {ev['type']}\ndata: "
                         f"{json.dumps(ev, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except OSError:
+                # 客户端断开：Windows 上是 ConnectionAbortedError(10053)，
+                # 其他平台多为 BrokenPipeError/ConnectionResetError
                 pass
             finally:
                 mon.subscribers.remove(q)
