@@ -122,6 +122,39 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(error.exception.code, 403)
         apply.assert_not_called()
 
+    def test_interactions_endpoint(self):
+        hosted = type("H", (), {"hid": "h1", "session_id": "sid-1"})()
+        inter = monitor.Interaction("r1", hosted, {
+            "tool_name": "Bash", "tool_use_id": "t1", "input": {"command": "ls"}})
+        self.mon.interactions["r1"] = inter
+        result = json.load(self.request("/interactions?session=sid-1"))
+        self.assertEqual(result["interactions"][0]["tool_name"], "Bash")
+        self.assertEqual(result["interactions"][0]["preview"]["kind"], "text")
+
+    def test_approval_endpoint_persists(self):
+        response = self.request("/sessions/sid-1/approval", {"approval": "full"},
+                                {"Content-Type": "application/json"})
+        self.assertEqual(json.load(response)["approval"], "full")
+        self.assertEqual(self.mon.approvals.get("sid-1"), "full")
+        detail = json.load(self.request("/sessions/sid-1"))
+        self.assertEqual(detail["approval"], "full")
+
+    def test_interrupt_non_hosted_returns_409(self):
+        with self.assertRaises(HTTPError) as error:
+            self.request("/sessions/sid-1/interrupt", {},
+                         {"Content-Type": "application/json"})
+        self.assertEqual(error.exception.code, 409)
+
+    def test_respond_cross_origin_rejected(self):
+        hosted = type("H", (), {"hid": "h1", "session_id": "sid-1"})()
+        inter = monitor.Interaction("r1", hosted, {"tool_name": "Bash", "input": {}})
+        self.mon.interactions["r1"] = inter
+        with self.assertRaises(HTTPError) as error:
+            self.request("/interactions/r1/respond", {"behavior": "allow"},
+                         {"Content-Type": "application/json", "Origin": "http://evil.invalid"})
+        self.assertEqual(error.exception.code, 403)
+        self.assertEqual(inter.state, "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

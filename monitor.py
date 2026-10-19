@@ -1485,6 +1485,9 @@ def make_handler(mon, refresh_interval):
             u = urlparse(self.path)
             if u.path == "/healthz":
                 return self._json({"ok": True, "sessions": len(mon.sessions)})
+            if u.path == "/interactions":
+                sid = parse_qs(u.query).get("session", [None])[0]
+                return self._json({"interactions": mon.pending_interactions(sid)})
             if u.path == "/":
                 body = _jinja.get_template("index.html").render(
                     refresh_interval=refresh_interval,
@@ -1498,17 +1501,23 @@ def make_handler(mon, refresh_interval):
                 return
             if u.path == "/sessions":
                 # 默认返回概览（按项目分组所需字段齐全）；加 ?full=1 返回完整信息
-                full = parse_qs(u.query).get("full", ["0"])[0] in ("1", "true")
+                qs = parse_qs(u.query)
+                full = qs.get("full", ["0"])[0] in ("1", "true")
+                include_subagents = qs.get("include_subagents", ["0"])[0] in ("1", "true")
                 with mon.lock:
                     pmap = mon.project_map()
                     items = sorted(((s.detail if full else s.summary)(mon.stale_after, mon.project_of(s, pmap))
-                                    for s in mon.unique_sessions()),
-                                   key=lambda x: x["last_event_at"], reverse=True)
+                                    for s in mon.unique_sessions(include_subagents)),
+                                   key=lambda x: x["last_input_at"] or x["last_event_at"],
+                                   reverse=True)
+                    counts = Counter(i.session_id for i in mon.interactions.values()
+                                     if i.state == "pending")
                 for it in items:
                     h = mon.hosted_by_sid.get(it["id"])
                     it["hosted"] = bool(h and h.alive())
                     it["hosted_id"] = h.hid if h else None
                     it["selected_model"] = mon.preferences.get(it["id"])
+                    it["pending_interactions"] = counts.get(it["id"], 0)
                 return self._json(items)
             if u.path.startswith("/sessions/") and u.path.endswith("/messages"):
                 sid = u.path.split("/")[2]
@@ -1570,9 +1579,17 @@ def make_handler(mon, refresh_interval):
                         return self._json({"error": "not found"}, 404)
                     d = s.detail(mon.stale_after, mon.project_of(s, mon.project_map()))
                 d["selected_model"] = mon.preferences.get(sid)
+                d["approval"] = mon.approvals.get(sid)
+                d["interactions"] = mon.pending_interactions(sid)
+                with mon.lock:
+                    d["subagent_session_ids"] = sorted({s.id for s in mon.sessions.values()
+                                                        if s.parent_id == sid})
                 h = mon.hosted_by_sid.get(sid)
                 d["hosted"] = bool(h and h.alive())
                 d["hosted_id"] = h.hid if h else None
+                d["hosted_busy"] = bool(h and h.alive()
+                                        and (h.current or h.pending or h.processing))
+                d["hosted_queued"] = len(h.pending) if h and h.alive() else 0
                 return self._json(d)
             if u.path.startswith("/static/"):
                 return self._static(u.path[len("/static/"):])
@@ -1660,7 +1677,14 @@ def make_handler(mon, refresh_interval):
                 if not isinstance(text, str) or not text.strip():
                     return self._json({"error": "body must contain \"text\" (first message)"}, 400)
                 code, resp = mon.host_session(body.get("cwd"), body.get("resume_id"),
-                                              text, bool(body.get("force")), body.get("model", UNSET))
+                                              text, bool(body.get("force")),
+                                              body.get("model", UNSET), body.get("approval"))
+                return self._json(resp, code)
+            if u.path.startswith("/interactions/") and u.path.endswith("/respond"):
+                if not self._safe_json_write():
+                    return
+                iid = u.path.split("/")[2]
+                code, resp = mon.respond_interaction(iid, self._read_body())
                 return self._json(resp, code)
             if u.path == "/new":
                 body = self._read_body()
@@ -1687,6 +1711,30 @@ def make_handler(mon, refresh_interval):
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400)
                 return self._json({"selected_model": selected})
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "interrupt":
+                if not self._safe_json_write():
+                    return
+                code, resp = mon.interrupt_session(parts[1])
+                return self._json(resp, code)
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "approval":
+                if not self._safe_json_write():
+                    return
+                body = self._read_body()
+                mode = body.get("approval") if isinstance(body, dict) else None
+                if mode not in APPROVAL_MODES:
+                    return self._json({"error": "approval 必须是 ask / auto / full"}, 400)
+                try:
+                    mon.approvals.set(parts[1], mode)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 500)
+                with mon.lock:
+                    h = mon.hosted_by_sid.get(parts[1])
+                if h and h.alive():
+                    try:
+                        h.set_approval(mode)
+                    except (RuntimeError, TimeoutError) as e:
+                        return self._json({"error": f"实时切换失败: {e}"}, 409)
+                return self._json({"approval": mode})
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "message":
                 body = self._read_body()
                 if not isinstance(body, dict):
