@@ -150,6 +150,12 @@ let view = {project: null, session: null};   // 当前视图
 let curPanel = null;               // main 里已渲染的面板 {type:"list"|"conv"|"new", key}，
                                    // 自动刷新只更新数据区域、不重建输入区，避免失焦/丢草稿
 let convCache = {id: null, size: -1};        // 对话缓存标记，避免重复渲染
+let convState = {id: null, msgs: [], total: 0, start: 0, size: -1,
+                 hasMore: false, loadingEarlier: false};
+let lastSidebarSig = "", lastListSig = "";
+let esGlobal = null, esSession = null, lastSeq = 0;
+let listTimer = null, convTimer = null;
+let liveText = "", liveRaf = null;
 let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
                                    // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
@@ -395,6 +401,114 @@ async function applyCc(cwd){
   }finally{ s.pending = false; renderCc(cwd); }
 }
 
+/* ---------- SSE 实时更新 ---------- */
+const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_message",
+  "tool_use", "tool_error", "turn_finished", "subagent_start", "task_created",
+  "task_updated", "context_compacted", "api_error", "hosted_turn_done",
+  "hosted_api_retry", "hosted_foreign_turn", "interaction_pending",
+  "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
+  "remote_message_done", "hosted_exited"];
+const raf = window.requestAnimationFrame || (fn => setTimeout(fn, 16));
+
+function scheduleListRefresh(){
+  clearTimeout(listTimer);
+  listTimer = setTimeout(() => { if(!document.hidden) load(); }, 800);
+}
+function scheduleConvRefresh(sid){
+  if(view.session !== sid) return;
+  clearTimeout(convTimer);
+  convTimer = setTimeout(() => {
+    if(!document.hidden) renderConversation(sid, false);
+  }, 500);
+}
+function onSseEvent(event){
+  let msg;
+  try{ msg = JSON.parse(event.data); }catch{ return; }
+  if(msg.seq && msg.seq <= lastSeq) return;   // 全局/单会话两路流去重
+  if(msg.seq) lastSeq = msg.seq;
+  if(msg.type === "snapshot"){
+    if(msg.data.sessions){
+      sessions = msg.data.sessions;
+      renderMain();
+    }
+    if(msg.data.session && view.session === msg.session){
+      applySessionDetail(msg.data.session);
+      if(msg.data.live && msg.data.live.text) updateLiveBubble(msg.data.live.text);
+      scheduleConvRefresh(msg.session);
+    }
+    return;
+  }
+  if(msg.type === "turn_delta"){
+    if(view.session === msg.session) updateLiveBubble(msg.data.text || "");
+    return;
+  }
+  if(["turn_finished", "hosted_turn_done", "interaction_pending",
+      "turn_interrupted"].includes(msg.type) && view.session === msg.session){
+    clearLiveBubble();
+  }
+  scheduleListRefresh();
+  if(msg.session) scheduleConvRefresh(msg.session);
+}
+function connectGlobalSse(){
+  if(!window.EventSource) return;
+  if(esGlobal) esGlobal.close();
+  esGlobal = new EventSource("/events");
+  for(const type of SSE_TYPES) esGlobal.addEventListener(type, onSseEvent);
+  let opened = false;
+  esGlobal.onopen = () => {
+    if(opened){
+      lastSeq = 0;
+      load();
+      if(view.session) renderConversation(view.session, true);
+    }
+    opened = true;
+  };
+}
+function connectSessionSse(id){
+  if(!window.EventSource) return;
+  disconnectSessionSse();
+  esSession = new EventSource("/events?session=" + encodeURIComponent(id));
+  for(const type of SSE_TYPES) esSession.addEventListener(type, onSseEvent);
+}
+function disconnectSessionSse(){
+  if(esSession){ esSession.close(); esSession = null; }
+}
+function applySessionDetail(d){
+  if(!d) return;
+  const badge = document.getElementById("statebadge");
+  if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
+  const panel = document.getElementById("infopanel");
+  if(panel) panel.innerHTML = infoHtml(d);
+  updateModelSt(d.id || convState.id || "");
+}
+function updateLiveBubble(text){
+  liveText = text || "";
+  if(liveRaf) return;
+  liveRaf = raf(() => { liveRaf = null; renderLiveBubble(); });
+}
+function renderLiveBubble(){
+  const conv = document.getElementById("conv");
+  if(!conv || !conv.insertBefore) return;
+  let el = document.getElementById("livebubble");
+  if(!liveText){
+    if(el && el.remove) el.remove();
+    return;
+  }
+  if(!el){
+    el = document.createElement("div");
+    el.id = "livebubble";
+    el.className = "msg assistant";
+    el.innerHTML = '<div class="mhead">助手 · 正在输入…</div><div class="abody"></div>';
+    conv.insertBefore(el, conv.firstChild);
+  }
+  const body = el.querySelector ? el.querySelector(".abody") : null;
+  if(body) body.textContent = liveText;
+}
+function clearLiveBubble(){
+  liveText = "";
+  renderLiveBubble();
+}
+
 /* ---------- 分组 ---------- */
 function groupByProject(){
   const groups = new Map();
@@ -416,6 +530,10 @@ function groupByProject(){
 
 /* ---------- 渲染：项目侧栏 ---------- */
 function renderSidebar(projects){
+  const sig = JSON.stringify([view.project,
+    projects.map(p => [p.cwd, p.sessions.length, p.working, p.wt, p.last])]);
+  if(sig === lastSidebarSig) return;
+  lastSidebarSig = sig;
   document.getElementById("projs").innerHTML = projects.map(p => `
     <div class="pitem ${p.cwd === view.project ? "active" : ""}" data-cwd="${esc(p.cwd)}">
       <div class="pname">${esc(projName(p.cwd))}
@@ -427,6 +545,12 @@ function renderSidebar(projects){
 
 /* ---------- 渲染：会话列表 ---------- */
 function renderSessionList(p){
+  const previousPanel = curPanel;
+  curPanel = {type: "list", key: p.cwd};
+  const sig = JSON.stringify([p.cwd, p.sessions]);
+  if(sig === lastListSig && previousPanel && previousPanel.type === "list"
+     && previousPanel.key === p.cwd) return;
+  lastListSig = sig;
   const main = document.getElementById("main");
   main.innerHTML = `
     <h2 style="font-size:16px;margin:4px 0">${esc(projName(p.cwd))}
@@ -450,7 +574,6 @@ function renderSessionList(p){
         ].filter(Boolean).map(esc).join(" · ")}</div>
         <div class="mut" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.last_user_message || "")}</div>
       </div>`).join("")}`;
-  curPanel = {type: "list", key: p.cwd};
   bindCc(p.cwd);
 }
 
@@ -581,88 +704,165 @@ function updateHostedControls(d){
 }
 
 let convLoading = null;     // 正在拉取对话的会话 id，防止同一会话的请求叠加
+function renderConvList(){
+  const el = document.getElementById("conv");
+  if(!el) return;
+  el.innerHTML = convHtml(convState.msgs.slice().reverse()) +
+    (convState.hasMore
+      ? '<div style="text-align:center;margin:10px 0">' +
+        '<button class="back" id="loadearlier">加载更早</button></div>'
+      : "");
+  const btn = document.getElementById("loadearlier");
+  if(btn) btn.onclick = loadEarlier;
+  const count = document.getElementById("convcount");
+  if(count) count.textContent = `对话 (${convState.msgs.length}/${convState.total})`;
+  if(!liveText){
+    const live = document.getElementById("livebubble");
+    if(live && live.remove) live.remove();
+  }
+}
+async function loadEarlier(){
+  if(!convState.id || !convState.hasMore || convState.loadingEarlier) return;
+  convState.loadingEarlier = true;
+  const main = document.getElementById("main");
+  const oldHeight = main.scrollHeight, oldScroll = main.scrollTop;
+  try{
+    const r = await fetch(`/sessions/${encodeURIComponent(convState.id)}/messages` +
+      `?before=${convState.start}&limit=100`);
+    const page = await r.json();
+    if(view.session !== convState.id) return;
+    convState.msgs = (page.messages || []).concat(convState.msgs);
+    convState.start = page.start;
+    convState.hasMore = !!page.has_more;
+    convState.total = page.total;
+    convState.size = page.size;
+    renderConvList();
+    main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
+  }catch(e){ /* 下次点击重试 */ }
+  finally{ convState.loadingEarlier = false; }
+}
 async function renderConversation(id, force){
   if(!force && convLoading === id) return;
   convLoading = id;
   const main = document.getElementById("main");
   const draft = document.getElementById("msgbox")?.value || "";   // 整体重建面板时保留草稿
   try{
-    const [dRes, mRes] = await Promise.all([
-      fetch("/sessions/" + encodeURIComponent(id)),
-      fetch(`/sessions/${encodeURIComponent(id)}/messages`),
-    ]);
-    const d = await dRes.json(), m = await mRes.json();
-    if(view.session !== id) return;   // 已切换走
-    const keep = curPanel && curPanel.type === "conv" && curPanel.key === id
-                 && document.getElementById("conv");
-    if(d.error){   // 转录尚未被轮询发现（常见于刚创建的会话）
-      if(!keep) main.innerHTML = '<div class="empty">会话转录尚未就绪，稍候自动刷新…</div>';
-      return;
-    }
-    if(keep){
-      // 该会话的面板已在页面上：只更新随刷新变化的部分（状态/信息/对话），
-      // 不动发送区，自动刷新不会打断正在输入的内容
-      const badge = document.getElementById("statebadge");
-      if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
-      // 同面板 keep 分支只更新历史信息，模型输入和 local 控件不重建。
-      document.getElementById("infopanel").innerHTML = infoHtml(d);
-      updateModelSt(id);
+    const isNew = !(curPanel && curPanel.type === "conv" && curPanel.key === id
+                    && document.getElementById("conv"));
+    if(isNew || force || convState.id !== id){
+      const [dRes, mRes] = await Promise.all([
+        fetch("/sessions/" + encodeURIComponent(id)),
+        fetch(`/sessions/${encodeURIComponent(id)}/messages?limit=100`),
+      ]);
+      const d = await dRes.json(), m = await mRes.json();
+      if(view.session !== id) return;   // 已切换走
+      if(d.error){   // 转录尚未被轮询发现（常见于刚创建的会话）
+        if(isNew) main.innerHTML = '<div class="empty">会话转录尚未就绪，稍候自动刷新…</div>';
+        return;
+      }
+      convState = {id, msgs: (m.messages || []).slice(),
+                   total: m.total || 0, start: m.start || 0,
+                   size: m.size || 0, hasMore: !!m.has_more,
+                   loadingEarlier: false};
+      if(isNew){
+        main.innerHTML = `
+          <button class="back" id="back">← 返回列表</button>
+          <h2 style="font-size:16px;margin:8px 0">
+            <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
+            ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
+            ${esc(sessTitle(d))}
+            <span class="mut">${esc(d.cwd || "")}</span></h2>
+          <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
+          <div id="interactions"></div>
+          <div class="info-panel">
+            ${modelControlsHtml()}
+            <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
+              style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
+            <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+              <button class="back" id="sendbtn">发送</button>
+              <button class="back" id="intbtn" disabled>中断</button>
+              <label class="ctl" id="approvalwrap">审批
+                <select id="approvalsel" aria-label="托管审批模式">
+                  <option value="ask">询问</option>
+                  <option value="auto">自动</option>
+                  <option value="full">全部允许</option>
+                </select></label>
+              <label class="ctl"><input type="checkbox" id="forcecb"> 忽略 working 强制发送</label>
+              <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
+                <input type="checkbox" id="hostcb" ${d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
+              ${d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
+                <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
+            </div>
+            <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
+          </div>
+          <h4 id="convcount">对话</h4>
+          <div id="conv"></div>`;
+        document.getElementById("back").onclick = () => {
+          disconnectSessionSse();
+          view.session = null;
+          convCache = {id: null, size: -1};
+          convState = {id: null, msgs: [], total: 0, start: 0, size: -1,
+                       hasMore: false, loadingEarlier: false};
+          renderMain();
+        };
+        document.getElementById("msgbox").value = draft;
+        bindSendBox(id, d);
+        curPanel = {type: "conv", key: id};
+        bindModel(id, d.selected_model);
+        loadModelOptions(id, d.cwd);
+        interCache = {id, sig: ""};
+        connectSessionSse(id);
+      }
+      applySessionDetail(d);
       renderInteractions(d.interactions || []);
       updateHostedControls(d);
-      if(force || convCache.id !== id || convCache.size !== m.size){
-        const nearTop = main.scrollTop < 80;   // 倒序后最新消息在顶部
-        convCache = {id, size: m.size};
-        document.getElementById("conv").innerHTML = convHtml(m.messages.slice().reverse());
-        document.getElementById("convcount").textContent = `对话 (${m.messages.length})`;
-        document.getElementById("infopanel").innerHTML = infoHtml(d);
-        if(force || nearTop) main.scrollTop = 0;
+      if(isNew){
+        updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
+        main.scrollTop = 0;
       }
+      clearLiveBubble();
+      renderConvList();
       return;
     }
-    convCache = {id, size: m.size};
-    main.innerHTML = `
-      <button class="back" id="back">← 返回列表</button>
-      <h2 style="font-size:16px;margin:8px 0">
-        <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
-        ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
-        ${esc(sessTitle(d))}
-        <span class="mut">${esc(d.cwd || "")}</span></h2>
-      <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
-      <div id="interactions"></div>
-      <div class="info-panel">
-        ${modelControlsHtml()}
-        <textarea id="msgbox" rows="3" placeholder="给该会话发消息…"
-          style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit"></textarea>
-        <div style="margin-top:6px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-          <button class="back" id="sendbtn">发送</button>
-          <button class="back" id="intbtn" disabled>中断</button>
-          <label class="ctl" id="approvalwrap">审批
-            <select id="approvalsel" aria-label="托管审批模式">
-              <option value="ask">询问</option>
-              <option value="auto">自动</option>
-              <option value="full">全部允许</option>
-            </select></label>
-          <label class="ctl"><input type="checkbox" id="forcecb"> 忽略 working 强制发送</label>
-          <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
-            <input type="checkbox" id="hostcb" ${d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
-          ${d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
-            <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
-        </div>
-        <div class="mut" id="sendst" style="white-space:pre-wrap;margin-top:4px"></div>
-      </div>
-      <h4 id="convcount">对话 (${m.messages.length})</h4>
-      <div id="conv">${convHtml(m.messages.slice().reverse())}</div>`;
-    document.getElementById("back").onclick = () => { view.session = null; convCache = {id: null, size: -1}; renderMain(); };
-    document.getElementById("msgbox").value = draft;
-    bindSendBox(id, d);
-    curPanel = {type: "conv", key: id};
-    bindModel(id, d.selected_model);
-    loadModelOptions(id, d.cwd);
-    interCache = {id, sig: ""};
+
+    // 同面板刷新：只更新数据区域，不重建输入区
+    const dRes = await fetch("/sessions/" + encodeURIComponent(id));
+    const d = await dRes.json();
+    if(view.session !== id) return;
+    if(d.error) return;
+    applySessionDetail(d);
     renderInteractions(d.interactions || []);
     updateHostedControls(d);
-    updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
-    main.scrollTop = 0;
+    updateSendSt(id);
+    const mRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages` +
+      `?from=${convState.total}&limit=500`);
+    const m = await mRes.json();
+    if(view.session !== id) return;
+    if(convState.id !== id || m.size < convState.size || m.total < convState.total){
+      // 文件被截断/替换：重新取最近一页
+      const freshRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages?limit=100`);
+      const fresh = await freshRes.json();
+      if(view.session !== id) return;
+      convState = {id, msgs: (fresh.messages || []).slice(),
+                   total: fresh.total || 0, start: fresh.start || 0,
+                   size: fresh.size || 0, hasMore: !!fresh.has_more,
+                   loadingEarlier: false};
+      renderConvList();
+      main.scrollTop = 0;
+    } else if(m.messages && m.messages.length){
+      const oldHeight = main.scrollHeight, oldScroll = main.scrollTop;
+      const nearTop = oldScroll < 80;
+      convState.msgs.push(...m.messages);
+      convState.total = m.total;
+      convState.size = m.size;
+      clearLiveBubble();
+      renderConvList();
+      if(nearTop) main.scrollTop = 0;
+      else main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
+    } else {
+      convState.total = m.total;
+      convState.size = m.size;
+    }
   }catch(e){ /* 下次刷新重试 */ }
   finally{ if(convLoading === id) convLoading = null; }
 }
@@ -1018,6 +1218,7 @@ auto.onchange = () => { localStorage.setItem("auto", auto.checked ? "1" : "0"); 
 ival.onchange = () => { localStorage.setItem("ival", ival.value); resetTimer(); };
 
 if(window.marked) marked.setOptions({breaks: true});
+connectGlobalSse();
 load();
 resetTimer();
 </script>

@@ -77,7 +77,7 @@ test('项目会话列表保留 local 配置，对话详情不显示或绑定 loc
     requests.push(url);
     if(url==='/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',selected_model:null,
       tokens:{},tool_uses:{},user_msgs:0,assistant_msgs:0,subagents:[],tasks:[]});
-    if(url==='/sessions/sid/messages') return response({size:1,messages:[]});
+    if(url.startsWith('/sessions/sid/messages')) return response({size:1,messages:[]});
     if(url==='/cc-switch?cwd=%2Fproject') return response({model_options:[{name:'团队 Sonnet',model:'vendor-sonnet'}]});
     throw Error('unexpected fetch ' + url);
   });
@@ -215,7 +215,7 @@ test('新建会话成功进入详情后仍以 profile 名称显示所选模型',
     if(url==='/jobs/job-1') return response({status:'done',result_session_id:'sid'});
     if(url==='/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',selected_model:null,
       tokens:{},tool_uses:{},user_msgs:0,assistant_msgs:0,subagents:[],tasks:[]});
-    if(url==='/sessions/sid/messages') return response({size:1,messages:[]});
+    if(url.startsWith('/sessions/sid/messages')) return response({size:1,messages:[]});
     throw Error('unexpected fetch ' + url);
   });
   b.context.setTimeout = callback => { callback(); return 1; };
@@ -239,7 +239,7 @@ test('新建会话进入详情后仍显示无 profile 匹配的自定义模型 I
     if(url==='/jobs/job-1') return response({status:'done',result_session_id:'sid'});
     if(url==='/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',selected_model:null,
       tokens:{},tool_uses:{},user_msgs:0,assistant_msgs:0,subagents:[],tasks:[]});
-    if(url==='/sessions/sid/messages') return response({size:1,messages:[]});
+    if(url.startsWith('/sessions/sid/messages')) return response({size:1,messages:[]});
     throw Error('unexpected fetch ' + url);
   });
   b.context.setTimeout = callback => { callback(); return 1; };
@@ -274,7 +274,7 @@ test('切入 sid 时 profile options 请求仍 pending，/new 与 /hosted 都能
       if(url==='/hosted') return response([{hosted_id:'host-1',session_id:'sid',status:'running'}]);
       if(url==='/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',selected_model:null,
         tokens:{},tool_uses:{},user_msgs:0,assistant_msgs:0,subagents:[],tasks:[]});
-      if(url==='/sessions/sid/messages') return response({size:1,messages:[]});
+      if(url.startsWith('/sessions/sid/messages')) return response({size:1,messages:[]});
       throw Error('unexpected fetch ' + url);
     });
     b.context.setTimeout = callback => { callback(); return 1; };
@@ -467,4 +467,32 @@ test('全局待审批计数显示与隐藏', () => {
   b.run('sessions=[{id:"a",pending_interactions:0}]');
   b.run('renderPendingBadge()');
   assert.equal(b.node('pendingbadge').style.display,'none');
+});
+test('SSE 快照更新会话列表与流式文本状态', async () => {
+  const b=boot();
+  b.run(`view={project:"/p",session:null,new:false}; onSseEvent({data: JSON.stringify(
+    {type:"snapshot",seq:1,session:null,
+     data:{sessions:[{id:"s1",project:"/p",cwd:"/p",state:"idle",
+       last_event_at:1,last_input_at:1}],interactions:[]}})});`);
+  assert.equal(b.run('sessions.length'),1);
+  assert.equal(b.run('lastSeq'),1);
+  b.run('view={project:"/p",session:"s1",new:false}; ' +
+    'onSseEvent({data: JSON.stringify({type:"turn_delta",seq:2,session:"s1",' +
+    'data:{text:"你好"}})});');
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(b.run('liveText'),'你好');
+  b.run('onSseEvent({data: JSON.stringify({type:"turn_finished",seq:3,session:"s1",data:{}})});');
+  assert.equal(b.run('liveText'),'');
+});
+test('对话分页状态渲染与加载更早按钮', () => {
+  const b=boot();
+  b.run('convState={id:"s1",msgs:[' +
+    '{role:"user",ts:0,parts:[{type:"text",text:"old"}]},' +
+    '{role:"assistant",ts:1,parts:[{type:"text",text:"new"}]}],' +
+    'total:10,start:8,size:1,hasMore:true,loadingEarlier:false}; renderConvList();');
+  const html=b.node('conv').innerHTML;
+  assert.match(html,/old/); assert.match(html,/new/); assert.match(html,/loadearlier/);
+  assert.equal(b.node('convcount').textContent,'对话 (2/10)');
+  b.run('convState.hasMore=false; renderConvList();');
+  assert.doesNotMatch(b.node('conv').innerHTML,/loadearlier/);
 });
