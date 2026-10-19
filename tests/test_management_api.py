@@ -145,6 +145,40 @@ class ManagementAPITests(unittest.TestCase):
                          {"Content-Type": "application/json"})
         self.assertEqual(error.exception.code, 409)
 
+    def test_live_approval_switch_failure_does_not_persist(self):
+        class FakeHost:
+            def alive(self):
+                return True
+
+            def set_approval(self, mode):
+                raise RuntimeError("切换失败")
+
+        self.mon.hosted_by_sid["sid-1"] = FakeHost()
+        with patch.object(self.mon.approvals, "set") as save:
+            code, _ = self.mon.set_approval("sid-1", "auto")
+        self.assertEqual(code, 409)
+        save.assert_not_called()
+
+    def test_live_approval_switch_persists_after_success(self):
+        calls = []
+
+        class FakeHost:
+            def alive(self):
+                return True
+
+            def set_approval(self, mode):
+                calls.append(("host", mode))
+
+        self.mon.hosted_by_sid["sid-1"] = FakeHost()
+        real_set = self.mon.approvals.set
+        def record(sid, mode):
+            calls.append(("disk", mode))
+            return real_set(sid, mode)
+        with patch.object(self.mon.approvals, "set", side_effect=record):
+            code, _ = self.mon.set_approval("sid-1", "full")
+        self.assertEqual(code, 200)
+        self.assertEqual(calls, [("host", "full"), ("disk", "full")])
+
     def test_respond_cross_origin_rejected(self):
         hosted = type("H", (), {"hid": "h1", "session_id": "sid-1"})()
         inter = monitor.Interaction("r1", hosted, {"tool_name": "Bash", "input": {}})

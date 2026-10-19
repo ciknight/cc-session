@@ -95,6 +95,13 @@ class InteractionTests(unittest.TestCase):
         self.assertEqual(code, 429)
         self.assertIn("queue", resp["error"].lower())
 
+    def test_api_retry_is_recorded_for_diagnostics(self):
+        host, job = self.start_host("api-retry")
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        retry = host.info().get("last_api_retry")
+        self.assertEqual(retry["error_status"], 503)
+        self.assertEqual(retry["attempt"], 1)
+
     def test_lifecycle_completed_before_result(self):
         host, job = self.start_host("lifecycle-first")
         self.assertTrue(self.wait_for(

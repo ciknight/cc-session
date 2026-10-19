@@ -129,6 +129,8 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
     </select>
   </label>
   <span class="ctl" id="updated"></span>
+  <button id="pendingbadge" class="back" style="display:none;border-color:#d97706;color:#d97706"
+          title="有权限请求等待审批，点击跳转">待审批 0</button>
   <span id="err"></span>
 </header>
 <div id="app">
@@ -906,10 +908,18 @@ function bindSendBox(id, d){
 }
 
 /* ---------- 主渲染 ---------- */
+function renderPendingBadge(){
+  const total = sessions.reduce((sum, s) => sum + (s.pending_interactions || 0), 0);
+  const el = document.getElementById("pendingbadge");
+  if(!el) return;
+  el.style.display = total ? "inline-block" : "none";
+  el.textContent = "待审批 " + total;
+}
 function renderMain(){
   const projects = groupByProject();
   renderSidebar(projects);
   document.getElementById("total").textContent = `(${sessions.length})`;
+  renderPendingBadge();
   if(view.session){
     renderConversation(view.session, false);
     return;
@@ -952,6 +962,13 @@ function toggleDrawer(open){
   asideEl.classList.toggle("open", open);
   maskEl.classList.toggle("show", open);
 }
+document.getElementById("pendingbadge").onclick = () => {
+  const target = sessions.find(s => s.pending_interactions > 0);
+  if(!target) return;
+  view = {project: target.project, session: target.id, new: false};
+  convCache = {id: null, size: -1};
+  renderConversation(target.id, true);
+};
 document.getElementById("menu").onclick = () => toggleDrawer(!asideEl.classList.contains("open"));
 maskEl.onclick = () => toggleDrawer(false);
 document.getElementById("projs").addEventListener("click", e => {

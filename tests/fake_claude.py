@@ -72,6 +72,8 @@ for line in sys.stdin:
         emit({"type": "system", "subtype": "init", "session_id": "fake-session"})
         text = obj["message"]["content"]
         uuid = obj.get("uuid")
+        # 真实 CLI 会先发 queued，再发 started
+        emit({"type": "command_lifecycle", "command_uuid": uuid, "state": "queued"})
         emit({"type": "command_lifecycle", "command_uuid": uuid, "state": "started"})
         if text.startswith("permission"):
             pending_permission_uuid = uuid
@@ -82,6 +84,11 @@ for line in sys.stdin:
                                             "destination": "session",
                                             "rules": [{"toolName": "Edit"}]}],
                 "decision_reason": "writes a file"}})
+        elif text == "api-retry":
+            emit({"type": "system", "subtype": "api_retry", "attempt": 1,
+                  "max_retries": 10, "error_status": 503,
+                  "error": "server_error"})
+            complete(uuid, "retried-ok")
         elif text == "lifecycle-first":
             emit({"type": "command_lifecycle", "command_uuid": uuid,
                   "state": "completed"})

@@ -519,6 +519,23 @@ class Monitor:
             return 409, {"error": "session is not hosted"}
         return h.interrupt()
 
+    def set_approval(self, sid, mode):
+        """先切换活动托管进程，成功后再持久化，避免失败时磁盘与内存不一致。"""
+        if mode not in APPROVAL_MODES:
+            return 400, {"error": "approval 必须是 ask / auto / full"}
+        with self.lock:
+            h = self.hosted_by_sid.get(sid)
+        if h and h.alive():
+            try:
+                h.set_approval(mode)
+            except (RuntimeError, TimeoutError) as e:
+                return 409, {"error": f"实时切换失败: {e}"}
+        try:
+            self.approvals.set(sid, mode)
+        except ValueError as e:
+            return 500, {"error": str(e)}
+        return 200, {"approval": mode}
+
     def respond_interaction(self, iid, body):
         if not isinstance(body, dict):
             return 400, {"error": "invalid JSON body"}
@@ -845,6 +862,7 @@ class Hosted:
         self.interrupting = False
         self.interrupt_target = None   # 被中断的 job；只取消这一轮，不误伤后续消息
         self.lifecycle_seen = False
+        self.last_api_retry = None     # 最近一次上游重试，用于诊断 5xx/限流
         self.max_queued = 32
 
     def alive(self):
@@ -1018,6 +1036,15 @@ class Hosted:
                     inter.resolve("deny", reason="请求已被 Claude 取消", state="cancelled")
             elif typ == "system" and obj.get("subtype") == "init":
                 self._on_init(obj.get("session_id"))
+            elif typ == "system" and obj.get("subtype") == "api_retry":
+                retry = {"attempt": obj.get("attempt"),
+                         "max_retries": obj.get("max_retries"),
+                         "error_status": obj.get("error_status"),
+                         "error": obj.get("error")}
+                with self.ready:
+                    self.last_api_retry = retry
+                self._emit_session_event("hosted_api_retry",
+                                         {"hosted": self.hid, **retry})
             elif typ == "command_lifecycle":
                 self._on_lifecycle(obj)
             elif typ == "result":
@@ -1100,11 +1127,16 @@ class Hosted:
         if sess:
             self.mon.emit(sess, kind, data)
 
+    # CLI 会在回合过程中发送 queued/started/running 等非终态；
+    # 只有以下状态才结束这一轮。
+    LIFECYCLE_TERMINAL = {"completed", "cancelled", "discarded", "refused", "dropped"}
+
     def _on_lifecycle(self, obj):
         state = obj.get("state")
         cu = obj.get("command_uuid")
         self.lifecycle_seen = True
-        if state == "started":
+        if state not in self.LIFECYCLE_TERMINAL:
+            # queued / started / running / released ... 仍在这一轮内
             with self.ready:
                 job = self.current
                 if job and job.get("command_uuid") == cu:
@@ -1301,6 +1333,7 @@ class Hosted:
                 "busy": busy, "queued": queued,
                 "approval": approval, "interrupting": interrupting,
                 "current_job": current.get("id") if current else None,
+                "last_api_retry": self.last_api_retry,
                 "needs_rehost": self.needs_rehost,
                 "turns": turns, "returncode": self.returncode,
                 "started_at": self.started_at, "stderr_tail": list(self.stderr_tail)}
@@ -1793,20 +1826,8 @@ def make_handler(mon, refresh_interval):
                     return
                 body = self._read_body()
                 mode = body.get("approval") if isinstance(body, dict) else None
-                if mode not in APPROVAL_MODES:
-                    return self._json({"error": "approval 必须是 ask / auto / full"}, 400)
-                try:
-                    mon.approvals.set(parts[1], mode)
-                except ValueError as e:
-                    return self._json({"error": str(e)}, 500)
-                with mon.lock:
-                    h = mon.hosted_by_sid.get(parts[1])
-                if h and h.alive():
-                    try:
-                        h.set_approval(mode)
-                    except (RuntimeError, TimeoutError) as e:
-                        return self._json({"error": f"实时切换失败: {e}"}, 409)
-                return self._json({"approval": mode})
+                code, resp = mon.set_approval(parts[1], mode)
+                return self._json(resp, code)
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "message":
                 body = self._read_body()
                 if not isinstance(body, dict):

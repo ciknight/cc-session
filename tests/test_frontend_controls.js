@@ -13,7 +13,7 @@ function boot(fetch = async () => { throw Error('unexpected fetch'); }) {
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {value:'', checked:false, textContent:'', innerHTML:'', disabled:false,
-      dataset:{}, options:[], appendChild(option){this.options.push(option);}, replaceChildren(){this.options=[];},
+      dataset:{}, style:{}, options:[], appendChild(option){this.options.push(option);}, replaceChildren(){this.options=[];},
       classList:{toggle(){}, contains(){return false;}}, listeners:{},
       addEventListener(type, listener){(this.listeners[type] ||= []).push(listener);},
       dispatchEvent(event){for(const listener of this.listeners[event.type] || []) listener(event);},
@@ -457,4 +457,14 @@ test('审批卡片与富工具结果渲染，中断按钮随托管状态启用',
   assert.equal(b.node('approvalsel').value,'full');
   b.run('updateHostedControls({hosted:true,hosted_busy:true,approval:"ask"})');
   assert.equal(b.node('intbtn').disabled,false);
+});
+test('全局待审批计数显示与隐藏', () => {
+  const b=boot();
+  b.run('sessions=[{id:"a",pending_interactions:1},{id:"b",pending_interactions:2}]');
+  b.run('renderPendingBadge()');
+  assert.equal(b.node('pendingbadge').textContent,'待审批 3');
+  assert.equal(b.node('pendingbadge').style.display,'inline-block');
+  b.run('sessions=[{id:"a",pending_interactions:0}]');
+  b.run('renderPendingBadge()');
+  assert.equal(b.node('pendingbadge').style.display,'none');
 });

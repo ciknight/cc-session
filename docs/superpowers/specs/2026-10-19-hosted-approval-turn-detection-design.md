@@ -51,10 +51,10 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 ### 3.3 回合生命周期
 
 - 主判定：stdout 的 `command_lifecycle`。
-  - `state=started`：job → running。
+  - 非终态：`queued / started / running / released`，job 保持 running。
   - `state=completed`：job → done（若 result 标记错误则 failed）。
   - `state=cancelled`：job → cancelled。
-  - `state=discarded|refused`：job → failed，error 记录状态。
+  - `state=discarded|refused|dropped`：job → failed，error 记录状态。
 - `result`：只填充 `result`、`result_session_id`、`cost_usd`、`is_error`；不单独释放队列。
 - 兜底：若收到 `result` 后 3 秒内没有对应 `command_lifecycle`（旧版 CLI、测试 fake），用 `result` 结束 job。
 - 未匹配当前 job 的 `command_uuid` 视为 foreign turn：仅发 `hosted_foreign_turn` 事件，不改变队列状态。

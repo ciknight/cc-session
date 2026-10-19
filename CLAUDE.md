@@ -17,11 +17,14 @@ uv run monitor.py --webhook http://localhost:3000/hook
 
 - 依赖管理用 [uv](https://docs.astral.sh/uv/)：`uv add <pkg>` 添加依赖，改完 `pyproject.toml` 后 `uv lock`。
 - 无测试框架、无 lint 配置；唯一依赖是 Jinja2，其余为标准库。
+- 单元测试：`PYTHONPATH=. uv run python -m unittest discover -s tests -p 'test_*.py' -v`；
+  前端测试：`node --test tests/test_frontend_controls.js`。
+- 真实 CLI 权限冒烟（会调用模型）：`CLAUDE_SESSIONS_SMOKE=1 uv run python tests/smoke_permission_live.py`。
 - 可用 `CLAUDE_CONFIG_DIR` 环境变量指向其他 Claude 配置目录做测试。
 
 ## 架构
 
-单文件服务 `monitor.py`（约 500 行）+ Jinja 模板 `templates/index.html` + 本地前端依赖
+单文件服务 `monitor.py`（约 1900 行）+ Jinja 模板 `templates/index.html` + 本地前端依赖
 `static/marked.min.js`、`static/purify.min.js`（不依赖外网 CDN）。
 
 ### 数据流
@@ -67,7 +70,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - **托管审批**：模式为 `ask`/`auto`/`full`，持久化在
   `~/.claude/claude-sessions/approvals.json`；`ask` 等待网页响应（`--permission-timeout`
   默认 300 秒，超时自动拒绝），`auto` 交给 CLI 权限模式，`full` 由服务自动放行。
-  回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底。
+  回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
+  `queued/started/running/released` 是非终态，只有
+  `completed/cancelled/discarded/refused/dropped` 结束回合。
 
 ### 前端
 
