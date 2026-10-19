@@ -81,6 +81,26 @@ class InteractionTests(unittest.TestCase):
         pending = self.mon.pending_interactions("fake-session")[0]
         self.assertTrue(pending["allow_always"])
 
+    def test_queue_limit(self):
+        host, first = self.start_host("interrupt-me")
+        host.max_queued = 2
+        self.assertTrue(self.wait_for(lambda: host.current is not None))
+        self.assertEqual(host.send("a")[0], 202)
+        self.assertEqual(host.send("b")[0], 202)
+        code, resp = host.send("c")
+        self.assertEqual(code, 429)
+        self.assertIn("queue", resp["error"].lower())
+
+    def test_interrupt_clears_queue_and_cancels_current(self):
+        host, first = self.start_host("interrupt-me")
+        _, queued = host.send("queued")
+        self.assertTrue(self.wait_for(lambda: "fake-session" in self.mon.hosted_by_sid))
+        code, _ = self.mon.interrupt_session("fake-session")
+        self.assertEqual(code, 200)
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[first]["status"] == "cancelled"))
+        self.assertEqual(self.mon.jobs[queued["job_id"]]["status"], "cancelled")
+        self.assertTrue(host.alive())
+
 
 if __name__ == "__main__":
     unittest.main()

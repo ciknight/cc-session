@@ -29,7 +29,7 @@ def complete(uuid, text):
 
 
 def slow_turn(uuid, text):
-    time.sleep(0.15)
+    time.sleep(5 if text == "interrupt-me" else 0.15)
     if uuid in cancelled:
         return
     complete(uuid, str(model) + ":" + text)
