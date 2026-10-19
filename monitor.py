@@ -51,9 +51,11 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
   python monitor.py --webhook http://localhost:3000/hook   # 事件同时 POST 出去
 """
 import argparse
+import difflib
 import json
 import os
 import queue
+import re
 import secrets
 import shlex
 import shutil
@@ -61,13 +63,15 @@ import subprocess
 import threading
 import time
 import urllib.request
+import uuid
 from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from session_preferences import ModelPreferences, UNSET, default_model, model_args, validate_model
+from session_preferences import (APPROVAL_MODES, ApprovalPreferences, ModelPreferences,
+                                 UNSET, default_model, model_args, validate_model)
 from cc_switch import CCSwitch, SwitchError
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
@@ -175,12 +179,14 @@ class Session:
 
 
 class Monitor:
-    def __init__(self, stale_after, webhook=None):
+    def __init__(self, stale_after, webhook=None, permission_timeout=300):
         # 以文件路径为键：同一 session id 可能出现在多个项目目录（恢复/移动过），
         # 若按 id 键控，两个文件的读取 offset 会互相干扰导致重复计数
         self.sessions = {}           # str(path) -> Session
         self.stale_after = stale_after
         self.webhook = webhook
+        self.permission_timeout = permission_timeout
+        self.interactions = {}       # request_id -> Interaction
         self.lock = threading.Lock()
         self.subscribers = []      # list of queue.Queue
         self.first_scan_done = False
@@ -195,6 +201,7 @@ class Monitor:
         self.hosted = {}           # hosted_id -> Hosted（服务托管的常驻进程）
         self.hosted_by_sid = {}    # session id -> Hosted
         self.preferences = ModelPreferences(CLAUDE_DIR / "claude-sessions" / "preferences.json")
+        self.approvals = ApprovalPreferences(CLAUDE_DIR / "claude-sessions" / "approvals.json")
         self.cc_switch = CCSwitch(CLAUDE_DIR)
 
     def by_sid(self, sid):
@@ -1293,9 +1300,11 @@ def main():
     ap.add_argument("--claude-args", default="",
                     help='发消息时附加给 claude 的参数，例如 "--permission-mode acceptEdits --model sonnet"')
     ap.add_argument("--msg-timeout", type=int, default=600, help="单条远程消息最长执行秒数")
+    ap.add_argument("--permission-timeout", type=int, default=300,
+                    help="托管会话审批等待秒数，0 表示无限等待")
     args = ap.parse_args()
 
-    mon = Monitor(args.stale, args.webhook)
+    mon = Monitor(args.stale, args.webhook, args.permission_timeout)
     # Windows 上 npm 安装的 claude 是 claude.cmd，这里先解析出完整路径
     mon.claude_bin = shutil.which(args.claude_bin) or args.claude_bin
     mon.claude_args = shlex.split(args.claude_args)

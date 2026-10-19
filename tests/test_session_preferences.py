@@ -65,5 +65,32 @@ class PreferenceTests(unittest.TestCase):
             self.assertEqual(store.get("b"), "opus")
 
 
+class ApprovalPreferenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "approvals.json"
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_default_ask_and_persist(self):
+        store = prefs.ApprovalPreferences(self.path)
+        self.assertEqual(store.get("sid-1"), "ask")
+        store.set("sid-1", "full")
+        self.assertEqual(prefs.ApprovalPreferences(self.path).get("sid-1"), "full")
+
+    def test_invalid_mode_rejected(self):
+        store = prefs.ApprovalPreferences(self.path)
+        with self.assertRaises(ValueError):
+            store.set("sid-1", "bypass")
+
+    def test_corrupt_file_does_not_overwrite(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{broken", encoding="utf-8")
+        store = prefs.ApprovalPreferences(self.path)
+        self.assertTrue(store.error)
+        with self.assertRaises(ValueError):
+            store.set("sid-1", "auto")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "{broken")
+
+
 if __name__ == "__main__":
     unittest.main()

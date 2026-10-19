@@ -9,6 +9,8 @@ from pathlib import Path
 
 UNSET = object()
 
+APPROVAL_MODES = ("ask", "auto", "full")
+
 
 def validate_model(model):
     if model is None:
@@ -107,3 +109,55 @@ class ModelPreferences:
             if temp and os.path.exists(temp):
                 os.unlink(temp)
         self.models = updated
+
+
+class ApprovalPreferences:
+    """看板独立的托管审批模式，不修改 Claude 配置或转录。"""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.modes = {}
+        self.error = None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict) or data.get("version") != 1
+                    or not isinstance(data.get("approvals"), dict)):
+                raise ValueError("格式或版本不支持")
+            for sid, mode in data["approvals"].items():
+                if not isinstance(sid, str) or mode not in APPROVAL_MODES:
+                    raise ValueError("审批模式记录无效")
+            self.modes = data["approvals"]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            self.error = "审批模式文件无法读取或格式损坏，请先修复或移走该文件"
+
+    def get(self, sid, default="ask"):
+        with self.lock:
+            return self.modes.get(sid, default)
+
+    def set(self, sid, mode):
+        if mode not in APPROVAL_MODES:
+            raise ValueError("审批模式必须是 ask / auto / full")
+        with self.lock:
+            if self.error:
+                raise ValueError(self.error)
+            updated = dict(self.modes)
+            updated[sid] = mode
+            temp = None
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                fd, temp = tempfile.mkstemp(prefix="approvals-", suffix=".tmp", dir=self.path.parent)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "approvals": updated}, stream, ensure_ascii=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp, self.path)
+            except OSError as exc:
+                raise ValueError("审批模式保存失败，请检查目录权限或磁盘空间") from exc
+            finally:
+                if temp and os.path.exists(temp):
+                    os.unlink(temp)
+            self.modes = updated
+            return mode
