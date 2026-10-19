@@ -1,6 +1,7 @@
 """测试专用 stream-json 进程，不连接模型服务。"""
 import json
 import sys
+import threading
 import time
 
 model = None
@@ -11,29 +12,78 @@ for i, arg in enumerate(args):
     elif arg.startswith("--model="):
         model = arg.split("=", 1)[1]
 
+_write_lock = threading.Lock()
+pending_permission_uuid = None
+pending_interrupt_uuid = None
+cancelled = set()
+
 
 def emit(obj):
-    print(json.dumps(obj), flush=True)
+    with _write_lock:
+        print(json.dumps(obj), flush=True)
+
+
+def complete(uuid, text):
+    emit({"type": "result", "session_id": "fake-session", "result": text})
+    emit({"type": "command_lifecycle", "command_uuid": uuid, "state": "completed"})
+
+
+def slow_turn(uuid, text):
+    time.sleep(0.15)
+    if uuid in cancelled:
+        return
+    complete(uuid, str(model) + ":" + text)
 
 
 for line in sys.stdin:
-    obj = json.loads(line)
-    if obj["type"] == "control_request":
-        request = obj["request"]
-        if request["subtype"] == "set_model":
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    typ = obj.get("type")
+    if typ == "control_request":
+        request = obj.get("request") or {}
+        subtype = request.get("subtype")
+        if subtype == "set_model":
             value = request.get("model")
             if value == "timeout":
                 continue
             if value == "reject":
                 emit({"type": "control_response", "response": {
-                    "subtype": "error", "request_id": obj["request_id"], "error": "模型不可用"}})
+                    "subtype": "error", "request_id": obj["request_id"],
+                    "error": "模型不可用"}})
                 continue
             model = value
+        elif subtype == "interrupt":
+            uuid = pending_interrupt_uuid
+            if uuid:
+                cancelled.add(uuid)
+                emit({"type": "command_lifecycle", "command_uuid": uuid,
+                      "state": "cancelled"})
         emit({"type": "control_response", "response": {
             "subtype": "success", "request_id": obj["request_id"], "response": {}}})
-    elif obj["type"] == "user":
+    elif typ == "control_response":
+        response = obj.get("response") or {}
+        if response.get("request_id") == "req-1":
+            decision = (response.get("response") or {}).get("behavior")
+            uuid, pending_permission_uuid = pending_permission_uuid, None
+            complete(uuid, "decision:" + str(decision))
+    elif typ == "user":
         emit({"type": "system", "subtype": "init", "session_id": "fake-session"})
         text = obj["message"]["content"]
-        if text == "slow":
-            time.sleep(0.15)
-        emit({"type": "result", "session_id": "fake-session", "result": str(model) + ":" + text})
+        uuid = obj.get("uuid")
+        emit({"type": "command_lifecycle", "command_uuid": uuid, "state": "started"})
+        if text.startswith("permission"):
+            pending_permission_uuid = uuid
+            emit({"type": "control_request", "request_id": "req-1", "request": {
+                "subtype": "can_use_tool", "tool_name": "Edit", "tool_use_id": "tool-1",
+                "input": {"file_path": "/tmp/a", "old_string": "old", "new_string": "new"},
+                "permission_suggestions": [{"type": "addRules", "behavior": "allow",
+                                            "destination": "session",
+                                            "rules": [{"toolName": "Edit"}]}],
+                "decision_reason": "writes a file"}})
+        elif text in ("slow", "interrupt-me"):
+            pending_interrupt_uuid = uuid
+            threading.Thread(target=slow_turn, args=(uuid, text), daemon=True).start()
+        else:
+            complete(uuid, str(model) + ":" + text)

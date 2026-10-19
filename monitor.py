@@ -93,6 +93,10 @@ def clip(s, n=300):
     return s if len(s) <= n else s[:n] + "…"
 
 
+def _arg_present(args, name):
+    return any(arg == name or arg.startswith(name + "=") for arg in args)
+
+
 def project_root(cwd):
     """把 worktree 目录归并到主项目：<proj>/.claude/worktrees/<name> -> <proj>"""
     if not cwd:
@@ -434,17 +438,19 @@ class Monitor:
                 self.jobs.pop(old, None)
         return job
 
-    def host_session(self, cwd, resume_id, text, force=False, model=UNSET):
+    def host_session(self, cwd, resume_id, text, force=False, model=UNSET, approval=None):
         with self.lock:
             sess = self.by_sid(resume_id) if resume_id else None
         target = cwd or (sess.cwd if sess else None)
         if not isinstance(target, str) or not target or not os.path.isdir(target):
             return 400, {"error": f"cwd unavailable: {target}"}
         with self.cc_switch.operation(target):
-            return self._host_session_locked(cwd, resume_id, text, force, model)
+            return self._host_session_locked(cwd, resume_id, text, force, model, approval)
 
-    def _host_session_locked(self, cwd, resume_id, text, force=False, model=UNSET):
+    def _host_session_locked(self, cwd, resume_id, text, force=False, model=UNSET, approval=None):
         """启动并托管常驻进程；resume_id 为空则新建会话。"""
+        if approval is not None and approval not in APPROVAL_MODES:
+            return 400, {"error": "approval 必须是 ask / auto / full"}
         try:
             selected = validate_model(self.preferences.get(resume_id) if model is UNSET and resume_id
                                      else None if model is UNSET else model)
@@ -472,7 +478,8 @@ class Monitor:
                 self.preferences.set(resume_id, selected)
             except ValueError as e:
                 return 500, {"error": str(e)}
-        h = Hosted(self, cwd, resume_id, selected)
+        h = Hosted(self, cwd, resume_id, selected,
+                   approval=approval or (self.approvals.get(resume_id) if resume_id else "ask"))
         try:
             code, resp = h.start(text)
         except FileNotFoundError:
@@ -486,6 +493,44 @@ class Monitor:
         resp["hosted_id"] = h.hid
         print(f"[hosted] {h.hid} 启动 (cwd={cwd}, resume={resume_id or '新会话'})", flush=True)
         return code, resp
+
+    # ---------- 权限审批 ----------
+    def pending_interactions(self, sid=None):
+        with self.lock:
+            items = [i.public() for i in self.interactions.values()
+                     if i.state == "pending" and (sid is None or i.session_id == sid)]
+        return sorted(items, key=lambda item: item["created_at"])
+
+    def interrupt_session(self, sid):
+        with self.lock:
+            h = self.hosted_by_sid.get(sid)
+        if not h or not h.alive():
+            return 409, {"error": "session is not hosted"}
+        return h.interrupt()
+
+    def respond_interaction(self, iid, body):
+        if not isinstance(body, dict):
+            return 400, {"error": "invalid JSON body"}
+        behavior = body.get("behavior")
+        if behavior not in ("allow", "deny"):
+            return 400, {"error": "behavior 必须是 allow 或 deny"}
+        scope = body.get("scope", "once")
+        if scope not in ("once", "always"):
+            return 400, {"error": "scope 必须是 once 或 always"}
+        if scope == "always" and behavior != "allow":
+            return 400, {"error": "scope=always 只能用于 allow"}
+        with self.lock:
+            inter = self.interactions.get(iid)
+            if inter is None:
+                return 404, {"error": "interaction not found"}
+            if inter.state != "pending":
+                return 409, {"error": "interaction already resolved"}
+            if scope == "always" and not inter.allow_always:
+                return 400, {"error": "该请求不允许始终允许"}
+        reason = body.get("reason")
+        reason = clip(reason, 500) if isinstance(reason, str) else None
+        inter.resolve(behavior, scope, reason)
+        return 200, inter.public()
 
     # ---------- 事件分发 ----------
     def emit(self, sess, kind, data):
@@ -750,11 +795,12 @@ class Hosted:
     所以原有的监听逻辑无需改动。
     """
 
-    def __init__(self, mon, cwd, resume_id=None, selected_model=None):
+    def __init__(self, mon, cwd, resume_id=None, selected_model=None, approval=None):
         self.mon, self.cwd, self.resume_id = mon, cwd, resume_id
         self.hid = "h-" + secrets.token_hex(4)
         self.session_id = resume_id
         self.selected_model = selected_model
+        self.approval = approval or (mon.approvals.get(resume_id) if resume_id else "ask")
         self.process_model = selected_model if selected_model is not None else default_model(mon.claude_args)
         self.proc = None
         self.stderr_thread = None
@@ -776,6 +822,9 @@ class Hosted:
         self.stopping = False
         self.control_failed = False
         self.needs_rehost = False
+        self.interrupting = False
+        self.lifecycle_seen = False
+        self.max_queued = 32
 
     def alive(self):
         return self.proc is not None and self.status == "running" and not self.stopping
@@ -786,9 +835,17 @@ class Hosted:
 
     def start(self, first_text):
         cmd = [self.mon.claude_bin, "-p", "--input-format", "stream-json",
-               "--output-format", "stream-json", "--verbose"]
+               "--output-format", "stream-json", "--verbose",
+               "--permission-prompt-tool", "stdio"]
         if self.resume_id:
             cmd += ["--resume", self.resume_id]
+        else:
+            # 预生成 session id，使首轮开始前就能关联审批和事件
+            if not self.session_id:
+                self.session_id = str(uuid.uuid4())
+            cmd += ["--session-id", self.session_id]
+        if self.approval == "auto" and not _arg_present(self.mon.claude_args, "--permission-mode"):
+            cmd += ["--permission-mode", "auto"]
         cmd += model_args(self.mon.claude_args, self.selected_model)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, cwd=self.cwd)
@@ -809,10 +866,14 @@ class Hosted:
         except ValueError as e:
             return 400, {"error": str(e)}
         job = self.mon._new_job(self.session_id or self.hid, text, model)
+        job["command_uuid"] = str(uuid.uuid4())
         with self.ready:
             if self.status == "exited" or self.stopping or self.control_failed:
                 job.update(status="failed", error="hosted process is stopping", finished_at=now_ts())
                 return 409, {"error": job["error"]}
+            if len(self.pending) >= self.max_queued:
+                job.update(status="failed", error="hosted send queue is full", finished_at=now_ts())
+                return 429, {"error": "hosted send queue is full"}
             self.pending.append((text, job, model))
             self.ready.notify_all()
         return 202, {"job_id": job["id"], "status": job["status"], "hosted": self.hid}
@@ -866,7 +927,8 @@ class Hosted:
                     with self.ready:
                         self.current = job
                         job["status"] = "running"
-                    self._write({"type": "user", "message": {"role": "user", "content": text}})
+                    self._write({"type": "user", "uuid": job.get("command_uuid"),
+                             "message": {"role": "user", "content": text}})
                 except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
                     job.update(status="failed", error=str(e), finished_at=now_ts())
                     with self.ready:
@@ -907,7 +969,8 @@ class Hosted:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if obj.get("type") == "control_response":
+            typ = obj.get("type")
+            if typ == "control_response":
                 response = obj.get("response") or {}
                 with self.ready:
                     waiter = self.control_waiters.get(response.get("request_id"))
@@ -917,9 +980,19 @@ class Hosted:
                         else:
                             waiter["error"] = response.get("error") or "Claude 返回未知控制响应"
                         waiter["event"].set()
-            elif obj.get("type") == "system" and obj.get("subtype") == "init":
+            elif typ == "control_request":
+                if (obj.get("request") or {}).get("subtype") == "can_use_tool":
+                    self._on_can_use_tool(obj)
+            elif typ == "control_cancel_request":
+                with self.mon.lock:
+                    inter = self.mon.interactions.get(obj.get("request_id"))
+                if inter:
+                    inter.resolve("deny", reason="请求已被 Claude 取消", state="cancelled")
+            elif typ == "system" and obj.get("subtype") == "init":
                 self._on_init(obj.get("session_id"))
-            elif obj.get("type") == "result":
+            elif typ == "command_lifecycle":
+                self._on_lifecycle(obj)
+            elif typ == "result":
                 self._on_result(obj)
             # 其余事件（assistant / thinking 等）转录文件里已有，这里不处理
         rc = self.proc.wait()
@@ -950,6 +1023,11 @@ class Hosted:
             self.ready.notify_all()
         print(f"[hosted] {self.hid} 退出 code={rc} 会话={self.session_id}"
               + (f" stderr: {tail}" if tail else ""), flush=True)
+        # 进程已退出：唤醒所有等待审批的线程，避免永久阻塞
+        with self.mon.lock:
+            waiting = [i for i in self.mon.interactions.values() if i.hosted_id == self.hid]
+        for inter in waiting:
+            inter.resolve("deny", reason="托管进程已退出", state="cancelled")
         sess = self._sess()
         if sess:
             self.mon.emit(sess, "hosted_exited", {"hosted": self.hid, "returncode": rc})
@@ -967,38 +1045,172 @@ class Hosted:
     def _on_init(self, sid):
         if not sid:
             return
+        old = self.session_id
         self.session_id = sid
         with self.mon.lock:
             self.mon.hosted_by_sid[sid] = self
             if self.resume_id:
                 self.mon.hosted_by_sid[self.resume_id] = self
+            if old and old != sid:
+                self.mon.hosted_by_sid.pop(old, None)
+                for inter in self.mon.interactions.values():
+                    if inter.hosted_id == self.hid:
+                        inter.session_id = sid
         if self.selected_model is not None:
             try:
                 self.mon.preferences.bind(sid, self.selected_model)
             except ValueError:
                 pass
 
-    def _on_result(self, obj):
-        with self.ready:
-            job, self.current = self.current, None
-            self.processing = False
-            self.turns += 1
-            if job:
-                job["result"] = obj.get("result")
-                job["result_session_id"] = obj.get("session_id")
-                if obj.get("is_error"):
-                    job["error"] = clip(obj.get("result") or obj.get("subtype") or "error", 500)
-                job["status"] = "failed" if job["error"] else "done"
-                job["finished_at"] = now_ts()
-            self.ready.notify_all()
-        print(f"[hosted] {self.hid} 第 {self.turns} 轮完成 job={job['id'] if job else '-'}"
-              + (" 失败: " + job["error"] if job and job["error"] else ""), flush=True)
+    def _emit_session_event(self, kind, data):
         sess = self._sess()
         if sess:
-            self.mon.emit(sess, "hosted_turn_done", {
-                "hosted": self.hid, "job": job["id"] if job else None,
-                "result": clip(obj.get("result") or "", 300),
-                "cost_usd": obj.get("total_cost_usd"), "is_error": obj.get("is_error")})
+            self.mon.emit(sess, kind, data)
+
+    def _on_lifecycle(self, obj):
+        state = obj.get("state")
+        cu = obj.get("command_uuid")
+        self.lifecycle_seen = True
+        if state == "started":
+            with self.ready:
+                job = self.current
+                if job and job.get("command_uuid") == cu:
+                    job["status"] = "running"
+            return
+        with self.ready:
+            job = self.current if self.current and self.current.get("command_uuid") == cu else None
+            if job:
+                job["_terminal_state"] = state
+        if job is None:
+            self._emit_session_event("hosted_foreign_turn",
+                                     {"hosted": self.hid, "state": state})
+            return
+        if state == "completed":
+            if job.get("_result_seen"):
+                self._finish_job(job, "completed")
+            else:
+                # result 可能稍后才到，留 3 秒收集回复内容
+                threading.Timer(3.0, lambda: self._finish_job(job, "completed")).start()
+        else:
+            self._finish_job(job, state)
+
+    def _finish_job(self, job, terminal_state):
+        with self.ready:
+            if job.get("finished_at"):
+                return
+            if terminal_state == "completed":
+                status = "failed" if job.get("result_is_error") else "done"
+                error = job.get("error")
+            elif terminal_state == "cancelled":
+                status, error = "cancelled", job.get("error") or "已中断"
+            else:
+                status, error = "failed", job.get("error") or f"command {terminal_state}"
+            job.update(status=status, error=error, finished_at=now_ts())
+            if self.current is job:
+                self.current = None
+            self.processing = False
+            self.interrupting = False
+            self.ready.notify_all()
+            self.turns += 1
+        print(f"[hosted] {self.hid} 第 {self.turns} 轮 {status} job={job.get('id')}"
+              + (" 失败: " + error if error else ""), flush=True)
+        self._emit_session_event("hosted_turn_done", {
+            "hosted": self.hid, "job": job.get("id"), "status": status,
+            "result": clip(job.get("result") or "", 300),
+            "is_error": job.get("result_is_error", False)})
+
+    def _on_result(self, obj):
+        with self.ready:
+            job = self.current
+            if job is None:
+                return
+            job["result"] = obj.get("result")
+            job["result_session_id"] = obj.get("session_id")
+            job["cost_usd"] = obj.get("total_cost_usd")
+            job["result_is_error"] = bool(obj.get("is_error"))
+            job["_result_seen"] = True
+            if obj.get("is_error"):
+                job["error"] = clip(obj.get("result") or obj.get("subtype") or "error", 500)
+            terminal = job.get("_terminal_state")
+        if terminal:
+            self._finish_job(job, terminal)
+        else:
+            # 旧版 CLI 或测试 fake 可能不发 command_lifecycle
+            threading.Timer(3.0, lambda: self._finish_job(job, "completed")).start()
+
+    # ---------- 权限审批 ----------
+    def _on_can_use_tool(self, obj):
+        request_id = obj.get("request_id")
+        if not request_id:
+            return
+        inter = Interaction(request_id, self, obj.get("request") or {})
+        with self.mon.lock:
+            self.mon.interactions[request_id] = inter
+        self._emit_session_event("interaction_pending", inter.public())
+        if self.approval == "full":
+            inter.resolve("allow", "once", state="allowed")
+            self._write_interaction(inter)
+        else:
+            threading.Thread(target=self._await_interaction, args=(inter,), daemon=True).start()
+
+    def _await_interaction(self, inter):
+        timeout = self.mon.permission_timeout
+        inter.event.wait(timeout if timeout and timeout > 0 else None)
+        if inter.state == "pending":
+            inter.resolve("deny", reason="审批超时，已自动拒绝", state="timed_out")
+        self._write_interaction(inter)
+
+    def _write_interaction(self, inter):
+        if inter.behavior == "allow":
+            response = {"behavior": "allow", "updatedInput": inter.updated_input}
+            if inter.scope == "always":
+                response["updatedPermissions"] = inter.suggestions
+        else:
+            response = {"behavior": "deny", "message": inter.message or "用户拒绝"}
+        payload = {"type": "control_response", "response": {
+            "subtype": "success", "request_id": inter.id, "response": response}}
+        try:
+            if self.status != "exited":
+                self._write(payload)
+        except (OSError, ValueError):
+            if inter.state == "pending":
+                inter.state = "cancelled"
+        with self.mon.lock:
+            self.mon.interactions.pop(inter.id, None)
+        self._emit_session_event("interaction_resolved", inter.public())
+
+    def set_approval(self, mode):
+        if mode not in APPROVAL_MODES:
+            raise ValueError("invalid approval mode")
+        target = "auto" if mode == "auto" else "default"
+        if self.approval == "auto" or mode == "auto":
+            self._control("set_permission_mode", mode=target)
+        self.approval = mode
+
+    def interrupt(self):
+        if not self.alive():
+            return 409, {"error": "hosted process is not running"}
+        with self.ready:
+            self.interrupting = True
+            for _, job, _ in self.pending:
+                job.update(status="cancelled", error="已中断", finished_at=now_ts())
+            self.pending.clear()
+            job = self.current
+            self.ready.notify_all()
+        try:
+            self._write({"type": "control_request",
+                         "request_id": f"monitor-int-{self.hid}-{int(time.time() * 1000)}",
+                         "request": {"subtype": "interrupt"}})
+        except (OSError, ValueError) as exc:
+            if job:
+                self._finish_job(job, "failed")
+            return 500, {"error": f"中断写入失败: {exc}"}
+        if job:
+            threading.Timer(30.0, lambda: self._finish_job(job, "cancelled")).start()
+        else:
+            with self.ready:
+                self.interrupting = False
+        return 200, {"interrupted": True, "queued_cancelled": True}
 
     def stop(self, kill=False):
         if self.proc is None or self.status == "exited":
@@ -1024,6 +1236,8 @@ class Hosted:
         return {"hosted_id": self.hid, "session_id": self.session_id, "cwd": self.cwd,
                 "status": self.status, "pid": self.proc.pid if self.proc else None,
                 "busy": self.current is not None or self.processing, "queued": len(self.pending),
+                "approval": self.approval, "interrupting": self.interrupting,
+                "current_job": self.current.get("id") if self.current else None,
                 "needs_rehost": self.needs_rehost,
                 "turns": self.turns, "returncode": self.returncode,
                 "started_at": self.started_at, "stderr_tail": list(self.stderr_tail)}
@@ -1037,6 +1251,80 @@ def _parse_iso(s):
         return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
     except Exception:
         return None
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_ansi(text):
+    return _ANSI.sub("", text or "")
+
+
+def permission_preview(tool_name, tool_input):
+    """为审批卡片生成 diff / 命令 / JSON 预览。"""
+    ti = tool_input or {}
+    if tool_name == "Write":
+        path = ti.get("file_path") or ti.get("path") or "new file"
+        diff = "\n".join(difflib.unified_diff(
+            [], (ti.get("content") or "").splitlines(),
+            fromfile="/dev/null", tofile=path, lineterm=""))
+        return {"kind": "diff", "text": clip(diff, 8000)}
+    if "old_string" in ti and "new_string" in ti:
+        path = ti.get("file_path") or ti.get("path") or ""
+        diff = "\n".join(difflib.unified_diff(
+            str(ti.get("old_string", "")).splitlines(),
+            str(ti.get("new_string", "")).splitlines(),
+            fromfile=path, tofile=path, lineterm=""))
+        return {"kind": "diff", "text": clip(diff, 8000)}
+    if "command" in ti:
+        return {"kind": "text", "text": clip(ti.get("command", ""), 4000)}
+    return {"kind": "text", "text": clip(json.dumps(ti, ensure_ascii=False), 4000)}
+
+
+class Interaction:
+    """一次等待用户回答的权限请求。"""
+
+    def __init__(self, request_id, hosted, request):
+        self.id = request_id
+        self.hosted_id = hosted.hid
+        self.session_id = hosted.session_id
+        self.request = request
+        self.tool_name = request.get("tool_name") or ""
+        self.tool_use_id = request.get("tool_use_id")
+        self.tool_input = request.get("input") or {}
+        self.reason = strip_ansi(request.get("decision_reason") or "")
+        self.suggestions = [s for s in (request.get("permission_suggestions") or [])
+                            if isinstance(s, dict) and s.get("behavior") == "allow"]
+        self.allow_always = bool(self.suggestions) and not request.get("suppress_always_allow_rule")
+        self.preview = permission_preview(self.tool_name, self.tool_input)
+        self.created_at = now_ts()
+        self.event = threading.Event()
+        self.behavior = None
+        self.scope = "once"
+        self.message = None
+        self.updated_input = self.tool_input
+        self.state = "pending"
+        self.resolved_at = None
+
+    def resolve(self, behavior, scope="once", reason=None, state=None):
+        if self.state != "pending":
+            return False
+        self.behavior = behavior
+        self.scope = scope
+        self.message = reason
+        self.state = state or ("allowed" if behavior == "allow" else "denied")
+        self.resolved_at = now_ts()
+        self.event.set()
+        return True
+
+    def public(self):
+        return {"id": self.id, "hosted_id": self.hosted_id, "session_id": self.session_id,
+                "tool_name": self.tool_name, "tool_use_id": self.tool_use_id,
+                "tool_input": self.tool_input, "preview": self.preview,
+                "reason": self.reason, "allow_always": self.allow_always,
+                "created_at": self.created_at, "state": self.state,
+                "behavior": self.behavior, "scope": self.scope,
+                "resolved_at": self.resolved_at}
 
 
 # 转录里 type=user 的行不一定是真人输入：工具结果回传、isMeta 注入、
