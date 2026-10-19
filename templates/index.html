@@ -469,6 +469,11 @@ function connectSessionSse(id){
   disconnectSessionSse();
   esSession = new EventSource("/events?session=" + encodeURIComponent(id));
   for(const type of SSE_TYPES) esSession.addEventListener(type, onSseEvent);
+  let opened = false;
+  esSession.onopen = () => {
+    if(opened && view.session === id) renderConversation(id, true);
+    opened = true;
+  };
 }
 function disconnectSessionSse(){
   if(esSession){ esSession.close(); esSession = null; }

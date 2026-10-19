@@ -580,7 +580,10 @@ class Monitor:
                     return 400, {"error": "choice 必须提供 answers"}
                 normalized = {}
                 for question in inter.questions:
-                    text = question.get("question")
+                    if not isinstance(question, dict) \
+                            or not isinstance(question.get("question"), str):
+                        return 400, {"error": "问题格式无效"}
+                    text = question["question"]
                     answer = answers.get(text)
                     if not isinstance(answer, str) or not answer.strip():
                         return 400, {"error": f"缺少问题答案: {text}"}
