@@ -535,9 +535,10 @@ class Monitor:
                 return 409, {"error": "interaction already resolved"}
             if scope == "always" and not inter.allow_always:
                 return 400, {"error": "该请求不允许始终允许"}
-        reason = body.get("reason")
-        reason = clip(reason, 500) if isinstance(reason, str) else None
-        inter.resolve(behavior, scope, reason)
+            reason = body.get("reason")
+            reason = clip(reason, 500) if isinstance(reason, str) else None
+            if not inter.resolve(behavior, scope, reason):
+                return 409, {"error": "interaction already resolved"}
         return 200, inter.public()
 
     # ---------- 事件分发 ----------
@@ -612,7 +613,9 @@ class Monitor:
             if subtype == "turn_duration":
                 sess.saw_turn_duration = True
                 sess.last_turn_end_ts = ts_epoch or now_ts()
-                if not sess.pending_tools and not sess.active_agents:
+                # turn_duration 是权威结束标记：清掉可能因中断而没有结果的 tool id
+                sess.pending_tools.clear()
+                if not sess.active_agents:
                     self._set_idle(sess)
             elif subtype == "compact_boundary":
                 sess.compacted_at = ts_epoch or now_ts()
@@ -1002,6 +1005,7 @@ class Hosted:
                 with self.mon.lock:
                     inter = self.mon.interactions.get(obj.get("request_id"))
                 if inter:
+                    inter.skip_response = True
                     inter.resolve("deny", reason="请求已被 Claude 取消", state="cancelled")
             elif typ == "system" and obj.get("subtype") == "init":
                 self._on_init(obj.get("session_id"))
@@ -1042,6 +1046,7 @@ class Hosted:
         with self.mon.lock:
             waiting = [i for i in self.mon.interactions.values() if i.hosted_id == self.hid]
         for inter in waiting:
+            inter.skip_response = True
             inter.resolve("deny", reason="托管进程已退出", state="cancelled")
         sess = self._sess()
         if sess:
@@ -1125,8 +1130,8 @@ class Hosted:
             job.update(status=status, error=error, finished_at=now_ts())
             if self.current is job:
                 self.current = None
-            self.processing = False
-            self.interrupting = False
+                self.processing = False
+                self.interrupting = False
             self.ready.notify_all()
             self.turns += 1
         print(f"[hosted] {self.hid} 第 {self.turns} 轮 {status} job={job.get('id')}"
@@ -1162,6 +1167,8 @@ class Hosted:
             return
         inter = Interaction(request_id, self, obj.get("request") or {})
         with self.mon.lock:
+            if request_id in self.mon.interactions:
+                return
             self.mon.interactions[request_id] = inter
         self._emit_session_event("interaction_pending", inter.public())
         if self.approval == "full":
@@ -1187,7 +1194,7 @@ class Hosted:
         payload = {"type": "control_response", "response": {
             "subtype": "success", "request_id": inter.id, "response": response}}
         try:
-            if self.status != "exited":
+            if self.status != "exited" and not inter.skip_response:
                 self._write(payload)
         except (OSError, ValueError):
             if inter.state == "pending":
@@ -1226,6 +1233,7 @@ class Hosted:
             waiting = [i for i in self.mon.interactions.values()
                        if i.hosted_id == self.hid]
         for inter in waiting:
+            inter.skip_response = True
             inter.resolve("deny", reason="回合已中断", state="cancelled")
         if job:
             threading.Timer(30.0, lambda: self._finish_job(job, "cancelled")).start()
@@ -1241,6 +1249,7 @@ class Hosted:
             waiting = [i for i in self.mon.interactions.values()
                        if i.hosted_id == self.hid]
         for inter in waiting:
+            inter.skip_response = True
             inter.resolve("deny", reason="托管进程正在退出", state="cancelled")
         with self.ready:
             self.stopping = True
@@ -1260,13 +1269,20 @@ class Hosted:
             pass
 
     def info(self):
+        with self.ready:
+            current = self.current
+            busy = current is not None or self.processing
+            queued = len(self.pending)
+            approval = self.approval
+            interrupting = self.interrupting
+            turns = self.turns
         return {"hosted_id": self.hid, "session_id": self.session_id, "cwd": self.cwd,
                 "status": self.status, "pid": self.proc.pid if self.proc else None,
-                "busy": self.current is not None or self.processing, "queued": len(self.pending),
-                "approval": self.approval, "interrupting": self.interrupting,
-                "current_job": self.current.get("id") if self.current else None,
+                "busy": busy, "queued": queued,
+                "approval": approval, "interrupting": interrupting,
+                "current_job": current.get("id") if current else None,
                 "needs_rehost": self.needs_rehost,
-                "turns": self.turns, "returncode": self.returncode,
+                "turns": turns, "returncode": self.returncode,
                 "started_at": self.started_at, "stderr_tail": list(self.stderr_tail)}
 
 
@@ -1332,6 +1348,7 @@ class Interaction:
         self.updated_input = self.tool_input
         self.state = "pending"
         self.resolved_at = None
+        self.skip_response = False   # CLI 已取消 / 进程已退出时不再回写
 
     def resolve(self, behavior, scope="once", reason=None, state=None):
         if self.state != "pending":
@@ -1635,7 +1652,9 @@ def make_handler(mon, refresh_interval):
                 except SwitchError as e:
                     return self._json({"error": e.message}, e.code)
             if u.path == "/hosted":
-                return self._json([h.info() for h in mon.hosted.values()])
+                with mon.lock:
+                    hosts = list(mon.hosted.values())
+                return self._json([h.info() for h in hosts])
             if u.path.startswith("/jobs/"):
                 job = mon.jobs.get(u.path.split("/", 2)[2])
                 return self._json(job) if job else self._json({"error": "not found"}, 404)

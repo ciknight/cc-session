@@ -139,7 +139,7 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 
 <script>
 const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
-const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATE_ZH = {working: "工作中", idle: "空闲", stale: "无活动"};
 const TASK_ZH = {pending: "待办", in_progress: "进行中", completed: "已完成", deleted: "已删除"};
 
@@ -680,6 +680,7 @@ function sendJobText(id){
   if(j.status === "queued") return "排队中…";
   if(j.status === "running") return "Claude 正在处理…";
   if(j.status === "done") return "已完成，回复见下方对话";
+  if(j.status === "cancelled") return "已中断";
   if(j.status === "failed") return "失败: " + (j.error || "未知错误");
   return "";
 }
