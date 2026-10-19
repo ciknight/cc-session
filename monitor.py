@@ -1673,18 +1673,21 @@ def hook_client(argv):
     ap.add_argument("--token", required=True)
     ap.add_argument("--event", default="PreToolUse")
     args = ap.parse_args(argv)
-    payload = sys.stdin.read()
+    # 二进制读写，避免 Windows 管道按本地代码页转换中文
+    payload = sys.stdin.buffer.read()
     try:
         req = urllib.request.Request(
             f"http://127.0.0.1:{args.port}/hook/{args.event}",
-            data=payload.encode("utf-8"),
+            data=payload,
             headers={"Content-Type": "application/json",
                      "X-Monitor-Token": args.token})
-        with urllib.request.urlopen(req, timeout=3600) as resp:
-            sys.stdout.write(resp.read().decode("utf-8"))
+        # 绕过 http_proxy，避免把本地请求和令牌发给代理
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=3600) as resp:
+            sys.stdout.buffer.write(resp.read())
     except Exception:
         # 服务不可达时 fail-open，让 CLI 回落到自身行为
-        sys.stdout.write("{}")
+        sys.stdout.buffer.write(b"{}")
     return 0
 
 

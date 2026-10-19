@@ -150,7 +150,7 @@ let view = {project: null, session: null};   // 当前视图
 let curPanel = null;               // main 里已渲染的面板 {type:"list"|"conv"|"new", key}，
                                    // 自动刷新只更新数据区域、不重建输入区，避免失焦/丢草稿
 let convCache = {id: null, size: -1};        // 对话缓存标记，避免重复渲染
-let convState = {id: null, msgs: [], total: 0, start: 0, size: -1,
+let convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
                  hasMore: false, loadingEarlier: false};
 let lastSidebarSig = "", lastListSig = "";
 let esGlobal = null, esSession = null, lastSeq = 0;
@@ -827,9 +827,9 @@ async function renderConversation(id, force){
         return;
       }
       convState = {id, msgs: (m.messages || []).slice(),
-                   total: m.total || 0, start: m.start || 0,
-                   size: m.size || 0, hasMore: !!m.has_more,
-                   loadingEarlier: false};
+                   total: m.total || 0, cursor: m.end || 0,
+                   start: m.start || 0, size: m.size || 0,
+                   hasMore: !!m.has_more, loadingEarlier: false};
       if(isNew){
         main.innerHTML = `
           <button class="back" id="back">← 返回列表</button>
@@ -867,7 +867,7 @@ async function renderConversation(id, force){
           disconnectSessionSse();
           view.session = null;
           convCache = {id: null, size: -1};
-          convState = {id: null, msgs: [], total: 0, start: 0, size: -1,
+          convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
                        hasMore: false, loadingEarlier: false};
           renderMain();
         };
@@ -901,7 +901,7 @@ async function renderConversation(id, force){
     updateHostedControls(d);
     updateSendSt(id);
     const mRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages` +
-      `?from=${convState.total}&limit=500`);
+      `?from=${convState.cursor}&limit=500`);
     const m = await mRes.json();
     if(view.session !== id) return;
     if(convState.id !== id || m.size < convState.size || m.total < convState.total){
@@ -910,9 +910,9 @@ async function renderConversation(id, force){
       const fresh = await freshRes.json();
       if(view.session !== id) return;
       convState = {id, msgs: (fresh.messages || []).slice(),
-                   total: fresh.total || 0, start: fresh.start || 0,
-                   size: fresh.size || 0, hasMore: !!fresh.has_more,
-                   loadingEarlier: false};
+                   total: fresh.total || 0, cursor: fresh.end || 0,
+                   start: fresh.start || 0, size: fresh.size || 0,
+                   hasMore: !!fresh.has_more, loadingEarlier: false};
       renderConvList();
       main.scrollTop = 0;
     } else if(m.messages && m.messages.length){
@@ -920,13 +920,16 @@ async function renderConversation(id, force){
       const nearTop = oldScroll < 80;
       convState.msgs.push(...m.messages);
       convState.total = m.total;
+      convState.cursor = m.end;
       convState.size = m.size;
       clearLiveBubble();
       renderConvList();
       if(nearTop) main.scrollTop = 0;
       else main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
+      if(m.end < m.total) scheduleConvRefresh(id);
     } else {
       convState.total = m.total;
+      convState.cursor = m.end != null ? m.end : convState.cursor;
       convState.size = m.size;
     }
   }catch(e){ /* 下次刷新重试 */ }

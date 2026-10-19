@@ -211,8 +211,8 @@ class ManagementAPITests(unittest.TestCase):
         self.mon.hook_token = "tok"
         result = subprocess.run(
             self.mon.hook_command(), shell=True,
-            input=json.dumps({"tool_name": "Bash"}),
-            capture_output=True, text=True, timeout=20)
+            input=json.dumps({"tool_name": "Bash", "note": "中文"}, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout), {})
 
