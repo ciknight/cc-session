@@ -468,6 +468,19 @@ test('全局待审批计数显示与隐藏', () => {
   b.run('renderPendingBadge()');
   assert.equal(b.node('pendingbadge').style.display,'none');
 });
+test('项目侧栏按名称固定排序，首次进入仍选中最近活跃项目', () => {
+  const b=boot();
+  const pairs = [
+    {id:'1',cwd:'/b/project-b',project:'/b/project-b',state:'idle',last_event_at:900},
+    {id:'2',cwd:'/a/project-a',project:'/a/project-a',state:'working',last_event_at:100},
+  ];
+  b.run(`sessions=${JSON.stringify(pairs)}`);
+  assert.equal(b.run('groupByProject().map(p=>p.cwd).join(",")'), '/a/project-a,/b/project-b');
+  assert.equal(b.run('view={project:null,session:null,new:false}; renderMain(); view.project'), '/b/project-b');
+  // 活跃时间变化不再影响侧栏顺序
+  b.run('sessions[1].last_event_at=9999');
+  assert.equal(b.run('groupByProject().map(p=>p.cwd).join(",")'), '/a/project-a,/b/project-b');
+});
 test('SSE 快照更新会话列表与流式文本状态', async () => {
   const b=boot();
   b.run(`view={project:"/p",session:null,new:false}; onGlobalSse({data: JSON.stringify(

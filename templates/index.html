@@ -564,7 +564,10 @@ function groupByProject(){
       out: ss.reduce((a, s) => a + ((s.tokens || {}).output || 0), 0),
       last: Math.max(...ss.map(s => s.last_event_at || 0)),
     }))
-    .sort((a, b) => b.last - a.last);
+    // 侧栏顺序固定按项目名排列（不随活跃时间跳动），同名时按完整路径区分
+    .sort((a, b) =>
+      projName(a.cwd).localeCompare(projName(b.cwd), "zh", {numeric: true})
+      || a.cwd.localeCompare(b.cwd, "zh", {numeric: true}));
 }
 
 /* ---------- 渲染：项目侧栏 ---------- */
@@ -1230,7 +1233,9 @@ function renderMain(){
     return;
   }
   if(!view.project || !projects.some(p => p.cwd === view.project))
-    view.project = projects.length ? projects[0].cwd : null;
+    // 侧栏固定排序后，初次进入仍默认选中最近活跃的项目
+    view.project = projects.length
+      ? projects.reduce((a, b) => b.last > a.last ? b : a).cwd : null;
   renderSidebar(projects);   // 更新 active 高亮
   const p = projects.find(x => x.cwd === view.project);
   const main = document.getElementById("main");
