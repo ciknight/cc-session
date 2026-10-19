@@ -470,18 +470,18 @@ test('全局待审批计数显示与隐藏', () => {
 });
 test('SSE 快照更新会话列表与流式文本状态', async () => {
   const b=boot();
-  b.run(`view={project:"/p",session:null,new:false}; onSseEvent({data: JSON.stringify(
+  b.run(`view={project:"/p",session:null,new:false}; onGlobalSse({data: JSON.stringify(
     {type:"snapshot",seq:1,session:null,
      data:{sessions:[{id:"s1",project:"/p",cwd:"/p",state:"idle",
        last_event_at:1,last_input_at:1}],interactions:[]}})});`);
   assert.equal(b.run('sessions.length'),1);
-  assert.equal(b.run('lastSeq'),1);
+  assert.equal(b.run('globalSeq'),1);
   b.run('view={project:"/p",session:"s1",new:false}; ' +
-    'onSseEvent({data: JSON.stringify({type:"turn_delta",seq:2,session:"s1",' +
+    'onGlobalSse({data: JSON.stringify({type:"turn_delta",seq:2,session:"s1",' +
     'data:{text:"你好"}})});');
   await new Promise(r => setTimeout(r, 20));
   assert.equal(b.run('liveText'),'你好');
-  b.run('onSseEvent({data: JSON.stringify({type:"turn_finished",seq:3,session:"s1",data:{}})});');
+  b.run('onGlobalSse({data: JSON.stringify({type:"turn_finished",seq:3,session:"s1",data:{}})});');
   assert.equal(b.run('liveText'),'');
 });
 test('对话分页状态渲染与加载更早按钮', () => {

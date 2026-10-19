@@ -19,7 +19,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - 无测试框架、无 lint 配置；唯一依赖是 Jinja2，其余为标准库。
 - 单元测试：`PYTHONPATH=. uv run python -m unittest discover -s tests -p 'test_*.py' -v`；
   前端测试：`node --test tests/test_frontend_controls.js`。
-- 真实 CLI 权限冒烟（会调用模型）：`CLAUDE_SESSIONS_SMOKE=1 uv run python tests/smoke_permission_live.py`。
+- 真实 CLI 权限冒烟（会调用模型）：`CLAUDE_SESSIONS_SMOKE=1 uv run python tests/smoke_permission_live.py`；
+  AskUserQuestion 冒烟加 `SMOKE_ASK=1`。
 - 可用 `CLAUDE_CONFIG_DIR` 环境变量指向其他 Claude 配置目录做测试。
 
 ## 架构
@@ -55,7 +56,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
   `~/.claude/tasks/<sid>/*.json` 目录存在时以它为准（`_merge_task_dirs`）。
 - **对话消息按需增量提取**（`parse_msg_line`）：不随轮询解析，只在请求
   `/sessions/<id>/messages` 时解析；`Monitor.msg_cache` 记录每个文件的读取 offset、
-  半行 buffer、已解析消息和 tool_use 索引，后续请求只解析新增部分；
+  已解析消息和 tool_use 索引，后续请求只解析新增部分。超过 2 MiB 的转录首次只解析
+  尾部窗口，`before` 翻页时按 1 MiB 块向前加载并前插；每个会话有独立解析锁。
   跳过 sidechain（子代理对话）。工具结果合并行级 `toolUseResult`（diff/stdout/图片），
   `isMeta` 分 boilerplate / sourceToolUseID / origin 注入三种语义。
 - **子代理会话**：额外扫描 `projects/<proj>/<parent>/subagents/agent-*.jsonl`，
@@ -80,10 +82,13 @@ uv run monitor.py --webhook http://localhost:3000/hook
   回合结束发最终文本并清空。
 - **网页问答**：托管启动时用内联 `--settings` 注册 AskUserQuestion 的 PreToolUse hook，
   command 为 `python monitor.py hook --port <port> --token <token>`；
-  `/hook/PreToolUse` 只接受回环地址和每次启动随机生成的令牌。
-- **前端实时更新**：EventSource 全局 + 单会话两路，按 `seq` 去重；连接先收 `snapshot`，
+  `/hook/PreToolUse` 只接受回环地址和每次启动随机生成的令牌。若用户已通过
+  `--claude-args` 提供内联 `--settings`，会把 hook 合并进去；指向文件时跳过并提示。
+  hook 客户端用二进制 stdin/stdout（避免 Windows 代码页问题）并绕过 HTTP 代理。
+- **前端实时更新**：EventSource 全局 + 单会话两路，各自维护 `seq`；连接先收 `snapshot`，
   断线重连后全量对账；SSE 事件触发节流刷新，保留定时轮询兜底。
-  对话只加载最近 100 条，向上滚动加载更早。
+  对话只加载最近 100 条，向上滚动加载更早；`cursor` 记录已加载末尾，
+  服务端前插旧块时用响应里的 `shift` 调整，避免增量漏消息。
 
 ### 前端
 

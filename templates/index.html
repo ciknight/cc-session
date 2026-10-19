@@ -153,7 +153,7 @@ let convCache = {id: null, size: -1};        // 对话缓存标记，避免重�
 let convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
                  hasMore: false, loadingEarlier: false};
 let lastSidebarSig = "", lastListSig = "";
-let esGlobal = null, esSession = null, lastSeq = 0;
+let esGlobal = null, esSession = null, globalSeq = 0, sessionSeq = 0;
 let listTimer = null, convTimer = null;
 let liveText = "", liveRaf = null;
 let timer = null;
@@ -421,11 +421,21 @@ function scheduleConvRefresh(sid){
     if(!document.hidden) renderConversation(sid, false);
   }, 500);
 }
-function onSseEvent(event){
+function onGlobalSse(event){
   let msg;
   try{ msg = JSON.parse(event.data); }catch{ return; }
-  if(msg.seq && msg.seq <= lastSeq) return;   // 全局/单会话两路流去重
-  if(msg.seq) lastSeq = msg.seq;
+  if(msg.seq && msg.seq <= globalSeq) return;
+  if(msg.seq) globalSeq = msg.seq;
+  handleSseMessage(msg);
+}
+function onSessionSse(event){
+  let msg;
+  try{ msg = JSON.parse(event.data); }catch{ return; }
+  if(msg.seq && msg.seq <= sessionSeq) return;
+  if(msg.seq) sessionSeq = msg.seq;
+  handleSseMessage(msg);
+}
+function handleSseMessage(msg){
   if(msg.type === "snapshot"){
     if(msg.data.sessions){
       sessions = msg.data.sessions;
@@ -453,11 +463,11 @@ function connectGlobalSse(){
   if(!window.EventSource) return;
   if(esGlobal) esGlobal.close();
   esGlobal = new EventSource("/events");
-  for(const type of SSE_TYPES) esGlobal.addEventListener(type, onSseEvent);
+  for(const type of SSE_TYPES) esGlobal.addEventListener(type, onGlobalSse);
   let opened = false;
   esGlobal.onopen = () => {
     if(opened){
-      lastSeq = 0;
+      globalSeq = 0;
       load();
       if(view.session) renderConversation(view.session, true);
     }
@@ -468,9 +478,10 @@ function connectSessionSse(id){
   if(!window.EventSource) return;
   disconnectSessionSse();
   esSession = new EventSource("/events?session=" + encodeURIComponent(id));
-  for(const type of SSE_TYPES) esSession.addEventListener(type, onSseEvent);
+  for(const type of SSE_TYPES) esSession.addEventListener(type, onSessionSse);
   let opened = false;
   esSession.onopen = () => {
+    sessionSeq = 0;
     if(opened && view.session === id) renderConversation(id, true);
     opened = true;
   };
@@ -802,6 +813,7 @@ async function loadEarlier(){
     convState.hasMore = !!page.has_more;
     convState.total = page.total;
     convState.size = page.size;
+    convState.cursor += page.shift || 0;   // 服务端前插了新块，末尾索引整体后移
     renderConvList();
     main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
   }catch(e){ /* 下次点击重试 */ }

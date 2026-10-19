@@ -157,6 +157,26 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual([m["parts"][0]["text"] for m in newer["messages"]],
                          [f"m{i}" for i in range(240, 250)])
 
+    def test_messages_tail_window_loads_earlier_chunks(self):
+        self._write_transcript(250)
+        with patch.object(monitor, "MSG_TAIL_BYTES", 500), \
+                patch.object(monitor, "MSG_CHUNK_BYTES", 2000):
+            page = json.load(self.request("/sessions/sid-1/messages?limit=100"))
+            messages = list(page["messages"])
+            self.assertLess(page["total"], 250)
+            self.assertTrue(page["has_more"])
+            for _ in range(100):
+                if not page["has_more"]:
+                    break
+                page = json.load(self.request(
+                    f"/sessions/sid-1/messages?before={page['start']}&limit=100"))
+                messages = page["messages"] + messages
+            else:
+                self.fail("分页循环未结束")
+        self.assertEqual(len(messages), 250)
+        self.assertEqual(messages[0]["parts"][0]["text"], "m0")
+        self.assertEqual(messages[-1]["parts"][0]["text"], "m249")
+
     def test_messages_paging_rejects_bad_params(self):
         with self.assertRaises(HTTPError) as error:
             self.request("/sessions/sid-1/messages?before=1&from=2")

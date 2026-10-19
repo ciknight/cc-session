@@ -94,6 +94,10 @@ CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
 
+# 首次打开大转录时只解析尾部窗口，向前翻页时再按块加载
+MSG_TAIL_BYTES = 2 * 1024 * 1024
+MSG_CHUNK_BYTES = 1 * 1024 * 1024
+
 _jinja = Environment(
     loader=FileSystemLoader(str(TEMPLATE_DIR)),
     autoescape=select_autoescape(["html"]),
@@ -111,6 +115,37 @@ def clip(s, n=300):
 
 def _arg_present(args, name):
     return any(arg == name or arg.startswith(name + "=") for arg in args)
+
+
+def _arg_index(args, name):
+    for i, arg in enumerate(args):
+        if arg == name:
+            return i, (args[i + 1] if i + 1 < len(args) else None)
+        if arg.startswith(name + "="):
+            return i, arg.split("=", 1)[1]
+    return None, None
+
+
+def _merge_hook_settings(existing, hook_settings):
+    """把 AskUserQuestion hook 合并进已有的内联 settings；无法合并时返回 None。"""
+    hooks = existing.get("hooks")
+    if hooks is None:
+        hooks = existing["hooks"] = {}
+    if not isinstance(hooks, dict):
+        return None
+    pre = hooks.get("PreToolUse")
+    if pre is None:
+        pre = hooks["PreToolUse"] = []
+    if not isinstance(pre, list):
+        return None
+    for rule in pre:
+        if not isinstance(rule, dict) or rule.get("matcher") != "AskUserQuestion":
+            continue
+        for hook in rule.get("hooks") or []:
+            if isinstance(hook, dict) and "monitor.py" in str(hook.get("command", "")):
+                return existing
+    pre.extend(hook_settings["hooks"]["PreToolUse"])
+    return existing
 
 
 def project_root(cwd):
@@ -230,7 +265,8 @@ class Monitor:
         self.hook_token = ""
         self.event_seq = 0
         self.event_lock = threading.Lock()
-        self.msg_lock = threading.Lock()
+        self.msg_locks = {}
+        self.msg_locks_guard = threading.Lock()
         self.lock = threading.Lock()
         self.subscribers = []      # list of queue.Queue
         self.first_scan_done = False
@@ -930,16 +966,34 @@ class Hosted:
             cmd += ["--session-id", self.session_id]
         if self.approval == "auto" and not _arg_present(self.mon.claude_args, "--permission-mode"):
             cmd += ["--permission-mode", "auto"]
+        spawn_args = list(self.mon.claude_args)
         if self.mon.http_port and self.mon.hook_token:
-            if _arg_present(self.mon.claude_args, "--settings"):
-                print(f"[hosted] 检测到 --settings，跳过 AskUserQuestion hook 注册", flush=True)
+            hook_settings = {"hooks": {"PreToolUse": [{
+                "matcher": "AskUserQuestion",
+                "hooks": [{"type": "command", "command": self.mon.hook_command(),
+                           "timeout": 604800}]}]}}
+            idx, current = _arg_index(spawn_args, "--settings")
+            if idx is None:
+                cmd += ["--settings", json.dumps(hook_settings, separators=(",", ":"))]
+            elif current and current.lstrip().startswith("{"):
+                try:
+                    existing = json.loads(current)
+                except json.JSONDecodeError:
+                    existing = None
+                merged = (_merge_hook_settings(existing, hook_settings)
+                          if isinstance(existing, dict) else None)
+                if merged is None:
+                    print("[hosted] 已有 --settings 无法合并，跳过 AskUserQuestion hook 注册",
+                          flush=True)
+                else:
+                    merged_json = json.dumps(merged, separators=(",", ":"))
+                    if spawn_args[idx] == "--settings":
+                        spawn_args[idx + 1] = merged_json
+                    else:
+                        spawn_args[idx] = "--settings=" + merged_json
             else:
-                settings = {"hooks": {"PreToolUse": [{
-                    "matcher": "AskUserQuestion",
-                    "hooks": [{"type": "command", "command": self.mon.hook_command(),
-                               "timeout": 604800}]}]}}
-                cmd += ["--settings", json.dumps(settings, separators=(",", ":"))]
-        cmd += model_args(self.mon.claude_args, self.selected_model)
+                print("[hosted] --settings 指向文件，跳过 AskUserQuestion hook 注册", flush=True)
+        cmd += model_args(spawn_args, self.selected_model)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, cwd=self.cwd)
         self.status = "running"
@@ -1616,6 +1670,56 @@ def parse_tool_result(o, block):
             "text": clip(text, 8000)}
 
 
+def _align_line_start(f, offset, size):
+    """把字节偏移向前对齐到行首，避免从半行开始解析。"""
+    if offset <= 0:
+        return 0
+    pos = min(offset, size)
+    while pos > 0:
+        start = max(0, pos - 4096)
+        f.seek(start)
+        data = f.read(pos - start)
+        idx = data.rfind(b"\n")
+        if idx >= 0:
+            return start + idx + 1
+        pos = start
+    return 0
+
+
+def _parse_message_chunk(data, tools):
+    """解析一段字节数据，返回 (messages, 末尾半行)。"""
+    *lines, tail = data.split(b"\n")
+    msgs = []
+    for ln in lines:
+        m = parse_msg_line(ln)
+        if not m:
+            continue
+        keep = []
+        for part in m["parts"]:
+            if part.get("type") == "tool":
+                if part.get("tool_use_id"):
+                    tools[part["tool_use_id"]] = part
+                keep.append(part)
+            elif part.get("type") == "tool_result":
+                target = tools.get(part.get("tool_use_id"))
+                if target is not None:
+                    target["result"] = part
+                else:
+                    keep.append(part)
+            elif part.get("type") == "tool_note":
+                target = tools.get(part.get("tool_use_id"))
+                if target is not None:
+                    target.setdefault("notes", []).append(part["text"])
+                else:
+                    keep.append({"type": "text", "text": part["text"]})
+            else:
+                keep.append(part)
+        if keep:
+            m["parts"] = keep
+            msgs.append(m)
+    return msgs, tail
+
+
 def parse_msg_line(ln, clip_len=8000):
     """把一行转录解析为一条消息；无内容返回 None。
 
@@ -1774,44 +1878,45 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": "file gone"}, 404)
                 # 增量解析：只解析上次读过后新增的部分（自动刷新每 2-3 秒来一次，
                 # 转录可达几十 MB，整文件重读既慢又占 CPU）
-                with mon.msg_lock:
+                with mon.msg_locks_guard:
+                    msg_lock = mon.msg_locks.setdefault(sid, threading.Lock())
+                with msg_lock:
                     st = mon.msg_cache.get(sid)
-                    if st is None or size < st["off"]:      # 首次或文件被截断
-                        st = mon.msg_cache[sid] = {"off": 0, "buf": b"", "msgs": [],
-                                                   "tools": {}}
+                    if st is None or size < st.get("off", 0) or size < st.get("base", 0):
+                        # 首次（或文件被截断/替换）：大文件只解析尾部窗口
+                        base = 0
+                        if size > MSG_TAIL_BYTES:
+                            with open(s.path, "rb") as f:
+                                base = _align_line_start(f, size - MSG_TAIL_BYTES, size)
+                        st = mon.msg_cache[sid] = {"base": base, "off": base, "buf": b"",
+                                                   "msgs": [], "tools": {}}
                     if size != st["off"]:
                         with open(s.path, "rb") as f:
                             f.seek(st["off"])
                             data = st["buf"] + f.read()
-                        *lines, st["buf"] = data.split(b"\n")   # 半行留到下次拼接
-                        for ln in lines:
-                            m = parse_msg_line(ln)
-                            if not m:
-                                continue
-                            keep = []
-                            for part in m["parts"]:
-                                if part.get("type") == "tool":
-                                    if part.get("tool_use_id"):
-                                        st["tools"][part["tool_use_id"]] = part
-                                    keep.append(part)
-                                elif part.get("type") == "tool_result":
-                                    target = st["tools"].get(part.get("tool_use_id"))
-                                    if target is not None:
-                                        target["result"] = part
-                                    else:
-                                        keep.append(part)
-                                elif part.get("type") == "tool_note":
-                                    target = st["tools"].get(part.get("tool_use_id"))
-                                    if target is not None:
-                                        target.setdefault("notes", []).append(part["text"])
-                                    else:
-                                        keep.append({"type": "text", "text": part["text"]})
-                                else:
-                                    keep.append(part)
-                            if keep:
-                                m["parts"] = keep
-                                st["msgs"].append(m)
+                        msgs, st["buf"] = _parse_message_chunk(data, st["tools"])
+                        st["msgs"].extend(msgs)
                         st["off"] = size
+                    shift = 0
+                    if before is not None and before <= 0 and st["base"] > 0:
+                        # 向前翻页：加载上一块并前插，返回该块的最后 limit 条
+                        with open(s.path, "rb") as f:
+                            for _ in range(32):
+                                new_base = _align_line_start(
+                                    f, max(0, st["base"] - MSG_CHUNK_BYTES), st["base"])
+                                if new_base >= st["base"]:
+                                    break
+                                f.seek(new_base)
+                                data = f.read(st["base"] - new_base)
+                                chunk_tools = {}
+                                chunk_msgs, _ = _parse_message_chunk(data, chunk_tools)
+                                st["msgs"] = chunk_msgs + st["msgs"]
+                                st["tools"].update(chunk_tools)
+                                shift += len(chunk_msgs)
+                                st["base"] = new_base
+                                if chunk_msgs or new_base == 0:
+                                    break
+                        before = shift
                     total = len(st["msgs"])
                     if before is not None:
                         start, end = max(0, before - limit), min(before, total)
@@ -1821,7 +1926,8 @@ def make_handler(mon, refresh_interval):
                         start, end = max(0, total - limit), total
                     payload = {"id": sid, "size": size, "total": total,
                                "start": start, "end": end,
-                               "has_more": start > 0,
+                               "has_more": start > 0 or st["base"] > 0,
+                               "shift": shift,
                                "messages": st["msgs"][start:end]}
                 return self._raw(json.dumps(payload, ensure_ascii=False,
                                             separators=(",", ":")).encode())
