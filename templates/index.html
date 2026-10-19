@@ -435,6 +435,7 @@ function renderSessionList(p){
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
         ${s.hosted ? '<span class="chip" title="消息直接写入常驻 claude 进程">⚙ 托管中</span>' : ""}
+        ${s.pending_interactions ? `<span class="chip" style="border-color:#d97706;color:#d97706">待审批 ${s.pending_interactions}</span>` : ""}
         <span class="stitle">${esc(sessTitle(s))}</span>
         <div class="mut">${[
           s.cwd !== s.project ? "⎇ " + projName(s.cwd) : null,
@@ -481,7 +482,8 @@ function diffHtml(text){
   }).join("\n");
 }
 function toolResultHtml(p){
-  const r = p.result;
+  // 已合并到工具卡时结果在 p.result；缓存从中间开始时可能是独立的 tool_result part
+  const r = p.result || (p.type === "tool_result" ? p : null);
   if(!r) return "";
   if(r.kind === "diff") return `<pre class="tool-out">${diffHtml(r.text)}</pre>`;
   if(r.kind === "image") return `<div class="mut">[图片] ${esc(r.text || "")}</div>`;

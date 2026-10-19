@@ -496,6 +496,9 @@ class Monitor:
             return 500, {"error": str(e)}
         with self.lock:
             self.hosted[h.hid] = h
+            # 新会话预生成的 id 也要立刻可路由，避免 init 到达前的竞态
+            if h.session_id:
+                self.hosted_by_sid[h.session_id] = h
             if resume_id:
                 self.hosted_by_sid[resume_id] = h
         resp["hosted_id"] = h.hid
@@ -611,6 +614,8 @@ class Monitor:
         if typ == "system":
             subtype = obj.get("subtype")
             if subtype == "turn_duration":
+                if obj.get("isSidechain"):
+                    return
                 sess.saw_turn_duration = True
                 sess.last_turn_end_ts = ts_epoch or now_ts()
                 # turn_duration 是权威结束标记：清掉可能因中断而没有结果的 tool id
@@ -733,7 +738,9 @@ class Monitor:
             is_subagent = path.parent.name == "subagents"
             if is_subagent:
                 parent_id = path.parent.parent.name
-                sid = f"{parent_id}::agent-{path.stem}"
+                stem = path.stem
+                suffix = stem[6:] if stem.startswith("agent-") else stem
+                sid = f"{parent_id}::agent-{suffix}"
             else:
                 parent_id, sid = None, path.stem
             key = str(path)
@@ -836,6 +843,7 @@ class Hosted:
         self.control_failed = False
         self.needs_rehost = False
         self.interrupting = False
+        self.interrupt_target = None   # 被中断的 job；只取消这一轮，不误伤后续消息
         self.lifecycle_seen = False
         self.max_queued = 32
 
@@ -940,7 +948,7 @@ class Hosted:
                         self._control("set_model", model=target)
                         self.process_model = target
                     with self.ready:
-                        cancelled = (self.interrupting or self.stopping
+                        cancelled = (self.interrupt_target is job or self.stopping
                                      or self.status == "exited")
                     if cancelled:
                         self._finish_job(job, "cancelled")
@@ -961,9 +969,10 @@ class Hosted:
                         break
                     continue
                 with self.ready:
-                    self.ready.wait_for(lambda: self.current is not job or self.stopping or self.status == "exited")
-                    if self.current is job:
-                        self.current = None
+                    # 不要在 stopping 时清 current：让 result/lifecycle 或进程退出
+                    # 给当前 job 收尾，否则它会永远停在 running
+                    self.ready.wait_for(lambda: self.current is not job or self.stopping
+                                        or self.status == "exited")
         except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
             self.control_failed = True
             self.stopping = True
@@ -1029,6 +1038,8 @@ class Hosted:
         with self.ready:
             self.status, self.returncode = "exited", rc
             self.processing = False
+            self.interrupting = False
+            self.interrupt_target = None
             dead = ([self.current] if self.current else []) + [j for _, j, _ in self.pending]
             self.current = None
             self.pending.clear()
@@ -1128,10 +1139,12 @@ class Hosted:
             else:
                 status, error = "failed", job.get("error") or f"command {terminal_state}"
             job.update(status=status, error=error, finished_at=now_ts())
+            if self.interrupt_target is job:
+                self.interrupt_target = None
+                self.interrupting = False
             if self.current is job:
                 self.current = None
                 self.processing = False
-                self.interrupting = False
             self.ready.notify_all()
             self.turns += 1
         print(f"[hosted] {self.hid} 第 {self.turns} 轮 {status} job={job.get('id')}"
@@ -1139,6 +1152,8 @@ class Hosted:
         self._emit_session_event("hosted_turn_done", {
             "hosted": self.hid, "job": job.get("id"), "status": status,
             "result": clip(job.get("result") or "", 300),
+            "cost_usd": job.get("cost_usd"),
+            "result_session_id": job.get("result_session_id"),
             "is_error": job.get("result_is_error", False)})
 
     def _on_result(self, obj):
@@ -1215,20 +1230,28 @@ class Hosted:
         if not self.alive():
             return 409, {"error": "hosted process is not running"}
         with self.ready:
-            self.interrupting = True
-            for _, job, _ in self.pending:
-                job.update(status="cancelled", error="已中断", finished_at=now_ts())
+            queued_count = len(self.pending)
+            for _, queued_job, _ in self.pending:
+                queued_job.update(status="cancelled", error="已中断", finished_at=now_ts())
             self.pending.clear()
             job = self.current
+            self.interrupt_target = job
+            self.interrupting = job is not None
             self.ready.notify_all()
         try:
             self._write({"type": "control_request",
                          "request_id": f"monitor-int-{self.hid}-{int(time.time() * 1000)}",
                          "request": {"subtype": "interrupt"}})
         except (OSError, ValueError) as exc:
+            with self.ready:
+                self.interrupt_target = None
+                self.interrupting = False
             if job:
                 self._finish_job(job, "failed")
             return 500, {"error": f"中断写入失败: {exc}"}
+        self._emit_session_event("turn_interrupted", {
+            "hosted": self.hid, "job": job.get("id") if job else None,
+            "queued_cancelled": queued_count})
         with self.mon.lock:
             waiting = [i for i in self.mon.interactions.values()
                        if i.hosted_id == self.hid]
@@ -1237,9 +1260,6 @@ class Hosted:
             inter.resolve("deny", reason="回合已中断", state="cancelled")
         if job:
             threading.Timer(30.0, lambda: self._finish_job(job, "cancelled")).start()
-        else:
-            with self.ready:
-                self.interrupting = False
         return 200, {"interrupted": True, "queued_cancelled": True}
 
     def stop(self, kill=False):
@@ -1867,6 +1887,8 @@ def main():
     ap.add_argument("--permission-timeout", type=int, default=300,
                     help="托管会话审批等待秒数，0 表示无限等待")
     args = ap.parse_args()
+    if args.permission_timeout < 0:
+        ap.error("--permission-timeout 不能为负数（0 表示无限等待）")
 
     mon = Monitor(args.stale, args.webhook, args.permission_timeout)
     # Windows 上 npm 安装的 claude 是 claude.cmd，这里先解析出完整路径

@@ -82,6 +82,14 @@ for line in sys.stdin:
                                             "destination": "session",
                                             "rules": [{"toolName": "Edit"}]}],
                 "decision_reason": "writes a file"}})
+        elif text == "lifecycle-first":
+            emit({"type": "command_lifecycle", "command_uuid": uuid,
+                  "state": "completed"})
+            def late_result():
+                time.sleep(0.05)
+                emit({"type": "result", "session_id": "fake-session",
+                      "result": "lifecycle-first"})
+            threading.Thread(target=late_result, daemon=True).start()
         elif text in ("slow", "interrupt-me"):
             pending_interrupt_uuid = uuid
             threading.Thread(target=slow_turn, args=(uuid, text), daemon=True).start()

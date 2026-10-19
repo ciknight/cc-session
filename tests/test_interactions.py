@@ -11,7 +11,11 @@ import monitor
 
 class InteractionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        try:
+            # Windows 上后台线程可能仍在关闭文件，清理失败不应让测试失败
+            self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        except TypeError:   # Python 3.9
+            self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.patch = patch.object(monitor, "CLAUDE_DIR", self.root / "config")
         self.patch.start()
@@ -90,6 +94,36 @@ class InteractionTests(unittest.TestCase):
         code, resp = host.send("c")
         self.assertEqual(code, 429)
         self.assertIn("queue", resp["error"].lower())
+
+    def test_lifecycle_completed_before_result(self):
+        host, job = self.start_host("lifecycle-first")
+        self.assertTrue(self.wait_for(
+            lambda: self.mon.jobs[job]["status"] == "done", timeout=2))
+        self.assertEqual(self.mon.jobs[job]["result"], "lifecycle-first")
+
+    def test_set_approval_switches_live(self):
+        host, job = self.start_host("first")
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        host.set_approval("auto")
+        self.assertEqual(host.approval, "auto")
+        host.set_approval("ask")
+        self.assertEqual(host.approval, "ask")
+
+    def test_stop_mid_turn_does_not_leave_job_running(self):
+        host, job = self.start_host("slow")
+        self.assertTrue(self.wait_for(lambda: host.current is not None))
+        host.stop()
+        self.assertTrue(self.wait_for(
+            lambda: self.mon.jobs[job]["status"] in ("done", "failed", "cancelled")))
+
+    def test_stop_cancels_pending_interactions(self):
+        host, job = self.start_host("permission please")
+        self.assertTrue(self.wait_for(lambda: self.mon.pending_interactions("fake-session")))
+        host.stop(kill=True)
+        self.assertTrue(self.wait_for(
+            lambda: not self.mon.pending_interactions("fake-session")))
+        self.assertTrue(self.wait_for(
+            lambda: self.mon.jobs[job]["status"] in ("failed", "cancelled")))
 
     def test_interrupt_clears_queue_and_cancels_current(self):
         host, first = self.start_host("interrupt-me")

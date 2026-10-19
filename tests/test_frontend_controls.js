@@ -449,6 +449,9 @@ test('审批卡片与富工具结果渲染，中断按钮随托管状态启用',
   const result=b.run('convHtml([{role:"assistant",ts:0,parts:[{type:"tool",name:"Edit",' +
     'input:"{}",result:{kind:"diff",text:"-old"+String.fromCharCode(10)+"+new"}}]}])');
   assert.match(result,/diff-del/); assert.match(result,/diff-add/);
+  const standalone=b.run('convHtml([{role:"tool",ts:0,parts:[{type:"tool_result",' +
+    'kind:"text",text:"tool output",is_error:false}]}])');
+  assert.match(standalone,/tool output/);
   b.run('updateHostedControls({hosted:true,hosted_busy:false,hosted_queued:2,approval:"full"})');
   assert.equal(b.node('intbtn').disabled,true);
   assert.equal(b.node('approvalsel').value,'full');

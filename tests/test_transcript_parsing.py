@@ -98,15 +98,15 @@ class SubagentDiscoveryTests(unittest.TestCase):
         self.assertEqual([s.id for s in main], ["parent-sid"])
         all_sessions = self.mon.unique_sessions(include_subagents=True)
         ids = {s.id for s in all_sessions}
-        self.assertIn("parent-sid::agent-agent-abc", ids)
-        sub = self.mon.by_sid("parent-sid::agent-agent-abc")
+        self.assertIn("parent-sid::agent-abc", ids)
+        sub = self.mon.by_sid("parent-sid::agent-abc")
         self.assertTrue(sub.is_subagent)
         self.assertEqual(sub.parent_id, "parent-sid")
         self.assertEqual(sub.agent_name, "Explore")
 
     def test_send_to_subagent_is_rejected(self):
         self.mon.scan_once()
-        code, _ = self.mon.send_message("parent-sid::agent-agent-abc", "hi")
+        code, _ = self.mon.send_message("parent-sid::agent-abc", "hi")
         self.assertEqual(code, 400)
 
 

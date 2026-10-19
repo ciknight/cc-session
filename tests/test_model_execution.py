@@ -12,7 +12,11 @@ import monitor
 
 class ExecutionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        try:
+            # Windows 上后台线程可能仍在关闭文件，清理失败不应让测试失败
+            self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        except TypeError:   # Python 3.9
+            self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.config_patch = patch.object(monitor, "CLAUDE_DIR", self.root / "config")
         self.config_patch.start()
