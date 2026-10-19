@@ -69,5 +69,46 @@ class ParseMessageTests(unittest.TestCase):
         self.assertEqual(part["tool_use_id"], "t1")
 
 
+class SubagentDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.patch = patch.object(monitor, "CLAUDE_DIR", self.root)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        proj = self.root / "projects" / "p1"
+        sub = proj / "parent-sid" / "subagents"
+        sub.mkdir(parents=True)
+        (proj / "parent-sid.jsonl").write_text(
+            json.dumps({"type": "user", "cwd": str(self.root),
+                        "message": {"content": "hello"}}) + "\n", encoding="utf-8")
+        (sub / "agent-abc.jsonl").write_text(
+            json.dumps({"type": "user", "cwd": str(self.root),
+                        "attributionAgent": "Explore",
+                        "message": {"content": "sub task"}}) + "\n", encoding="utf-8")
+        self.mon = monitor.Monitor(600)
+
+    def test_subagent_is_discovered_and_hidden_by_default(self):
+        self.mon.scan_once()
+        main = self.mon.unique_sessions()
+        self.assertEqual([s.id for s in main], ["parent-sid"])
+        all_sessions = self.mon.unique_sessions(include_subagents=True)
+        ids = {s.id for s in all_sessions}
+        self.assertIn("parent-sid::agent-agent-abc", ids)
+        sub = self.mon.by_sid("parent-sid::agent-agent-abc")
+        self.assertTrue(sub.is_subagent)
+        self.assertEqual(sub.parent_id, "parent-sid")
+        self.assertEqual(sub.agent_name, "Explore")
+
+    def test_send_to_subagent_is_rejected(self):
+        self.mon.scan_once()
+        code, _ = self.mon.send_message("parent-sid::agent-agent-abc", "hi")
+        self.assertEqual(code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

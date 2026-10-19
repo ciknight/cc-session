@@ -230,14 +230,14 @@ class Monitor:
                 best = s
         return best
 
-    def unique_sessions(self):
+    def unique_sessions(self, include_subagents=False):
         """按 session id 去重后的会话列表（同名取最近活跃的）。"""
         best = {}
         for s in self.sessions.values():
             cur = best.get(s.id)
             if cur is None or s.last_event_ts > cur.last_event_ts:
                 best[s.id] = s
-        return list(best.values())
+        return [s for s in best.values() if include_subagents or not s.is_subagent]
 
     def project_map(self):
         """会话 cwd -> 归并后的项目根目录。
@@ -294,6 +294,8 @@ class Monitor:
         cwd = h.cwd if h and h.status != "exited" else sess.cwd if sess else None
         if not sess and not h:
             return 404, {"error": "session not found"}
+        if sess and sess.is_subagent:
+            return 400, {"error": "子代理会话只读，不能发送消息"}
         if not cwd or not os.path.isdir(cwd):
             return 400, {"error": f"session cwd unavailable: {cwd}"}
         with self.cc_switch.operation(cwd):
@@ -452,6 +454,8 @@ class Monitor:
             sess = self.by_sid(resume_id) if resume_id else None
             if resume_id and not sess:
                 return 404, {"error": "session not found"}
+            if sess and sess.is_subagent:
+                return 400, {"error": "子代理会话只读，不能托管"}
             old = self.hosted_by_sid.get(resume_id) if resume_id else None
             if old and old.proc and old.proc.poll() is None:
                 return 409, {"error": "session is already hosted", "hosted_id": old.hid}
@@ -666,13 +670,23 @@ class Monitor:
         root = CLAUDE_DIR / "projects"
         if not root.exists():
             return
-        for path in root.glob("*/*.jsonl"):
-            sid = path.stem
+        paths = list(root.glob("*/*.jsonl"))
+        # 子代理转录：projects/<proj>/<parent-sid>/subagents/agent-*.jsonl
+        paths.extend(root.glob("*/*/subagents/agent-*.jsonl"))
+        for path in paths:
+            is_subagent = path.parent.name == "subagents"
+            if is_subagent:
+                parent_id = path.parent.parent.name
+                sid = f"{parent_id}::agent-{path.stem}"
+            else:
+                parent_id, sid = None, path.stem
             key = str(path)
             with self.lock:
                 sess = self.sessions.get(key)
                 if sess is None:
                     sess = self.sessions[key] = Session(sid, path)
+                    sess.is_subagent = is_subagent
+                    sess.parent_id = parent_id
                     self.emit(sess, "session_discovered", {"path": str(path)})
                 try:
                     size = path.stat().st_size
