@@ -68,6 +68,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -876,6 +877,9 @@ class Hosted:
         self.interrupt_target = None   # 被中断的 job；只取消这一轮，不误伤后续消息
         self.lifecycle_seen = False
         self.last_api_retry = None     # 最近一次上游重试，用于诊断 5xx/限流
+        self.stream_text = ""          # 当前 job 的流式文本聚合
+        self.stream_job = None
+        self.last_delta_emit = 0.0
         self.max_queued = 32
 
     def alive(self):
@@ -888,6 +892,7 @@ class Hosted:
     def start(self, first_text):
         cmd = [self.mon.claude_bin, "-p", "--input-format", "stream-json",
                "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages",
                "--permission-prompt-tool", "stdio"]
         if self.resume_id:
             cmd += ["--resume", self.resume_id]
@@ -973,6 +978,9 @@ class Hosted:
                     self.current = job
                     job["status"] = "running"
                     self.processing = True
+                    self.stream_text = ""
+                    self.stream_job = job
+                    self.last_delta_emit = 0.0
                 try:
                     target = model if model is not None else default_model(self.mon.claude_args)
                     if target != self.process_model:
@@ -1060,6 +1068,8 @@ class Hosted:
                                          {"hosted": self.hid, **retry})
             elif typ == "command_lifecycle":
                 self._on_lifecycle(obj)
+            elif typ == "stream_event":
+                self._on_stream_event(obj)
             elif typ == "result":
                 self._on_result(obj)
             # 其余事件（assistant / thinking 等）转录文件里已有，这里不处理
@@ -1080,6 +1090,8 @@ class Hosted:
             self.processing = False
             self.interrupting = False
             self.interrupt_target = None
+            self.stream_text = ""
+            self.stream_job = None
             dead = ([self.current] if self.current else []) + [j for _, j, _ in self.pending]
             self.current = None
             self.pending.clear()
@@ -1135,10 +1147,10 @@ class Hosted:
             except ValueError:
                 pass
 
-    def _emit_session_event(self, kind, data):
+    def _emit_session_event(self, kind, data, transient=False):
         sess = self._sess()
         if sess:
-            self.mon.emit(sess, kind, data)
+            self.mon.emit(sess, kind, data, transient=transient)
 
     # CLI 会在回合过程中发送 queued/started/running 等非终态；
     # 只有以下状态才结束这一轮。
@@ -1190,16 +1202,46 @@ class Hosted:
             if self.current is job:
                 self.current = None
                 self.processing = False
+            final_text = ""
+            if self.stream_job is job:
+                final_text = self.stream_text
+                self.stream_text = ""
+                self.stream_job = None
             self.ready.notify_all()
             self.turns += 1
         print(f"[hosted] {self.hid} 第 {self.turns} 轮 {status} job={job.get('id')}"
               + (" 失败: " + error if error else ""), flush=True)
+        if final_text:
+            self._emit_session_event("turn_delta", {
+                "hosted": self.hid, "job": job.get("id"), "text": final_text},
+                transient=True)
         self._emit_session_event("hosted_turn_done", {
             "hosted": self.hid, "job": job.get("id"), "status": status,
             "result": clip(job.get("result") or "", 300),
             "cost_usd": job.get("cost_usd"),
             "result_session_id": job.get("result_session_id"),
             "is_error": job.get("result_is_error", False)})
+
+    def _on_stream_event(self, obj):
+        event = obj.get("event") or {}
+        if event.get("type") != "content_block_delta":
+            return
+        delta = event.get("delta") or {}
+        if delta.get("type") != "text_delta" or not delta.get("text"):
+            return
+        with self.ready:
+            job = self.current
+            if job is None or self.stream_job is not job:
+                return
+            self.stream_text += delta["text"]
+            should_emit = now_ts() - self.last_delta_emit >= 0.08
+            text = self.stream_text
+            if should_emit:
+                self.last_delta_emit = now_ts()
+        if should_emit:
+            self._emit_session_event("turn_delta", {
+                "hosted": self.hid, "job": job.get("id"), "text": text},
+                transient=True)
 
     def _on_result(self, obj):
         with self.ready:
@@ -1341,11 +1383,14 @@ class Hosted:
             approval = self.approval
             interrupting = self.interrupting
             turns = self.turns
+            stream_text = self.stream_text
+            streaming = self.stream_job is not None
         return {"hosted_id": self.hid, "session_id": self.session_id, "cwd": self.cwd,
                 "status": self.status, "pid": self.proc.pid if self.proc else None,
                 "busy": busy, "queued": queued,
                 "approval": approval, "interrupting": interrupting,
                 "current_job": current.get("id") if current else None,
+                "stream_text": stream_text, "streaming": streaming,
                 "last_api_retry": self.last_api_retry,
                 "needs_rehost": self.needs_rehost,
                 "turns": turns, "returncode": self.returncode,
@@ -1729,6 +1774,8 @@ def make_handler(mon, refresh_interval):
                 d["hosted_busy"] = bool(h and h.alive()
                                         and (h.current or h.pending or h.processing))
                 d["hosted_queued"] = len(h.pending) if h and h.alive() else 0
+                d["hosted_stream_text"] = h.stream_text if h and h.alive() else ""
+                d["hosted_streaming"] = bool(h and h.alive() and h.stream_job is not None)
                 return self._json(d)
             if u.path.startswith("/static/"):
                 return self._static(u.path[len("/static/"):])

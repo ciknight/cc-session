@@ -97,6 +97,12 @@ for line in sys.stdin:
                 emit({"type": "result", "session_id": "fake-session",
                       "result": "lifecycle-first"})
             threading.Thread(target=late_result, daemon=True).start()
+        elif text == "stream":
+            for chunk in ("你", "好", "世界"):
+                emit({"type": "stream_event", "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": chunk}}})
+            complete(uuid, "stream-done")
         elif text in ("slow", "interrupt-me"):
             pending_interrupt_uuid = uuid
             threading.Thread(target=slow_turn, args=(uuid, text), daemon=True).start()

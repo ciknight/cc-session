@@ -1,3 +1,4 @@
+import queue
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,29 @@ class InteractionTests(unittest.TestCase):
         code, resp = host.send("c")
         self.assertEqual(code, 429)
         self.assertIn("queue", resp["error"].lower())
+
+    def test_stream_text_is_aggregated_and_cleared(self):
+        self.mon.first_scan_done = True
+        q = queue.Queue()
+        self.mon.subscribers.append(q)
+        host, job = self.start_host("stream")
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        self.assertEqual(host.info()["stream_text"], "")
+        self.assertFalse(host.info()["streaming"])
+        deltas = []
+        end = time.time() + 2
+        while time.time() < end:
+            try:
+                ev = q.get_nowait()
+            except queue.Empty:
+                time.sleep(0.01)
+                continue
+            if ev["type"] == "turn_delta":
+                deltas.append(ev["data"]["text"])
+                if "世界" in ev["data"]["text"]:
+                    break
+        self.assertTrue(deltas)
+        self.assertIn("世界", deltas[-1])
 
     def test_api_retry_is_recorded_for_diagnostics(self):
         host, job = self.start_host("api-retry")

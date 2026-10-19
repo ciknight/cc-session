@@ -333,7 +333,7 @@ def _on_stream_event(self, obj):
                                   "text": chunk}, transient=True)
 ```
 
-注意：这里发送的是增量 chunk，前端累加；spec 中的 `text` 字段即“本次增量”。
+注意：`text` 是当前 job 的**完整聚合文本**（节流发送）；回合结束时再发一次最终文本，然后清空。前端直接用 `text` 覆盖气泡内容。`_finish_job` 清空前发送最终 `turn_delta`。
 
 `_emit_session_event` 增加 `transient=False` 并透传。
 
@@ -569,8 +569,8 @@ git commit -m "feat: 前端 SSE、分页与渲染缓存"
 
 ```js
 let liveText = "", liveRaf = null;
-function updateLiveBubble(chunk){
-  liveText += chunk || "";
+function updateLiveBubble(text){
+  liveText = text || "";
   if(liveRaf) return;
   liveRaf = requestAnimationFrame(() => {
     liveRaf = null;
