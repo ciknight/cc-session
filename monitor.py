@@ -117,7 +117,9 @@ class Session:
         self.id = sid
         self.path = path
         self.cwd = None
-        self.title = None            # ai-title
+        self.title = None            # 最终展示标题（custom-title 优先）
+        self.ai_title = None
+        self.custom_title = None
         self.model = None
         self.version = None          # Claude Code 版本
         self.git_branch = None
@@ -137,6 +139,15 @@ class Session:
         self.last_user = None
         self.last_assistant = None
         self.last_event_ts = 0
+        self.last_input_ts = None      # 只由真实用户输入推进
+        self.last_turn_end_ts = None   # system/turn_duration
+        self.saw_turn_duration = False
+        self.pending_tools = set()     # 主链上尚未回传结果/未结束的 tool_use id
+        self.context_tokens = 0        # 最新一条 assistant usage 的上下文大小
+        self.compacted_at = None
+        self.is_subagent = False
+        self.parent_id = None
+        self.agent_name = None
         self.state = "idle"
         self.recent = deque(maxlen=50)
 
@@ -158,6 +169,13 @@ class Session:
             "state": state,
             "first_event_at": self.first_ts,
             "last_event_at": self.last_event_ts,
+            "last_input_at": self.last_input_ts,
+            "last_turn_end_at": self.last_turn_end_ts,
+            "context_tokens": self.context_tokens,
+            "compacted_at": self.compacted_at,
+            "is_subagent": self.is_subagent,
+            "parent_id": self.parent_id,
+            "agent_name": self.agent_name,
             "last_user_message": self.last_user,
             "first_user_message": self.first_user,
             "last_assistant_message": self.last_assistant,
@@ -491,6 +509,15 @@ class Monitor:
             print(f"[webhook] 失败: {e}")
 
     # ---------- 解析一行转录 ----------
+    def _set_working(self, sess):
+        sess.state = "working"
+
+    def _set_idle(self, sess):
+        if sess.state == "idle":
+            return
+        sess.state = "idle"
+        self.emit(sess, "turn_finished", {"last": sess.last_assistant})
+
     def handle_line(self, sess, line):
         try:
             obj = json.loads(line)
@@ -501,35 +528,66 @@ class Monitor:
             sess.git_branch = obj["gitBranch"]
         if obj.get("version"):
             sess.version = obj["version"]
+        if obj.get("attributionAgent") and not sess.agent_name:
+            sess.agent_name = obj["attributionAgent"]
         ts = obj.get("timestamp")
         ts_epoch = _parse_iso(ts)
-        if ts_epoch and (sess.first_ts is None or ts_epoch < sess.first_ts):
-            sess.first_ts = ts_epoch
-        sess.last_event_ts = now_ts() if self.first_scan_done else ts_epoch or sess.last_event_ts
+        if ts_epoch:
+            if sess.first_ts is None or ts_epoch < sess.first_ts:
+                sess.first_ts = ts_epoch
+            sess.last_event_ts = max(sess.last_event_ts, ts_epoch)
+        elif self.first_scan_done:
+            sess.last_event_ts = now_ts()
         typ = obj.get("type")
+
+        if typ == "ai-title":
+            sess.ai_title = obj.get("aiTitle") or sess.ai_title
+            sess.title = sess.custom_title or sess.ai_title or sess.title
+            return
+        if typ == "custom-title":
+            value = obj.get("customTitle")
+            if value is not None:
+                sess.custom_title = value or None
+                sess.title = sess.custom_title or sess.ai_title or sess.title
+            return
+        if typ == "system":
+            subtype = obj.get("subtype")
+            if subtype == "turn_duration":
+                sess.saw_turn_duration = True
+                sess.last_turn_end_ts = ts_epoch or now_ts()
+                if not sess.pending_tools and not sess.active_agents:
+                    self._set_idle(sess)
+            elif subtype == "compact_boundary":
+                sess.compacted_at = ts_epoch or now_ts()
+                self.emit(sess, "context_compacted", {"at": sess.compacted_at})
+            return
+
         msg = obj.get("message") or {}
         content = msg.get("content")
         sidechain = bool(obj.get("isSidechain"))
 
-        if typ == "ai-title":
-            sess.title = obj.get("aiTitle") or sess.title
-
-        elif typ == "user":
+        if typ == "user":
             blocks = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
             kind = classify_user_line(obj, blocks)
+            if kind == "meta":
+                return
             for b in blocks:
-                if b.get("type") == "tool_result":
+                if isinstance(b, dict) and b.get("type") == "tool_result":
                     self._on_tool_result(sess, b)
-                elif b.get("type") == "text" and b.get("text") and kind == "user" and not sidechain:
-                    # sidechain 里的 user 行是子代理的提示词，不是真人输入，不计入
+            if kind == "user" and not sidechain:
+                text = " ".join(b.get("text", "") for b in blocks
+                                if isinstance(b, dict) and b.get("type") == "text")
+                if text:
                     sess.user_msgs += 1
+                    sess.last_input_ts = ts_epoch or now_ts()
                     if sess.first_user is None:
-                        sess.first_user = clip(b["text"], 80)
-                    sess.last_user = clip(b["text"])
-                    sess.state = "working"
+                        sess.first_user = clip(text, 80)
+                    sess.last_user = clip(text)
+                    self._set_working(sess)
                     self.emit(sess, "user_message", {"text": sess.last_user})
-            if any(b.get("type") == "tool_result" for b in blocks) or sidechain:
-                sess.state = "working"
+            elif sidechain or kind in ("tool", "injected", "system", "meta_tool"):
+                # 子代理、工具回传和注入内容都说明会话仍在活动
+                self._set_working(sess)
 
         elif typ == "assistant":
             if not sidechain:
@@ -541,24 +599,34 @@ class Monitor:
             sess.tokens["output"] += usage.get("output_tokens", 0)
             sess.tokens["cache_read"] += usage.get("cache_read_input_tokens", 0)
             sess.tokens["cache_creation"] += usage.get("cache_creation_input_tokens", 0)
+            ctx = (usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+                   + usage.get("cache_read_input_tokens", 0) + usage.get("output_tokens", 0))
+            if ctx > 0:
+                sess.context_tokens = ctx
             blocks = content if isinstance(content, list) else []
             for b in blocks:
+                if not isinstance(b, dict):
+                    continue
                 if b.get("type") == "text" and b.get("text") and not sidechain:
                     sess.last_assistant = clip(b["text"])
                     self.emit(sess, "assistant_message", {"text": sess.last_assistant})
                 elif b.get("type") == "tool_use":
-                    self._on_tool_use(sess, b)
-            if sidechain:
-                # 子代理（sidechain）在跑：即使它本回合 end_turn，主对话仍在等它的结果，不算空闲
-                sess.state = "working"
-            else:
-                sess.state = "idle" if msg.get("stop_reason") == "end_turn" else "working"
-                if sess.state == "idle":
-                    self.emit(sess, "turn_finished", {"last": sess.last_assistant})
+                    self._on_tool_use(sess, b, sidechain)
+            if obj.get("isApiErrorMessage"):
+                self.emit(sess, "api_error", {"text": clip(_result_text(msg), 300)})
+                self._set_working(sess)
+            elif sidechain:
+                # 子代理（sidechain）在跑：即使它本回合 end_turn，主对话仍在等它的结果
+                self._set_working(sess)
+            elif not sess.saw_turn_duration and msg.get("stop_reason") == "end_turn" \
+                    and not sess.pending_tools:
+                self._set_idle(sess)
 
-    def _on_tool_use(self, sess, b):
+    def _on_tool_use(self, sess, b, sidechain=False):
         name, inp, tid = b.get("name"), b.get("input") or {}, b.get("id")
         sess.tool_uses[name] += 1
+        if not sidechain and tid:
+            sess.pending_tools.add(tid)
         self.emit(sess, "tool_use", {"tool": name, "input": clip(inp, 200)})
         if name == "Agent":
             if tid:
@@ -588,6 +656,7 @@ class Monitor:
 
     def _on_tool_result(self, sess, b):
         sess.active_agents.discard(b.get("tool_use_id"))
+        sess.pending_tools.discard(b.get("tool_use_id"))
         if b.get("is_error"):
             self.emit(sess, "tool_error", {"tool_use_id": b.get("tool_use_id"),
                                            "error": clip(b.get("content", ""), 200)})
@@ -963,11 +1032,24 @@ SYSTEM_MARKERS = ("<task-notification>", "<command-name>", "<command-message>",
 
 
 def classify_user_line(o, blocks):
-    """把 type=user 的行分类为 user（真人）/ system（系统文本）/ tool（工具结果回传）。"""
+    """把 type=user 的行分类。
+
+    user      真人输入
+    tool      工具结果回传
+    meta      纯 boilerplate，展示和计数都应丢弃
+    meta_tool isMeta + sourceToolUseID，内容属于对应工具卡片
+    injected  origin/promptSource 注入的输入，不是真人输入
+    system    命令输出、任务通知、中断标记等系统文本
+    """
     if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks):
         return "tool"
-    if o.get("isMeta"):
+    if o.get("isCompactSummary"):
         return "system"
+    if o.get("isMeta"):
+        return "meta_tool" if o.get("sourceToolUseID") else "meta"
+    origin = o.get("origin")
+    if (isinstance(origin, dict) and origin.get("kind")) or o.get("promptSource"):
+        return "injected"
     for b in blocks:
         if isinstance(b, dict) and b.get("type") == "text":
             if (b.get("text") or "").lstrip().startswith(SYSTEM_MARKERS):

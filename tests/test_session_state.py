@@ -19,10 +19,12 @@ class SessionStateTests(unittest.TestCase):
         self.addCleanup(self.clock.stop)
         self.addCleanup(self.temp.cleanup)
 
-    def line(self, typ, content, timestamp=None, stop_reason=None, **fields):
+    def line(self, typ, content, timestamp=None, stop_reason=None, usage=None, **fields):
         message = {"content": content}
         if stop_reason is not None:
             message["stop_reason"] = stop_reason
+        if usage is not None:
+            message["usage"] = usage
         obj = {
             "type": typ,
             "timestamp": timestamp or self.timestamp(self.now),
@@ -108,6 +110,70 @@ class SessionStateTests(unittest.TestCase):
 
         self.assertEqual([agent["ts"] for agent in detail["subagents"]], [200, 100])
         self.assertEqual([agent["ts"] for agent in self.sess.subagents], [100, 200])
+
+    def test_turn_duration_wins_over_end_turn(self):
+        self.line("user", [{"type": "text", "text": "do it"}])
+        self.line("assistant", [{"type": "text", "text": "working"}], stop_reason="end_turn")
+        self.line("system", [], subtype="turn_duration")
+        self.assertTrue(self.sess.saw_turn_duration)
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "idle")
+
+    def test_end_turn_is_fallback_without_turn_duration(self):
+        self.line("user", [{"type": "text", "text": "hi"}])
+        self.line("assistant", [{"type": "text", "text": "done"}], stop_reason="end_turn")
+        self.assertFalse(self.sess.saw_turn_duration)
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "idle")
+
+    def test_tool_result_and_meta_do_not_advance_last_input(self):
+        self.line("user", [{"type": "text", "text": "real input"}], timestamp=self.timestamp(self.now))
+        self.assertEqual(self.sess.last_input_ts, self.now)
+        later = self.now + 10
+        self.line("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+                  timestamp=self.timestamp(later))
+        self.line("user", [{"type": "text", "text": "injected"}], isMeta=True,
+                  timestamp=self.timestamp(later + 10))
+        self.assertEqual(self.sess.last_input_ts, self.now)
+
+    def test_injected_prompt_does_not_advance_last_input(self):
+        self.line("user", [{"type": "text", "text": "injected"}],
+                  origin={"kind": "coordinator"}, timestamp=self.timestamp(self.now))
+        self.assertIsNone(self.sess.last_input_ts)
+
+    def test_pending_tool_keeps_working_after_end_turn(self):
+        self.line("user", [{"type": "text", "text": "go"}])
+        self.line("assistant", [{"type": "tool_use", "id": "tool-1", "name": "Bash",
+                                 "input": {"command": "sleep 1"}}], stop_reason="tool_use")
+        self.line("assistant", [{"type": "text", "text": "waiting"}], stop_reason="end_turn")
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "working")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}])
+        self.line("system", [], subtype="turn_duration")
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "idle")
+
+    def test_context_tokens_use_latest_usage_not_sum(self):
+        self.line("assistant", [{"type": "text", "text": "a"}], usage={
+            "input_tokens": 10, "output_tokens": 2,
+            "cache_creation_input_tokens": 3, "cache_read_input_tokens": 4})
+        self.assertEqual(self.sess.context_tokens, 19)
+        self.line("assistant", [{"type": "text", "text": "b"}], usage={
+            "input_tokens": 5, "output_tokens": 1})
+        self.assertEqual(self.sess.context_tokens, 6)
+        self.assertEqual(self.sess.tokens["input"], 15)
+
+    def test_meta_source_tool_is_not_user_input(self):
+        self.line("user", [{"type": "text", "text": "skill body"}],
+                  isMeta=True, sourceToolUseID="tool-9", timestamp=self.timestamp(self.now))
+        self.assertIsNone(self.sess.last_input_ts)
+        self.assertEqual(self.sess.user_msgs, 0)
+
+    def test_boilerplate_meta_is_ignored(self):
+        self.line("user", [{"type": "text", "text": "system boilerplate"}],
+                  isMeta=True, timestamp=self.timestamp(self.now))
+        self.assertIsNone(self.sess.last_input_ts)
+
+    def test_interrupt_marker_is_system(self):
+        self.line("user", [{"type": "text", "text": "[Request interrupted by user]"}])
+        self.assertIsNone(self.sess.last_input_ts)
+        self.assertEqual(self.sess.user_msgs, 0)
 
 
 if __name__ == "__main__":
