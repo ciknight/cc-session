@@ -36,6 +36,9 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 2. **行解析**（`handle_line`）：逐行 JSON 解析，更新 `Session` 的 cwd/git 分支/模型/token 用量/
    工具统计/任务清单/状态等。事件经 `emit` 分发给 SSE 订阅者和可选 webhook；
    **首次扫描只回放不推送**（`first_scan_done` 标志）。
+   Agent 工具调用的子代理条目带 tid/state（running/done/error），tool_result 回传时翻转
+   状态并发 `subagent_done`；`parse_msg_line` 把 `<command-name>`/`<local-command-stdout>`
+   系统行解析为 command/command_output part。
 3. **HTTP 层**（`make_handler`，`ThreadingHTTPServer` + `BaseHTTPRequestHandler`）：
    `GET /` 渲染看板模板，`/sessions`、`/sessions/<id>`、`/sessions/<id>/messages` 返回 JSON，
    `/events` 是 SSE 流（连接先发 `snapshot`，随后推增量），`/static/` 提供静态文件。
@@ -113,4 +116,6 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 对话视图顶部显示待审批卡片，发送区提供中断按钮和审批模式选择；审批默认 `auto`，
 发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用同一个 `composerHtml`
 输入对话框；`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，自动刷新/整页刷新后恢复
-（`sessionStorage`）。
+（`sessionStorage`）。子代理折叠区与会话卡片显示运行中数量（条目带状态圆点，运行中在前）；
+发送后对话顶部有本地回显气泡（`pendingEcho`，转录出现同文本 user 消息或 command part 后退场，
+失败标红）；斜杠命令渲染为命令气泡（输出折叠），状态行显示"正在执行命令 /xxx…"。
