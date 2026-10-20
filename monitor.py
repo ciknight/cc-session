@@ -284,6 +284,12 @@ class Session:
         subagents = data.get("subagents")
         if isinstance(subagents, list):
             self.subagents = [x for x in subagents if isinstance(x, dict)]
+            # 旧缓存条目没有 tid/state：无法继续配对，一律视为已完成
+            for sub in self.subagents:
+                if not isinstance(sub.get("state"), str):
+                    sub["state"] = "done"
+                if not isinstance(sub.get("tid"), str):
+                    sub["tid"] = ""
         self.active_agents = {x for x in (data.get("active_agents") or []) if isinstance(x, str)}
         self.pending_tools = {x for x in (data.get("pending_tools") or []) if isinstance(x, str)}
         tool_uses = data.get("tool_uses")

@@ -243,6 +243,18 @@ class SessionStateTests(unittest.TestCase):
         self.line("user", [{"type": "text", "text": "[Request interrupted by user]"}])
         self.assertIsNone(self.sess.last_api_error)
 
+    def test_restore_old_subagent_entries_marked_done(self):
+        self.sess.restore_cache({
+            "subagents": [{"type": "Explore", "description": "d", "ts": 1},
+                          {"type": "claude", "description": "e", "ts": 2,
+                           "tid": "t2", "state": "running"}],
+        })
+        self.assertEqual(self.sess.subagents[0]["state"], "done")
+        self.assertEqual(self.sess.subagents[0]["tid"], "")
+        # 新格式条目原样保留（运行中的子任务在增量读取中会等来 tool_result）
+        self.assertEqual(self.sess.subagents[1]["state"], "running")
+        self.assertEqual(self.sess.subagents[1]["tid"], "t2")
+
 
 if __name__ == "__main__":
     unittest.main()
