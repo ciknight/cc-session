@@ -850,4 +850,6 @@ test('202 后保留 sendJobs 原文，命令状态文案不中断', async () => 
   await b.node('sendbtn').onclick();
   assert.ok(texts.includes('命令 /model 排队中…') || texts.includes('正在执行命令 /model…'),
     '命令状态文案应出现，实际: ' + JSON.stringify(texts));
+  // 反向断言：queued/running 阶段不应回落成裸的普通文案
+  assert.ok(!texts.includes('排队中…'), '202 后不应丢失命令前缀，实际: ' + JSON.stringify(texts));
 });

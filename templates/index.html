@@ -862,7 +862,8 @@ function convHtml(messages){
       if(p.type === "command")
         return `<div class="cmd">⌘ <code>${esc(p.command)}</code>${p.args ? " " + esc(p.args) : ""}</div>`;
       if(p.type === "command_output")
-        return `<details class="fold"><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
+        // 无独立 id，key 由内容派生，重渲染后展开状态可恢复
+        return `<details class="fold"${detailsAttrs("cmdout:" + p.text)}><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
       if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
       return "";
     }).join("");
