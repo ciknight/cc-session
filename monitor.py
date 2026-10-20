@@ -197,7 +197,7 @@ class Session:
         self.tasks = {}              # taskId -> {id, subject, status}
         self.task_seq = 0
         self.pending_create = {}     # tool_use_id -> subject
-        self.subagents = []          # Agent 工具调用: {type, description, ts}
+        self.subagents = []          # Agent 工具调用: {type, description, ts, tid, state}
         self.active_agents = set()    # 尚未收到匹配 tool_result 的 Agent tool_use id
         self.tool_uses = Counter()   # 工具名 -> 次数
         self.tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
@@ -960,7 +960,9 @@ class Monitor:
                    # 无 tid 无法配对结果，直接视为已完成
                    "state": "running" if tid else "done"}
             sess.subagents.append(sub)
-            self.emit(sess, "subagent_start", sub)
+            # 发副本：条目稍后会被 _on_tool_result 原地改 state，
+            # 直接引用会让已入队/入 recent 的 start 事件也变成最终状态
+            self.emit(sess, "subagent_start", dict(sub))
         elif name == "TaskCreate":
             sess.pending_create[tid] = inp.get("subject", "")
             sess.task_seq += 1
