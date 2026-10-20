@@ -86,6 +86,7 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
   border:1px solid var(--bd);border-radius:6px;padding:6px 8px;white-space:pre-wrap;
   font:12px ui-monospace,monospace}
 .diff-add{color:#16a34a}.diff-del{color:#dc2626}.diff-hunk{color:var(--acc)}
+.cmd{background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:4px 10px;font-size:12.5px;display:inline-block;margin:2px 0}
 /* 待审批卡片：权限 / 计划 / 问答共用 */
 .inter-card{background:var(--card);border:1px solid var(--bd);border-left:3px solid #d97706;
   border-radius:8px;padding:10px 14px;margin:10px 0}
@@ -858,6 +859,10 @@ function convHtml(messages){
         return g.role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
              : g.role === "assistant" ? `<div class="abody">${md(p.text)}</div>`
              : `<div class="sysbody">${esc(p.text)}</div>`;
+      if(p.type === "command")
+        return `<div class="cmd">⌘ <code>${esc(p.command)}</code>${p.args ? " " + esc(p.args) : ""}</div>`;
+      if(p.type === "command_output")
+        return `<details class="fold"><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
       if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
       return "";
     }).join("");
@@ -1194,9 +1199,12 @@ function sendJobText(id){
   // 自动刷新会整体重渲染对话视图，旧引用会指向已替换的节点导致界面停在"发送中…"
   const j = sendJobs[id];
   if(!j) return "";
-  if(j.status === "sending") return "发送中…";
-  if(j.status === "queued") return "排队中…";
-  if(j.status === "running") return "Claude 正在处理…";
+  // 斜杠命令用命令本身做状态前缀，和普通消息的"发送中/Claude 正在处理"区分开
+  const cmd = typeof j.text === "string" && j.text.trim().startsWith("/")
+    ? "命令 " + j.text.trim().split(/\s+/)[0] : "";
+  if(j.status === "sending") return cmd ? `${cmd} 发送中…` : "发送中…";
+  if(j.status === "queued") return cmd ? `${cmd} 排队中…` : "排队中…";
+  if(j.status === "running") return cmd ? `正在执行${cmd}…` : "Claude 正在处理…";
   if(j.status === "done") return "已完成，回复见下方对话";
   if(j.status === "cancelled") return "已中断";
   if(j.status === "failed") return "失败: " + (j.error || "未知错误");
@@ -1258,7 +1266,7 @@ function bindNewBox(p){
     const key = "new:" + p.cwd;
     const selectedModel = modelSnapshot(key);
     if(selectedModel === undefined) return;
-    sendJobs[key] = {status: "sending", requested_model: selectedModel};
+    sendJobs[key] = {status: "sending", requested_model: selectedModel, text};
     updateSendSt(key);
     let sid = null;
     const enterSession = () => {   // 拿到新 session id 后切换到对话视图
@@ -1317,7 +1325,8 @@ function bindNewBox(p){
             enterSession();
           }
         }
-        sendJobs[sid || key] = {jobId: j.job_id, status: jr.status, result: jr.result, error: jr.error};
+        sendJobs[sid || key] = {jobId: j.job_id, status: jr.status, result: jr.result, error: jr.error,
+                                text: (sendJobs[sid || key] || {}).text};
         updateSendSt(sid || key);
         if(jr.status === "running" || jr.status === "queued") continue;
         break;
@@ -1388,7 +1397,7 @@ function bindSendBox(id, d){
     // 已托管的会话 /sessions/<id>/message 会自动路由到常驻进程，无需再 POST /hosted
     const useHost = document.getElementById("hostcb").checked
       && !(d.hosted || sessions.find(s => s.id === id)?.hosted);
-    sendJobs[id] = {status: "sending", requested_model: selectedModel};
+    sendJobs[id] = {status: "sending", requested_model: selectedModel, text};
     updateSendSt(id);
     try{
       const r = await fetchT(useHost ? "/hosted" : "/sessions/" + encodeURIComponent(id) + "/message", {
@@ -1421,7 +1430,8 @@ function bindSendBox(id, d){
         // 多个消息排队时只更新自己的状态，避免旧任务的轮询覆盖新任务
         if(!sendJobs[id] || sendJobs[id].jobId === j.job_id)
           sendJobs[id] = {jobId: j.job_id, status: jr.status,
-                          result: jr.result, error: jr.error};
+                          result: jr.result, error: jr.error,
+                          text: (sendJobs[id] || {}).text};
         updateSendSt(id);
         if(jr.status === "running" || jr.status === "queued") continue;
         break;

@@ -804,3 +804,28 @@ test('会话卡片 chip 显示运行中子代理数', () => {
   assert.ok(html.includes('1 子代理'));
   assert.ok(!html.includes('1 子代理 ·'));   // 无运行中时不追加
 });
+
+test('command part 渲染为命令气泡与折叠输出', () => {
+  const b = boot();
+  const html = b.run(`convHtml([{role:"system", ts:0, parts:[
+    {type:"command", command:"/model", args:"deepseek-v4.1-flash"},
+    {type:"command_output", text:"switched"},
+  ]}])`);
+  assert.ok(html.includes('class="cmd"'));
+  assert.ok(html.includes('/model'));
+  assert.ok(html.includes('deepseek-v4.1-flash'));
+  assert.ok(html.includes('命令输出'));
+  assert.ok(html.includes('switched'));
+});
+
+test('sendJobText 对斜杠命令显示命令文案', () => {
+  const b = boot();
+  b.run(`sendJobs["s1"] = {status:"sending", text:"/model deepseek"}`);
+  assert.equal(b.run(`sendJobText("s1")`), "命令 /model 发送中…");
+  b.run(`sendJobs["s1"] = {status:"queued", text:"/model deepseek"}`);
+  assert.equal(b.run(`sendJobText("s1")`), "命令 /model 排队中…");
+  b.run(`sendJobs["s1"] = {status:"running", text:"/model deepseek"}`);
+  assert.equal(b.run(`sendJobText("s1")`), "正在执行命令 /model…");
+  b.run(`sendJobs["s1"] = {status:"running", text:"hello"}`);
+  assert.equal(b.run(`sendJobText("s1")`), "Claude 正在处理…");
+});
