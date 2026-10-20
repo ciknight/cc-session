@@ -101,6 +101,38 @@ class SessionStateTests(unittest.TestCase):
 
         self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "working")
 
+    def test_subagent_entry_running_then_done(self):
+        self.line("assistant", [{
+            "type": "tool_use", "id": "a1", "name": "Agent",
+            "input": {"description": "scan code", "subagent_type": "Explore"},
+        }], stop_reason="tool_use")
+        sub = self.sess.subagents[0]
+        self.assertEqual(sub["tid"], "a1")
+        self.assertEqual(sub["state"], "running")
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 1)
+
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1", "content": "ok"}])
+        self.assertEqual(self.sess.subagents[0]["state"], "done")
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 0)
+
+    def test_subagent_entry_error_on_error_result(self):
+        self.line("assistant", [{
+            "type": "tool_use", "id": "a1", "name": "Agent",
+            "input": {"description": "scan"},
+        }], stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1",
+                            "content": "boom", "is_error": True}])
+        self.assertEqual(self.sess.subagents[0]["state"], "error")
+
+    def test_detail_orders_running_subagents_first(self):
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "first"}}], stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1", "content": "ok"}])
+        self.line("assistant", [{"type": "tool_use", "id": "a2", "name": "Agent",
+                                 "input": {"description": "second"}}], stop_reason="tool_use")
+        subs = self.sess.detail(self.mon.stale_after)["subagents"]
+        self.assertEqual([s["description"] for s in subs], ["second", "first"])
+
     def test_detail_lists_subagents_newest_first_without_reordering_internal_list(self):
         older = {"type": "general-purpose", "description": "older", "ts": 100}
         newer = {"type": "general-purpose", "description": "newer", "ts": 200}

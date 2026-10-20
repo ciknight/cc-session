@@ -329,6 +329,8 @@ class Session:
             "tasks_total": len(self.tasks),
             "tasks_completed": done,
             "subagent_count": len(self.subagents),
+            "subagents_running": sum(1 for a in self.subagents
+                                     if a.get("state") == "running"),
             "user_msgs": self.user_msgs,
             "assistant_msgs": self.assistant_msgs,
             "tokens": dict(self.tokens),
@@ -337,7 +339,10 @@ class Session:
     def detail(self, stale_after, project=None):
         d = self.summary(stale_after, project)
         d["tasks"] = list(self.tasks.values())
-        d["subagents"] = sorted(self.subagents, key=lambda sub: sub.get("ts", 0), reverse=True)
+        # 运行中的子代理排最前，其余按 ts 倒序
+        d["subagents"] = sorted(self.subagents,
+                                key=lambda sub: (sub.get("state") != "running",
+                                                 -sub.get("ts", 0)))
         d["tool_uses"] = dict(self.tool_uses.most_common())
         d["recent_events"] = list(self.recent)
         return d
@@ -950,7 +955,10 @@ class Monitor:
                 sess.active_agents.add(tid)
             sub = {"type": inp.get("subagent_type") or "general-purpose",
                    "description": clip(inp.get("description", ""), 120),
-                   "ts": now_ts()}
+                   "ts": now_ts(),
+                   "tid": tid or "",
+                   # 无 tid 无法配对结果，直接视为已完成
+                   "state": "running" if tid else "done"}
             sess.subagents.append(sub)
             self.emit(sess, "subagent_start", sub)
         elif name == "TaskCreate":
@@ -972,11 +980,20 @@ class Monitor:
                                                  "subject": task["subject"]})
 
     def _on_tool_result(self, sess, b):
-        sess.active_agents.discard(b.get("tool_use_id"))
-        sess.pending_tools.discard(b.get("tool_use_id"))
+        tid = b.get("tool_use_id")
+        sess.active_agents.discard(tid)
+        sess.pending_tools.discard(tid)
         if b.get("is_error"):
-            self.emit(sess, "tool_error", {"tool_use_id": b.get("tool_use_id"),
+            self.emit(sess, "tool_error", {"tool_use_id": tid,
                                            "error": clip(b.get("content", ""), 200)})
+        for sub in sess.subagents:
+            if sub.get("tid") == tid and sub.get("state") == "running":
+                sub["state"] = "error" if b.get("is_error") else "done"
+                self.emit(sess, "subagent_done",
+                          {"tid": tid, "state": sub["state"],
+                           "type": sub.get("type"),
+                           "description": sub.get("description")})
+                break
 
     # ---------- 轮询文件 ----------
     def _scan_cache_obj(self):
