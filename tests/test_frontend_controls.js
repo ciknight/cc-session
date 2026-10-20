@@ -829,3 +829,25 @@ test('sendJobText 对斜杠命令显示命令文案', () => {
   b.run(`sendJobs["s1"] = {status:"running", text:"hello"}`);
   assert.equal(b.run(`sendJobText("s1")`), "Claude 正在处理…");
 });
+
+test('202 后保留 sendJobs 原文，命令状态文案不中断', async () => {
+  // bindSendBox 全流程：POST 返回 202 后重建 sendJobs，若丢 text 字段，
+  // 斜杠命令的状态文案会回落成普通"排队中/Claude 正在处理"
+  const texts = [];
+  let polls = 0;
+  const b = boot(async(url)=>{
+    if(url==='/sessions/sid/message') return {ok:true,status:202,json:async()=>({job_id:'job-1'})};
+    if(url==='/jobs/job-1') return response({status: ++polls === 1 ? 'queued' : 'done'});
+    if(url==='/sessions') return response([]);
+    throw Error('unexpected fetch ' + url);
+  });
+  b.context.texts = texts;
+  b.context.setTimeout = callback => { callback(); return 1; };
+  b.run('curPanel={type:"conv",key:"sid"}; modelDraft("sid", null); bindSendBox("sid", {})');
+  // 收集每次 updateSendSt 时的状态文案
+  b.run('const _oldUpd = updateSendSt; updateSendSt = id => { _oldUpd(id); texts.push(sendJobText(id)); };');
+  b.node('msgbox').value='/model x';
+  await b.node('sendbtn').onclick();
+  assert.ok(texts.includes('命令 /model 排队中…') || texts.includes('正在执行命令 /model…'),
+    '命令状态文案应出现，实际: ' + JSON.stringify(texts));
+});

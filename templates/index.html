@@ -1412,7 +1412,8 @@ function bindSendBox(id, d){
       const box = document.getElementById("msgbox");
       if(box) box.value = "";
       // 202 后立刻解除“发送中”锁定：托管会话可以继续排队，不必等整轮结束。
-      sendJobs[id] = {jobId: j.job_id, status: j.status || "queued"};
+      sendJobs[id] = {jobId: j.job_id, status: j.status || "queued",
+                      text: (sendJobs[id] || {}).text};
       updateSendSt(id);
       // 本次刚启动托管时重建一次面板，让“托管中/退出托管”控件立即出现；
       // 已有托管或一次性消息只做软刷新，避免打断正在输入的下一条消息。
