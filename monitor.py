@@ -1954,6 +1954,12 @@ class Interaction:
 SYSTEM_MARKERS = ("<task-notification>", "<command-name>", "<command-message>",
                   "<local-command-stdout>", "Caveat:", "[Request interrupted")
 
+# 网页发送的斜杠命令在转录里是 <command-name>/<command-args> 的 user 行，
+# 本地命令输出则是 <local-command-stdout> 行，解析成独立 part 供前端渲染命令气泡
+COMMAND_NAME_RE = re.compile(r"<command-name>\s*([^<]+?)\s*</command-name>")
+COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+LOCAL_STDOUT_RE = re.compile(r"^<local-command-stdout>\s*(.*?)\s*</local-command-stdout>$", re.S)
+
 
 def classify_user_line(o, blocks):
     """把 type=user 的行分类。
@@ -2120,14 +2126,30 @@ def parse_msg_line(ln, clip_len=8000):
             continue
         bt = b.get("type")
         if bt == "text" and (b.get("text") or "").strip():
+            text = b["text"]
+            stripped = text.lstrip()
+            if kind == "system" and stripped.startswith("<command-name>"):
+                m = COMMAND_NAME_RE.search(text)
+                if m:
+                    am = COMMAND_ARGS_RE.search(text)
+                    parts.append({"type": "command",
+                                  "command": clip(m.group(1), 120),
+                                  "args": clip(am.group(1).strip(), 200) if am else ""})
+                    continue
+            if kind == "system":
+                lm = LOCAL_STDOUT_RE.match(stripped)
+                if lm:
+                    parts.append({"type": "command_output",
+                                  "text": clip(lm.group(1), 2000)})
+                    continue
             if kind == "meta_tool":
                 parts.append({"type": "tool_note",
                               "tool_use_id": o.get("sourceToolUseID"),
-                              "text": clip(b["text"], 3000)})
+                              "text": clip(text, 3000)})
             else:
                 # 系统文本（任务通知/命令输出等）截短即可，不需要全文
                 parts.append({"type": "text",
-                              "text": clip(b["text"], 500 if role == "system" else clip_len)})
+                              "text": clip(text, 500 if role == "system" else clip_len)})
         elif bt == "tool_use":
             parts.append({"type": "tool", "tool_use_id": b.get("id"),
                           "name": b.get("name"), "input": clip(b.get("input") or {}, 500)})

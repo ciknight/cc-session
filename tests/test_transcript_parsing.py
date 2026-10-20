@@ -68,6 +68,55 @@ class ParseMessageTests(unittest.TestCase):
         part = monitor.parse_msg_line(line(obj))["parts"][0]
         self.assertEqual(part["tool_use_id"], "t1")
 
+    def test_command_line_parses_to_command_part(self):
+        obj = {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content":
+                        "<command-name>/model</command-name>\n"
+                        "            <command-message>model</command-message>\n"
+                        "            <command-args>deepseek-v4.1-flash</command-args>"},
+        }
+        msg = monitor.parse_msg_line(line(obj))
+        self.assertEqual(msg["role"], "system")
+        self.assertEqual(len(msg["parts"]), 1)
+        self.assertEqual(msg["parts"][0]["type"], "command")
+        self.assertEqual(msg["parts"][0]["command"], "/model")
+        self.assertEqual(msg["parts"][0]["args"], "deepseek-v4.1-flash")
+
+    def test_command_line_without_args(self):
+        obj = {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content":
+                        "<command-name>/compact</command-name>\n"
+                        "            <command-message>compact</command-message>"},
+        }
+        part = monitor.parse_msg_line(line(obj))["parts"][0]
+        self.assertEqual(part["command"], "/compact")
+        self.assertEqual(part["args"], "")
+
+    def test_local_command_stdout_parses_to_output_part(self):
+        obj = {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content":
+                        "<local-command-stdout>switched to model x</local-command-stdout>"},
+        }
+        msg = monitor.parse_msg_line(line(obj))
+        self.assertEqual(msg["role"], "system")
+        self.assertEqual(msg["parts"][0]["type"], "command_output")
+        self.assertEqual(msg["parts"][0]["text"], "switched to model x")
+
+    def test_other_system_text_unchanged(self):
+        obj = {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": "[Request interrupted by user]"},
+        }
+        msg = monitor.parse_msg_line(line(obj))
+        self.assertEqual(msg["parts"][0]["type"], "text")
+
 
 class SubagentDiscoveryTests(unittest.TestCase):
     def setUp(self):
