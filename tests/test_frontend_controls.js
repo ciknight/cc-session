@@ -779,6 +779,7 @@ test('导航同步 URL，并在默认项目解析后替换首页地址', () => {
   b.run('navigate({project:null, session:null, new:false})');
   assert.deepEqual(b.historyCalls[3], ['replace', '/p/F:/code/p']);
 });
+
 test('子代理折叠区显示运行数与状态圆点', () => {
   const b = boot();
   const html = b.run(`infoHtml({id:"s1", tokens:{}, subagents:[
@@ -791,6 +792,7 @@ test('子代理折叠区显示运行数与状态圆点', () => {
   assert.ok(html.includes('dot done'));
   assert.ok(html.includes('dot err'));
 });
+
 test('会话卡片 chip 显示运行中子代理数', () => {
   const b = boot();
   b.run(`renderSessionList({cwd:"/p", sessions:[

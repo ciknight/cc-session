@@ -808,9 +808,9 @@ function infoHtml(d){
     ${tools ? `<details class="fold"${detailsAttrs(`info:${sid}:tools`)}><summary>工具调用 (${Object.keys(d.tool_uses).length} 种)</summary><div>${tools}</div></details>` : ""}
     ${d.subagents && d.subagents.length ? (() => {
       const run = d.subagents.filter(a => a.state === "running").length;
-      const dot = st => st === "running" ? '<span class="dot run" title="运行中"></span>'
-        : st === "error" ? '<span class="dot err" title="出错"></span>'
-        : '<span class="dot done" title="已完成"></span>';
+      const dot = st => st === "running" ? '<span class="dot run" role="img" aria-label="运行中" title="运行中"></span>'
+        : st === "error" ? '<span class="dot err" role="img" aria-label="出错" title="出错"></span>'
+        : '<span class="dot done" role="img" aria-label="已完成" title="已完成"></span>';
       return `<details class="fold"${detailsAttrs(`info:${sid}:subagents`)}><summary>子代理 (${d.subagents.length})${run ? ` · ${run} 运行中` : ""}</summary><ul>` +
         d.subagents.map(a => `<li>${dot(a.state)}<span class="chip">${esc(a.type)}</span> ${esc(a.description)}</li>`).join("") + "</ul></details>";
     })() : ""}
