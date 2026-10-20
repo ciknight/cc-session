@@ -136,6 +136,7 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
 .dot.run{background:#f59e0b;animation:dotpulse 1.2s ease-in-out infinite}
 .dot.done{background:#9ca3af}
+.dot.stale{background:transparent;border:2px solid #9ca3af;width:6px;height:6px}
 .dot.err{background:#ef4444}
 @keyframes dotpulse{0%,100%{opacity:1}50%{opacity:.35}}
 @media(prefers-color-scheme:dark){
@@ -819,6 +820,7 @@ function infoHtml(d){
     ${d.subagents && d.subagents.length ? (() => {
       const run = d.subagents.filter(a => a.state === "running").length;
       const dot = st => st === "running" ? '<span class="dot run" role="img" aria-label="运行中" title="运行中"></span>'
+        : st === "stale" ? '<span class="dot stale" role="img" aria-label="已停滞" title="已停滞（会话长时间无活动，等待回合结束标记）"></span>'
         : st === "error" ? '<span class="dot err" role="img" aria-label="出错" title="出错"></span>'
         : '<span class="dot done" role="img" aria-label="已完成" title="已完成"></span>';
       return `<details class="fold"${detailsAttrs(`info:${sid}:subagents`)}><summary>子代理 (${d.subagents.length})${run ? ` · ${run} 运行中` : ""}</summary><ul>` +

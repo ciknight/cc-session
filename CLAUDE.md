@@ -39,8 +39,12 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
    Agent 工具调用的子代理条目带 tid/state（running/done/error），tool_result 回传时翻转
    状态并发 `subagent_done`；**后台异步 Agent 例外**：`toolUseResult.isAsync` 的回传只是
    "已启动"确认，条目保持 running（标记 async、不解除 working），完成以后续
-   `<task-notification>` 系统行按 `<tool-use-id>` 配对收尾，`turn_duration` 清扫跳过
-   async 条目。`parse_msg_line` 把 `<command-name>`/`<local-command-stdout>`
+   `<task-notification>`（user 消息或新版 `queue-operation` 行的 `content` 字符串）
+   按 `<tool-use-id>` 配对收尾，`turn_duration` 清扫跳过
+   async 条目。父进程异常退出会留下截断转录（无 tool_result/turn_duration），
+   `summary()`/`detail()` 在会话 stale 时把非 async 的运行条目输出为 `stale`
+   （仅输出层副本，累计状态不动，前端渲染空心灰点）；async 条目无回合寿命，不降级。
+   `parse_msg_line` 把 `<command-name>`/`<local-command-stdout>`
    系统行解析为 command/command_output part。
 3. **HTTP 层**（`make_handler`，`ThreadingHTTPServer` + `BaseHTTPRequestHandler`）：
    `GET /` 渲染看板模板，`/sessions`、`/sessions/<id>`、`/sessions/<id>/messages` 返回 JSON，

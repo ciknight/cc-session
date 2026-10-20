@@ -303,9 +303,15 @@ class Session:
         error = data.get("last_api_error")
         self.last_api_error = error if isinstance(error, dict) else None
 
+    def _is_stale(self, stale_after):
+        """超过 stale 秒无内容事件。父进程异常退出留下的截断转录没有回合结束
+        标记，靠它把残留的运行中子代理在输出层降级。"""
+        return bool(self.last_event_ts and now_ts() - self.last_event_ts > stale_after)
+
     def summary(self, stale_after, project=None):
         state = self.state
-        if self.last_event_ts and now_ts() - self.last_event_ts > stale_after:
+        stale = self._is_stale(stale_after)
+        if stale:
             state = "stale"
         elif self.active_agents:
             state = "working"
@@ -335,8 +341,11 @@ class Session:
             "tasks_total": len(self.tasks),
             "tasks_completed": done,
             "subagent_count": len(self.subagents),
+            # 会话停滞时同步子代理是截断转录的残留，不计入运行中；
+            # 异步子代理无回合寿命，仍可能在后台运行
             "subagents_running": sum(1 for a in self.subagents
-                                     if a.get("state") == "running"),
+                                     if a.get("state") == "running"
+                                     and (not stale or a.get("async"))),
             "user_msgs": self.user_msgs,
             "assistant_msgs": self.assistant_msgs,
             "tokens": dict(self.tokens),
@@ -345,8 +354,15 @@ class Session:
     def detail(self, stale_after, project=None):
         d = self.summary(stale_after, project)
         d["tasks"] = list(self.tasks.values())
+        # 会话停滞时同步运行条目输出为 stale（副本，累计状态不动）；
+        # 活跃会话一旦恢复，条目自动回到 running
+        subs = self.subagents
+        if self._is_stale(stale_after):
+            subs = [dict(sub, state="stale")
+                    if sub.get("state") == "running" and not sub.get("async") else sub
+                    for sub in subs]
         # 运行中的子代理排最前，其余按 ts 倒序
-        d["subagents"] = sorted(self.subagents,
+        d["subagents"] = sorted(subs,
                                 key=lambda sub: (sub.get("state") != "running",
                                                  -sub.get("ts", 0)))
         d["tool_uses"] = dict(self.tool_uses.most_common())
@@ -895,6 +911,15 @@ class Monitor:
                 # 请求还在退避重试，回合没有结束
                 self._set_working(sess)
                 self.emit(sess, "api_error", data)
+            return
+
+        if typ == "queue-operation":
+            # 新版 CLI 把 task-notification 写成队列操作行（content 为字符串）
+            # 而非 user 消息；后台异步子代理的完成信号同样在这里
+            content = obj.get("content")
+            if isinstance(content, str) \
+                    and content.lstrip().startswith("<task-notification>"):
+                self._on_task_notification(sess, content)
             return
 
         msg = obj.get("message") or {}

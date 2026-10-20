@@ -170,6 +170,58 @@ class SessionStateTests(unittest.TestCase):
                             "</task-notification>"}])
         self.assertEqual(self.sess.subagents[0]["state"], "done")
 
+    def test_stale_session_downgrades_sync_running_subagent_in_output(self):
+        # 父进程异常退出会留下截断转录：tool_result/turn_duration 都不会再来。
+        # 输出层把会话已停滞时的非 async 运行条目降级为 stale，累计状态不动
+        stale_ts = self.now - self.mon.stale_after - 1
+        self.line("assistant", [{
+            "type": "tool_use", "id": "a1", "name": "Agent",
+            "input": {"description": "scan", "subagent_type": "Explore"},
+        }], timestamp=self.timestamp(stale_ts), stop_reason="tool_use")
+        s = self.sess.summary(self.mon.stale_after)
+        self.assertEqual(s["state"], "stale")
+        self.assertEqual(s["subagents_running"], 0)
+        detail = self.sess.detail(self.mon.stale_after)
+        self.assertEqual(detail["subagents"][0]["state"], "stale")
+        # 内部累计状态保持 running，会话恢复活跃时不误报 done
+        self.assertEqual(self.sess.subagents[0]["state"], "running")
+
+    def test_stale_output_keeps_async_subagent_running(self):
+        # 异步子代理没有回合寿命：父会话停滞时仍可能在后台运行，不降级
+        stale_ts = self.now - self.mon.stale_after - 1
+        self.line("assistant", [{
+            "type": "tool_use", "id": "a1", "name": "Agent",
+            "input": {"description": "bg"}},
+        ], timestamp=self.timestamp(stale_ts), stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1",
+                            "content": "launched"}],
+                  timestamp=self.timestamp(stale_ts),
+                  toolUseResult={"isAsync": True})
+        s = self.sess.summary(self.mon.stale_after)
+        self.assertEqual(s["state"], "stale")
+        self.assertEqual(s["subagents_running"], 1)
+        detail = self.sess.detail(self.mon.stale_after)
+        self.assertEqual(detail["subagents"][0]["state"], "running")
+
+    def test_task_notification_in_queue_operation_line_finishes_async_agent(self):
+        # 新版 CLI 把 task-notification 写成 queue-operation 行（content 为字符串），
+        # 而不是 user 消息；同样要按 tool-use-id 配对收尾异步子代理
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "bg"}}], stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1",
+                            "content": "launched"}],
+                  toolUseResult={"isAsync": True})
+        self.mon.handle_line(self.sess, json.dumps({
+            "type": "queue-operation", "operation": "enqueue",
+            "content": "<task-notification>\n<task-id>x</task-id>\n"
+                       "<tool-use-id>a1</tool-use-id>\n<status>completed</status>\n"
+                       "</task-notification>",
+            "timestamp": self.timestamp(self.now),
+        }))
+        self.assertEqual(self.sess.subagents[0]["state"], "done")
+        self.assertNotIn("a1", self.sess.active_agents)
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 0)
+
     def test_subagent_entry_error_on_error_result(self):
         self.line("assistant", [{
             "type": "tool_use", "id": "a1", "name": "Agent",
