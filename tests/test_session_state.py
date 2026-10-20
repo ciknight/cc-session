@@ -126,6 +126,50 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual(self.sess.subagents[0]["state"], "done")
         self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 0)
 
+    def test_async_agent_launch_result_keeps_running(self):
+        # 后台异步 Agent 的 tool_result 只是"已启动"确认（行级 toolUseResult.isAsync），
+        # 真正的完成信号是后续 task-notification；期间条目保持 running、会话保持 working
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "bg"}}], stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1",
+                            "content": "launched"}],
+                  toolUseResult={"isAsync": True, "status": "async_launched"})
+        self.assertEqual(self.sess.subagents[0]["state"], "running")
+        self.assertTrue(self.sess.subagents[0].get("async"))
+        self.assertIn("a1", self.sess.active_agents)
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 1)
+
+    def test_task_notification_finishes_async_agent(self):
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "bg"}}], stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1",
+                            "content": "launched"}],
+                  toolUseResult={"isAsync": True})
+        self.line("user", [{"type": "text", "text":
+                            "<task-notification>\n<task-id>x</task-id>\n"
+                            "<tool-use-id>a1</tool-use-id>\n<status>completed</status>\n"
+                            "</task-notification>"}])
+        self.assertEqual(self.sess.subagents[0]["state"], "done")
+        self.assertNotIn("a1", self.sess.active_agents)
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 0)
+
+    def test_turn_duration_sweep_skips_async_agent(self):
+        # 异步子代理跨回合运行：主回合 turn_duration 不能把它当中断残留收尾
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "bg"}}], stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1",
+                            "content": "launched"}],
+                  toolUseResult={"isAsync": True})
+        self.mon.handle_line(self.sess, json.dumps({
+            "type": "system", "subtype": "turn_duration", "durationMs": 1234,
+            "timestamp": self.timestamp(self.now),
+        }))
+        self.assertEqual(self.sess.subagents[0]["state"], "running")
+        self.line("user", [{"type": "text", "text":
+                            "<task-notification>\n<tool-use-id>a1</tool-use-id>\n"
+                            "</task-notification>"}])
+        self.assertEqual(self.sess.subagents[0]["state"], "done")
+
     def test_subagent_entry_error_on_error_result(self):
         self.line("assistant", [{
             "type": "tool_use", "id": "a1", "name": "Agent",

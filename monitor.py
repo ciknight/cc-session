@@ -858,9 +858,10 @@ class Monitor:
                 # turn_duration 是权威结束标记：清掉可能因中断而没有结果的 tool id
                 sess.pending_tools.clear()
                 # 中断的 Agent 调用不会再有 tool_result：运行中的子代理条目一并收尾，
-                # 否则“运行中”计数和脉动圆点会永久残留
+                # 否则“运行中”计数和脉动圆点会永久残留；异步子代理跨回合运行，
+                # 只认 task-notification，不在此清扫
                 for sub in sess.subagents:
-                    if sub.get("state") == "running":
+                    if sub.get("state") == "running" and not sub.get("async"):
                         sub["state"] = "done"
                         self.emit(sess, "subagent_done",
                                   {"tid": sub.get("tid"), "state": "done",
@@ -903,7 +904,13 @@ class Monitor:
                 return
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    self._on_tool_result(sess, b)
+                    self._on_tool_result(sess, b, obj.get("toolUseResult"))
+            if kind == "system" and any(
+                    (b.get("text") or "").lstrip().startswith("<task-notification>")
+                    for b in blocks if isinstance(b, dict)):
+                note = " ".join(b.get("text", "") for b in blocks
+                                if isinstance(b, dict) and b.get("type") == "text")
+                self._on_task_notification(sess, note)
             if kind == "user" and not sidechain:
                 text = " ".join(b.get("text", "") for b in blocks
                                 if isinstance(b, dict) and b.get("type") == "text")
@@ -996,18 +1003,44 @@ class Monitor:
                 self.emit(sess, "task_updated", {"id": task["id"], "status": inp.get("status"),
                                                  "subject": task["subject"]})
 
-    def _on_tool_result(self, sess, b):
+    def _on_tool_result(self, sess, b, tur=None):
         tid = b.get("tool_use_id")
-        sess.active_agents.discard(tid)
+        # 后台异步 Agent 的 tool_result 只是"已启动"确认（行级 toolUseResult.isAsync），
+        # 真正的完成信号是后续 task-notification；期间保持 running 和 working
+        async_launch = isinstance(tur, dict) and bool(
+            tur.get("isAsync") or tur.get("status") == "async_launched")
+        entry = next((s for s in sess.subagents
+                      if s.get("tid") == tid and s.get("state") == "running"), None)
+        # 同步 Agent 的结果回传才解除 working；异步启动确认不算结束
+        if not (async_launch and entry is not None):
+            sess.active_agents.discard(tid)
         sess.pending_tools.discard(tid)
         if b.get("is_error"):
             self.emit(sess, "tool_error", {"tool_use_id": tid,
                                            "error": clip(b.get("content", ""), 200)})
+        if entry is not None:
+            if async_launch:
+                entry["async"] = True
+            else:
+                entry["state"] = "error" if b.get("is_error") else "done"
+                self.emit(sess, "subagent_done",
+                          {"tid": tid, "state": entry["state"],
+                           "type": entry.get("type"),
+                           "description": entry.get("description")})
+
+    def _on_task_notification(self, sess, text):
+        """后台异步 Agent 的完成通知：按 tool-use-id 配对收尾对应条目。"""
+        m = TASK_TOOL_USE_ID_RE.search(text)
+        if not m:
+            return
+        tid = m.group(1)
+        sess.active_agents.discard(tid)
+        sess.pending_tools.discard(tid)
         for sub in sess.subagents:
             if sub.get("tid") == tid and sub.get("state") == "running":
-                sub["state"] = "error" if b.get("is_error") else "done"
+                sub["state"] = "done"
                 self.emit(sess, "subagent_done",
-                          {"tid": tid, "state": sub["state"],
+                          {"tid": tid, "state": "done",
                            "type": sub.get("type"),
                            "description": sub.get("description")})
                 break
@@ -1966,6 +1999,8 @@ SYSTEM_MARKERS = ("<task-notification>", "<command-name>", "<command-message>",
 # 网页发送的斜杠命令在转录里是 <command-name>/<command-args> 的 user 行，
 # 本地命令输出则是 <local-command-stdout> 行，解析成独立 part 供前端渲染命令气泡
 COMMAND_NAME_RE = re.compile(r"<command-name>\s*([^<]+?)\s*</command-name>")
+# 后台异步 Agent 完成时注入的 task-notification，按 tool-use-id 与发起调用配对
+TASK_TOOL_USE_ID_RE = re.compile(r"<tool-use-id>\s*([^<]+?)\s*</tool-use-id>")
 COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 LOCAL_STDOUT_RE = re.compile(r"^<local-command-stdout>\s*(.*?)\s*</local-command-stdout>$", re.S)
 
@@ -2202,7 +2237,10 @@ def make_handler(mon, refresh_interval):
         def log_request(self, code="-", size="-"):
             # GET 轮询太频繁不打印；写操作和出错请求留日志便于排查
             if self.command != "GET" or (isinstance(code, int) and code >= 400):
-                print(f"[http] {self.command} {self.path} -> {code}", flush=True)
+                # 请求行解析失败时 stdlib 只设置 command（None），没有 path，
+                # 回退到 requestline（它在版本校验前就已赋值）
+                path = getattr(self, "path", None) or getattr(self, "requestline", "?")
+                print(f"[http] {self.command} {path} -> {code}", flush=True)
 
         def _json(self, obj, code=200):
             body = json.dumps(obj, ensure_ascii=False, indent=2).encode()
