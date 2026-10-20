@@ -2098,7 +2098,7 @@ def parse_msg_line(ln, clip_len=8000):
     """把一行转录解析为一条消息；无内容返回 None。
 
     返回 {role: user/assistant/tool/system, ts, parts: [...]}。
-    parts 类型：text / tool / tool_result / tool_note。
+    parts 类型：text / tool / tool_result / tool_note / command / command_output。
     """
     if isinstance(ln, bytes):
         ln = ln.decode("utf-8", "replace")
