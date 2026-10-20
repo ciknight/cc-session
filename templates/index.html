@@ -127,6 +127,11 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .choice-free:focus{outline:none;border-color:var(--acc)}
 #pendingbadge,.chip.pending{border-color:rgba(217,119,6,.5);background:rgba(217,119,6,.10);
   color:#b45309;font-weight:600}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.dot.run{background:#f59e0b;animation:dotpulse 1.2s ease-in-out infinite}
+.dot.done{background:#9ca3af}
+.dot.err{background:#ef4444}
+@keyframes dotpulse{0%,100%{opacity:1}50%{opacity:.35}}
 @media(prefers-color-scheme:dark){
   .inter-card{border-left-color:#f59e0b}
   .inter-kind{color:#fbbf24;background:rgba(217,119,6,.18)}
@@ -563,7 +568,8 @@ async function applyCc(cwd){
 
 /* ---------- SSE 实时更新 ---------- */
 const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_message",
-  "tool_use", "tool_error", "turn_finished", "subagent_start", "task_created",
+  "tool_use", "tool_error", "turn_finished", "subagent_start", "subagent_done",
+  "task_created",
   "task_updated", "context_compacted", "api_error", "hosted_turn_done",
   "hosted_api_retry", "hosted_foreign_turn", "interaction_pending",
   "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
@@ -775,7 +781,7 @@ function renderSessionList(p){
           relTime(s.last_event_at),
           dur(s.first_event_at, s.last_event_at) && "时长 " + dur(s.first_event_at, s.last_event_at),
           s.tasks_total && `任务 ${s.tasks_completed}/${s.tasks_total}`,
-          s.subagent_count && `${s.subagent_count} 子代理`,
+          s.subagent_count && `${s.subagent_count} 子代理${s.subagents_running ? ` · ${s.subagents_running} 运行中` : ""}`,
           s.tokens && s.tokens.output && `输出 ${fmtTok(s.tokens.output)} tok`,
         ].filter(Boolean).map(esc).join(" · ")}</div>
         <div class="mut" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.last_user_message || "")}</div>
@@ -800,8 +806,14 @@ function infoHtml(d){
       <span>开始 <b>${d.first_event_at ? new Date(d.first_event_at*1000).toLocaleString() : "?"}</b></span>
     </div>
     ${tools ? `<details class="fold"${detailsAttrs(`info:${sid}:tools`)}><summary>工具调用 (${Object.keys(d.tool_uses).length} 种)</summary><div>${tools}</div></details>` : ""}
-    ${d.subagents && d.subagents.length ? `<details class="fold"${detailsAttrs(`info:${sid}:subagents`)}><summary>子代理 (${d.subagents.length})</summary><ul>` +
-      d.subagents.map(a => `<li><span class="chip">${esc(a.type)}</span> ${esc(a.description)}</li>`).join("") + "</ul></details>" : ""}
+    ${d.subagents && d.subagents.length ? (() => {
+      const run = d.subagents.filter(a => a.state === "running").length;
+      const dot = st => st === "running" ? '<span class="dot run" title="运行中"></span>'
+        : st === "error" ? '<span class="dot err" title="出错"></span>'
+        : '<span class="dot done" title="已完成"></span>';
+      return `<details class="fold"${detailsAttrs(`info:${sid}:subagents`)}><summary>子代理 (${d.subagents.length})${run ? ` · ${run} 运行中` : ""}</summary><ul>` +
+        d.subagents.map(a => `<li>${dot(a.state)}<span class="chip">${esc(a.type)}</span> ${esc(a.description)}</li>`).join("") + "</ul></details>";
+    })() : ""}
     ${d.tasks && d.tasks.length ? `<details class="fold"${detailsAttrs(`info:${sid}:tasks`, true)}><summary>任务 ${d.tasks_completed}/${d.tasks_total}</summary><ul>` +
       d.tasks.map(x => `<li class="${x.status}">[${TASK_ZH[x.status] || x.status}] ${esc(x.subject)}</li>`).join("") + "</ul></details>" : ""}`;
 }

@@ -779,3 +779,26 @@ test('导航同步 URL，并在默认项目解析后替换首页地址', () => {
   b.run('navigate({project:null, session:null, new:false})');
   assert.deepEqual(b.historyCalls[3], ['replace', '/p/F:/code/p']);
 });
+test('子代理折叠区显示运行数与状态圆点', () => {
+  const b = boot();
+  const html = b.run(`infoHtml({id:"s1", tokens:{}, subagents:[
+    {type:"Explore", description:"scan", state:"running"},
+    {type:"claude", description:"write", state:"done"},
+    {type:"claude", description:"bad", state:"error"},
+  ], tasks:[]})`);
+  assert.ok(html.includes('1 运行中'));
+  assert.ok(html.includes('dot run'));
+  assert.ok(html.includes('dot done'));
+  assert.ok(html.includes('dot err'));
+});
+test('会话卡片 chip 显示运行中子代理数', () => {
+  const b = boot();
+  b.run(`renderSessionList({cwd:"/p", sessions:[
+    {id:"s1", state:"idle", subagent_count:3, subagents_running:2},
+    {id:"s2", state:"idle", subagent_count:1, subagents_running:0},
+  ], out:0})`);
+  const html = b.node("main").innerHTML;
+  assert.ok(html.includes('3 子代理 · 2 运行中'));
+  assert.ok(html.includes('1 子代理'));
+  assert.ok(!html.includes('1 子代理 ·'));   // 无运行中时不追加
+});
