@@ -101,6 +101,7 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .ibtn{font:inherit;font-size:13px;padding:4px 14px;border-radius:6px;cursor:pointer;
   border:1px solid var(--bd);background:var(--card);color:var(--fg)}
 .ibtn:hover{border-color:var(--acc)}
+.ibtn:disabled{opacity:.5;cursor:not-allowed;filter:none}
 .ibtn.primary{background:var(--acc);border-color:var(--acc);color:#fff}
 .ibtn.primary:hover{filter:brightness(1.08)}
 .ibtn.secondary{background:none;border-color:var(--acc);color:var(--acc)}
@@ -118,6 +119,9 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .choice-opt:focus-within{outline:2px solid var(--acc);outline-offset:1px}
 .choice-opt input{position:absolute;opacity:0;pointer-events:none}
 .opt-desc{font-size:12px;color:var(--mut)}
+.opt-preview{display:block;margin-top:2px;white-space:pre-wrap;overflow:auto;max-height:180px;
+  font:11px ui-monospace,monospace;color:var(--mut);background:var(--card2);
+  border:1px solid var(--bd);border-radius:4px;padding:4px 6px}
 .choice-free{width:100%;margin-top:6px;background:var(--bg);color:var(--fg);
   border:1px solid var(--bd);border-radius:6px;padding:6px 8px;font:inherit;font-size:13px}
 .choice-free:focus{outline:none;border-color:var(--acc)}
@@ -851,14 +855,11 @@ function convHtml(messages){
   }).join("");
 }
 
-let interCache = {id: null, sig: ""};
-function interactionsHtml(items){
-  if(!items || !items.length) return "";
-  return items.map(it => {
-    const preview = it.preview || {};
-    const iid = esc(it.id);
+function interactionHtml(it){
+  const preview = it.preview || {};
+  const iid = esc(it.id);
     if(it.kind === "plan"){
-      return `<div class="inter-card" data-iid="${iid}">
+      return `<div class="inter-card" data-iid="${iid}" data-sig="${iid}:${esc(it.state)}">
         <div class="inter-head"><span class="inter-kind">计划待确认</span>
           <code class="inter-tool">ExitPlanMode</code></div>
         <pre class="inter-preview">${esc(preview.text || "")}</pre>
@@ -876,6 +877,7 @@ function interactionsHtml(items){
           return `<label class="choice-opt"><input type="${type}" name="${esc(name)}" ` +
             `data-label="${esc(o.label)}"><span>${esc(o.label)}</span>` +
             (o.description ? `<span class="opt-desc">${esc(o.description)}</span>` : "") +
+            (o.preview ? `<span class="opt-preview">${esc(o.preview)}</span>` : "") +
             `</label>`;
         }).join("");
         return `<div class="choice-q" data-q="${esc(q.question)}">
@@ -886,18 +888,20 @@ function interactionsHtml(items){
           <input class="choice-free" placeholder="其他答案（可选）" maxlength="2000">
         </div>`;
       }).join("");
-      return `<div class="inter-card" data-iid="${iid}" data-choice="1">
+      return `<div class="inter-card" data-iid="${iid}" data-choice="1" data-sig="${iid}:${esc(it.state)}">
         <div class="inter-head"><span class="inter-kind">需要你的选择</span>
           <code class="inter-tool">AskUserQuestion</code></div>${questions}
         <div class="inter-actions">
-          <button class="ibtn primary" data-act="choice-submit">提交</button>
-          <button class="back" data-act="deny">跳过</button>
+          <button class="ibtn primary" data-act="choice-submit" disabled
+            title="请先回答所有问题">提交</button>
+          <button class="back" data-act="deny"
+            data-reason="User declined to answer; continue in the conversation.">跳过</button>
         </div></div>`;
     }
     const body = preview.kind === "diff"
       ? `<pre class="inter-preview">${diffHtml(preview.text)}</pre>`
       : `<pre class="inter-preview">${esc(preview.text || "")}</pre>`;
-    return `<div class="inter-card" data-iid="${iid}">
+    return `<div class="inter-card" data-iid="${iid}" data-sig="${iid}:${esc(it.state)}">
       <div class="inter-head"><span class="inter-kind">需要审批</span>
         <code class="inter-tool">${esc(it.tool_name)}</code></div>
       ${it.reason ? `<div class="inter-reason">${esc(it.reason)}</div>` : ""}
@@ -907,7 +911,6 @@ function interactionsHtml(items){
         ${it.allow_always ? '<button class="ibtn secondary" data-act="allow" data-scope="always">始终允许</button>' : ""}
         <button class="ibtn danger" data-act="deny">拒绝</button>
       </div></div>`;
-  }).join("");
 }
 function collectChoiceAnswers(card){
   const answers = {};
@@ -922,13 +925,59 @@ function collectChoiceAnswers(card){
   }
   return answers;
 }
+// choice 卡的互斥与提交启停：勾选选项清空该题的“其他答案”，
+// 输入文字取消该题勾选；所有问题都有答案前提交按钮保持禁用
+function refreshChoiceSubmit(card){
+  const btn = card.querySelector("button[data-act=choice-submit]");
+  if(!btn) return;
+  const answered = [...card.querySelectorAll(".choice-q")].every(q => {
+    const free = q.querySelector(".choice-free");
+    return (free && free.value.trim()) || q.querySelector("input:checked");
+  });
+  btn.disabled = !answered;
+  btn.title = answered ? "" : "请先回答所有问题";
+}
+function wireChoiceCard(card){
+  if(!card || !card.dataset.choice) return;
+  card.querySelectorAll(".choice-q").forEach(q => {
+    const free = q.querySelector(".choice-free");
+    q.querySelectorAll("input[type=checkbox],input[type=radio]").forEach(inp => {
+      inp.addEventListener("change", () => {
+        if(inp.checked && free) free.value = "";
+        refreshChoiceSubmit(card);
+      });
+    });
+    if(free) free.addEventListener("input", () => {
+      if(free.value.trim())
+        q.querySelectorAll("input:checked").forEach(x => x.checked = false);
+      refreshChoiceSubmit(card);
+    });
+  });
+  refreshChoiceSubmit(card);
+}
 function renderInteractions(items){
   const el = document.getElementById("interactions");
   if(!el) return;
-  const sig = JSON.stringify((items || []).map(it => [it.id, it.state]));
-  if(interCache.sig === sig) return;
-  interCache.sig = sig;
-  el.innerHTML = interactionsHtml(items);
+  items = items || [];
+  // 卡片级 diff：以 id:state 为键保留未变的 DOM，作答中的 choice 卡
+  // 不会因其他交互的新增/解决而被重置（丢失勾选和输入）
+  const existing = [...el.querySelectorAll(".inter-card")];
+  const bySig = new Map(existing.map(c => [c.dataset.sig, c]));
+  const wanted = new Set(items.map(it => it.id + ":" + it.state));
+  for(const c of existing) if(!wanted.has(c.dataset.sig)) c.remove();
+  let anchor = el.firstChild;
+  for(const it of items){
+    const sig = it.id + ":" + it.state;
+    let card = bySig.get(sig);
+    if(!card){
+      const tpl = document.createElement("template");
+      tpl.innerHTML = interactionHtml(it);
+      card = tpl.content.firstElementChild;
+      wireChoiceCard(card);
+    }
+    if(card !== anchor) el.insertBefore(card, anchor);
+    anchor = card.nextSibling;
+  }
 }
 async function respondInteraction(card, act, scope, reason){
   if(!card) return;
@@ -959,12 +1008,12 @@ async function respondInteraction(card, act, scope, reason){
     });
     const j = await r.json();
     if(!r.ok) throw Error(j.error || ("HTTP " + r.status));
-    interCache.sig = "";
     load();
   }catch(e){
     if(card.insertAdjacentHTML)
       card.insertAdjacentHTML("beforeend", `<div class="terror">${esc(e.message)}</div>`);
     buttons.forEach(b => b.disabled = false);
+    refreshChoiceSubmit(card);   // 恢复按作答状态启停，而不是一律可点
   }
 }
 function updateHostedControls(d){
@@ -1061,7 +1110,6 @@ async function renderConversation(id, force){
         curPanel = {type: "conv", key: id};
         bindModel(id, d.selected_model);
         loadModelOptions(id, d.cwd);
-        interCache = {id, sig: ""};
         connectSessionSse(id);
       }
       applySessionDetail(d);
@@ -1396,7 +1444,6 @@ function clearSessionView(){
   convCache = {id: null, size: -1};
   convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
                hasMore: false, loadingEarlier: false};
-  interCache = {id: null, sig: ""};
 }
 function navigate(next, opts){
   next = next || {project: null, session: null, new: false};

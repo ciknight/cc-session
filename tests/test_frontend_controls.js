@@ -539,8 +539,8 @@ test('不可用 cc-switch 不执行写入，目标 pending 不互相阻塞', asy
 });
 test('审批卡片与富工具结果渲染，中断按钮随托管状态启用', () => {
   const b=boot();
-  const card=b.run('interactionsHtml([{id:"r1",tool_name:"Bash",preview:{kind:"text",text:"ls -la"},' +
-    'allow_always:true,reason:"runs a command"}])');
+  const card=b.run('interactionHtml({id:"r1",tool_name:"Bash",preview:{kind:"text",text:"ls -la"},' +
+    'allow_always:true,reason:"runs a command",state:"pending"})');
   assert.match(card,/需要审批/); assert.match(card,/始终允许/); assert.match(card,/ls -la/);
   const result=b.run('convHtml([{role:"assistant",ts:0,parts:[{type:"tool",name:"Edit",' +
     'input:"{}",result:{kind:"diff",text:"-old"+String.fromCharCode(10)+"+new"}}]}])');
@@ -607,16 +607,20 @@ test('对话分页状态渲染与加载更早按钮', () => {
 });
 test('计划与选择卡片渲染及答案收集', () => {
   const b=boot();
-  const plan=b.run('interactionsHtml([{id:"p1",kind:"plan",' +
-    'preview:{kind:"text",text:"# Plan"}}])');
+  const plan=b.run('interactionHtml({id:"p1",kind:"plan",state:"pending",' +
+    'preview:{kind:"text",text:"# Plan"}})');
   assert.match(plan,/批准计划/); assert.match(plan,/继续规划/);
   assert.match(plan,/keep planning/);
-  const choice=b.run('interactionsHtml([{id:"c1",kind:"choice",questions:[' +
+  const choice=b.run('interactionHtml({id:"c1",kind:"choice",state:"pending",questions:[' +
     '{question:"Q1",header:"URL 方案",multiSelect:true,' +
-    'options:[{label:"A",description:"说明 A"},{label:"B"}]}]}])');
+    'options:[{label:"A",description:"说明 A"},{label:"B",preview:"code B"}]}]})');
   assert.match(choice,/checkbox/); assert.match(choice,/Q1/);
   assert.match(choice,/URL 方案/); assert.match(choice,/说明 A/);
   assert.match(choice,/choice-opt/); assert.match(choice,/data-act="choice-submit"/);
+  // 选项 preview 渲染为等宽块；提交按钮初始禁用；跳过带明确拒绝语义
+  assert.match(choice,/opt-preview/); assert.match(choice,/code B/);
+  assert.match(choice,/choice-submit" disabled/);
+  assert.match(choice,/declined to answer; continue in the conversation/);
   const free=b.run('collectChoiceAnswers({querySelectorAll:()=>[' +
     '{dataset:{q:"Q1"},querySelector:()=>({value:"custom"}),querySelectorAll:()=>[]}]})');
   assert.equal(JSON.stringify(free), JSON.stringify({Q1:'custom'}));
@@ -624,6 +628,59 @@ test('计划与选择卡片渲染及答案收集', () => {
     '{dataset:{q:"Q1"},querySelector:()=>null,' +
     'querySelectorAll:()=>[{dataset:{label:"A"}},{dataset:{label:"B"}}]}]})');
   assert.equal(JSON.stringify(picked), JSON.stringify({Q1:'A, B'}));
+});
+test('交互卡片按卡片级 diff 保留作答中的 DOM，提交按钮随作答启停', () => {
+  const b=boot();
+  // 给 interactions 容器与 template 装最小 DOM shim
+  const el=b.node('interactions');
+  const children=[];
+  Object.defineProperty(el,'firstChild',{get:()=>children[0]||null});
+  el.querySelectorAll=()=>[...children];
+  el.insertBefore=(card,anchor)=>{
+    const i=anchor?children.indexOf(anchor):children.length;
+    children.splice(i<0?children.length:i,0,card); return card;};
+  let seq=0;
+  b.context.document.createElement=()=>{
+    const card={dataset:{sig:'sig-'+(++seq)},removed:false,
+      remove(){this.removed=true;const i=children.indexOf(this);if(i>=0)children.splice(i,1);},
+      querySelector(){return null;},querySelectorAll(){return [];}};
+    Object.defineProperty(card,'nextSibling',{get(){return children[children.indexOf(this)+1]||null;}});
+    const tpl={};
+    // data-sig 是 diff 的键，从 interactionHtml 生成的 HTML 里解析回卡片
+    Object.defineProperty(tpl,'innerHTML',{set(v){
+      const m=v.match(/data-sig="([^"]*)"/); if(m) card.dataset.sig=m[1];}});
+    Object.defineProperty(tpl,'content',{value:{firstElementChild:card}});
+    return tpl;};
+  const choiceA={id:'a',state:'pending',kind:'choice',questions:[]};
+  const permB={id:'b',state:'pending',tool_name:'Bash',preview:{kind:'text',text:'ls'}};
+  const permC={id:'c',state:'pending',tool_name:'Bash',preview:{kind:'text',text:'pwd'}};
+  b.run(`renderInteractions([${JSON.stringify(choiceA)},${JSON.stringify(permB)}])`);
+  assert.equal(children.length,2);
+  const cardA=children[0];
+  // 其他交互解决/新增：作答中的 choice 卡 DOM 原样保留，勾选和输入不丢失
+  b.run(`renderInteractions([${JSON.stringify(choiceA)},${JSON.stringify(permC)}])`);
+  assert.equal(children[0],cardA);
+  assert.equal(children.length,2);
+  // 自身状态变化（解决）才重建
+  b.run(`renderInteractions([${JSON.stringify({...choiceA,state:'allowed'})}])`);
+  assert.notEqual(children[0],cardA);
+  b.run('renderInteractions([])');
+  assert.equal(children.length,0);
+  // refreshChoiceSubmit：每题都有答案（自由文本或勾选）才启用提交
+  const disabled=b.run('(function(){const btn={disabled:true,title:"t"};' +
+    'const mkq=(free,checked)=>({querySelector:s=>s===".choice-free"?{value:free}:' +
+    '(s==="input:checked"?(checked[0]||null):null),' +
+    'querySelectorAll:s=>checked});' +
+    'const card={querySelector:s=>btn,querySelectorAll:s=>[mkq("hi",[]),mkq("",[])]};' +
+    'refreshChoiceSubmit(card);return btn.disabled;})()');
+  assert.equal(disabled,true);
+  const enabled=b.run('(function(){const btn={disabled:true,title:"t"};' +
+    'const mkq=(free,checked)=>({querySelector:s=>s===".choice-free"?{value:free}:' +
+    '(s==="input:checked"?(checked[0]||null):null),' +
+    'querySelectorAll:s=>checked});' +
+    'const card={querySelector:s=>btn,querySelectorAll:s=>[mkq("hi",[]),mkq("",[{dataset:{label:"A"}}])]};' +
+    'refreshChoiceSubmit(card);return btn.disabled;})()');
+  assert.equal(enabled,false);
 });
 test('SSE 事件触发的列表刷新遵循用户设置的间隔', async () => {
   const requested = [];
