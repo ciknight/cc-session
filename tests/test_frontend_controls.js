@@ -853,3 +853,26 @@ test('202 后保留 sendJobs 原文，命令状态文案不中断', async () => 
   // 反向断言：queued/running 阶段不应回落成裸的普通文案
   assert.ok(!texts.includes('排队中…'), '202 后不应丢失命令前缀，实际: ' + JSON.stringify(texts));
 });
+
+test('echoVisible 按文本对账', () => {
+  const b = boot();
+  assert.equal(b.run(`echoVisible([], {text:" hi "})`), true);
+  assert.equal(b.run(`echoVisible([{role:"user", parts:[{type:"text", text:"hi"}]}], {text:"hi"})`), false);
+  assert.equal(b.run(`echoVisible([{role:"assistant", parts:[{type:"text", text:"hi"}]}], {text:"hi"})`), true);
+  assert.equal(b.run(`echoVisible(null, {text:"hi"})`), false);
+  assert.equal(b.run(`echoVisible([], null)`), false);
+});
+
+test('发送 202 后 pendingEcho 记录', async () => {
+  const b = boot(async(url) => {
+    if(url === "/sessions/sid/message") return {ok:true, status:202, json:async()=>({job_id:"j1"})};
+    if(url === "/jobs/j1") return response({status:"done"});
+    return response({});
+  });
+  b.context.setTimeout = callback => { callback(); return 1; };
+  b.run('bindSendBox("sid", {})');
+  b.node("msgbox").value = "hello";
+  b.node("sendbtn").click();
+  for(let i = 0; i < 30; i++) await Promise.resolve();
+  assert.equal(b.run(`pendingEcho["sid"]?.text`), "hello");
+});

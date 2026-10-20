@@ -67,6 +67,9 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .ubody{background:var(--accbg);border-radius:10px;padding:8px 12px;white-space:pre-wrap;word-break:break-word;max-width:85%}
 .msg.user{display:flex;flex-direction:column;align-items:flex-end}
 .msg.user .mhead{text-align:right}
+.msg.user.pending{opacity:.55}
+.msg.user.pending.failed{opacity:1}
+.msg.user.pending.failed .mhead{color:#ef4444}
 .abody{max-width:100%;word-break:break-word}
 .abody pre{background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:8px 10px;overflow-x:auto;font-size:12.5px}
 .abody code{font-family:ui-monospace,monospace;font-size:12.5px;background:var(--card2);padding:0 3px;border-radius:4px}
@@ -231,6 +234,7 @@ let liveText = "", liveRaf = null;
 let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
                                    // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
+let pendingEcho = {};              // sid -> {text, failed} 发送后未落盘的本地回显
 
 /* ---------- 工具 ---------- */
 function relTime(ts){
@@ -1048,7 +1052,10 @@ let convLoading = null;     // 正在拉取对话的会话 id，防止同一会�
 function renderConvList(){
   const el = document.getElementById("conv");
   if(!el) return;
-  el.innerHTML = convHtml(convState.msgs.slice().reverse()) +
+  const echo = pendingEcho[convState.id];
+  if(echo && !echoVisible(convState.msgs, echo)) delete pendingEcho[convState.id];
+  const echoOut = pendingEcho[convState.id] ? echoHtml(pendingEcho[convState.id]) : "";
+  el.innerHTML = echoOut + convHtml(convState.msgs.slice().reverse()) +
     (convState.hasMore
       ? '<div style="text-align:center;margin:10px 0">' +
         '<button class="back" id="loadearlier">加载更早</button></div>'
@@ -1211,6 +1218,23 @@ function sendJobText(id){
   if(j.status === "failed") return "失败: " + (j.error || "未知错误");
   return "";
 }
+function echoVisible(messages, echo){
+  // 转录里出现同文本 user 消息后回显退场；只查最近 20 条，避免长对话全量比对
+  if(!echo || !echo.text || !messages) return false;
+  const t = echo.text.trim();
+  for(let i = messages.length - 1; i >= 0 && i >= messages.length - 20; i--){
+    const m = messages[i];
+    if(m.role !== "user") continue;
+    for(const p of m.parts || [])
+      if(p.type === "text" && (p.text || "").trim() === t) return false;
+  }
+  return true;
+}
+function echoHtml(echo){
+  return `<div class="msg user pending${echo.failed ? " failed" : ""}">` +
+    `<div class="mhead">用户 · ${echo.failed ? "发送失败" : "发送中…"}</div>` +
+    `<div class="ubody">${esc(echo.text)}</div></div>`;
+}
 function panelMatch(id){
   // 当前显示的面板是否属于该任务 key：后台轮询循环在用户切走后仍会存活，
   // 不检查就会把 A 会话的状态写进 B 会话/新建会话的输入区、禁用它们的按钮
@@ -1275,6 +1299,7 @@ function bindNewBox(p){
       modelProfileOptions[sid] = modelProfileOptions[key] || [];
       sendJobs[sid] = sendJobs[key] || sendJobs[sid];   // 任务状态改挂到新会话 id 名下
       delete sendJobs[key];
+      pendingEcho[sid] = {text};   // 新会话转录尚未就绪，先在对话顶部本地回显
       if(view.new && view.project === p.cwd){
         // 新建页是一次性入口，用 replace 换成会话地址，返回时直接回到项目列表
         navigate({project: p.cwd, session: sid, new: false}, {replace: true});
@@ -1298,6 +1323,7 @@ function bindNewBox(p){
       for(;;){
         if(Date.now() >= deadline){
           sendJobs[sid || key] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
+          if(pendingEcho[sid]) pendingEcho[sid].failed = true;   // sid 未知时无对话区可显示，跳过
           updateSendSt(sid || key);
           break;
         }
@@ -1334,6 +1360,7 @@ function bindNewBox(p){
       }
     }catch(e){
       sendJobs[sid || key] = {status: "failed", error: String(e)};
+      if(pendingEcho[sid]) pendingEcho[sid].failed = true;   // sid 未知时无对话区可显示，跳过
       updateSendSt(sid || key);
     }
   };
@@ -1408,6 +1435,7 @@ function bindSendBox(id, d){
       const j = await r.json();
       if(r.status !== 202){
         sendJobs[id] = {status: "failed", error: j.error || ("HTTP " + r.status)};
+        if(pendingEcho[id]) pendingEcho[id].failed = true;
         updateSendSt(id); return;
       }
       const box = document.getElementById("msgbox");
@@ -1415,6 +1443,8 @@ function bindSendBox(id, d){
       // 202 后立刻解除“发送中”锁定：托管会话可以继续排队，不必等整轮结束。
       sendJobs[id] = {jobId: j.job_id, status: j.status || "queued",
                       text: (sendJobs[id] || {}).text};
+      pendingEcho[id] = {text};   // 本地回显：转录落盘前先在对话顶部显示
+      renderConvList();
       updateSendSt(id);
       // 本次刚启动托管时重建一次面板，让“托管中/退出托管”控件立即出现；
       // 已有托管或一次性消息只做软刷新，避免打断正在输入的下一条消息。
@@ -1424,6 +1454,7 @@ function bindSendBox(id, d){
       for(;;){
         if(Date.now() >= deadline){
           sendJobs[id] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
+          if(pendingEcho[id]) pendingEcho[id].failed = true;
           updateSendSt(id);
           break;
         }
@@ -1441,6 +1472,7 @@ function bindSendBox(id, d){
       load();   // 软刷新最终状态，不重建输入区
     }catch(e){
       sendJobs[id] = {status: "failed", error: String(e)};
+      if(pendingEcho[id]) pendingEcho[id].failed = true;
       updateSendSt(id);
     }
   };
