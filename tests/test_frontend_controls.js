@@ -892,3 +892,50 @@ test('job 终态失败后回显标记发送失败', async () => {
   for(let i = 0; i < 30; i++) await Promise.resolve();
   assert.equal(b.run(`pendingEcho["sid"]?.failed`), true);
 });
+
+test('旧任务失败不污染最新一条回显', async () => {
+  // 托管会话运行中可继续发送：第二条发送覆盖 pendingEcho 后，
+  // 第一条的轮询循环才收到 job failed——文本守卫应拦住，不把新回显标成失败
+  let gate, post = 0, j1polls = 0;
+  const b = boot(async(url) => {
+    if(url === '/sessions/sid/message'){
+      post++;
+      return {ok:true, status:202, json:async()=>({job_id: post === 1 ? 'j1' : 'j2'})};
+    }
+    if(url === '/jobs/j1'){
+      j1polls++;
+      if(j1polls === 1) return new Promise(r => gate = r);   // 挂起第一条的轮询
+      return response({status:'failed', error:'x'});
+    }
+    if(url === '/jobs/j2') return response({status:'done'});
+    return response({});
+  });
+  b.context.setTimeout = callback => { callback(); return 1; };
+  b.run('bindSendBox("sid", {})');
+  b.node('msgbox').value = 'first';
+  b.node('sendbtn').click();                        // 第一条发送并停在轮询
+  for(let i = 0; i < 30; i++) await Promise.resolve();
+  assert.equal(b.run(`pendingEcho["sid"]?.text`), 'first');
+  b.node('msgbox').value = 'second';
+  await b.node('sendbtn').onclick();                // 第二条完整走完（done）
+  assert.equal(b.run(`pendingEcho["sid"]?.text`), 'second');
+  gate(response({status:'failed', error:'x'}));     // 旧任务此时才失败
+  for(let i = 0; i < 50; i++) await Promise.resolve();
+  assert.equal(b.run(`pendingEcho["sid"]?.text`), 'second');
+  assert.equal(b.run(`pendingEcho["sid"]?.failed`), undefined,
+    '旧任务的失败不应标记最新回显');
+});
+
+test('renderConvList 对账：落盘回显退场，未落盘保留', () => {
+  const b = boot();
+  b.run(`convState = {id:"sid", total:1, hasMore:false, loadingEarlier:false,
+    msgs:[{role:"user", ts:1, parts:[{type:"text", text:"hello"}]}]}`);
+  b.run('pendingEcho["sid"] = {text:"hello"}');
+  b.run('renderConvList()');
+  assert.equal(b.run('pendingEcho["sid"]'), undefined);
+  assert.ok(!b.node('conv').innerHTML.includes('pending'), '落盘的回显不应再渲染');
+  b.run('pendingEcho["sid"] = {text:"not yet"}');
+  b.run('renderConvList()');
+  assert.ok(b.node('conv').innerHTML.includes('pending'));
+  assert.ok(b.node('conv').innerHTML.includes('not yet'));
+});
