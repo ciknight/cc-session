@@ -115,6 +115,17 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual(self.sess.subagents[0]["state"], "done")
         self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 0)
 
+    def test_interrupted_agent_collected_at_turn_duration(self):
+        # 回合被中断时不会有 tool_result：turn_duration 权威结束时把运行中条目收尾
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "scan"}}], stop_reason="tool_use")
+        self.mon.handle_line(self.sess, json.dumps({
+            "type": "system", "subtype": "turn_duration", "durationMs": 1234,
+            "timestamp": self.timestamp(self.now),
+        }))
+        self.assertEqual(self.sess.subagents[0]["state"], "done")
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["subagents_running"], 0)
+
     def test_subagent_entry_error_on_error_result(self):
         self.line("assistant", [{
             "type": "tool_use", "id": "a1", "name": "Agent",

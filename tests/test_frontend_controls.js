@@ -865,18 +865,24 @@ test('echoVisible 按文本对账', () => {
   assert.equal(b.run(`echoVisible([{role:"system", parts:[{type:"command", command:"/compact"}]}], {text:"/compact"})`), false);
 });
 
-test('发送 202 后 pendingEcho 记录', async () => {
+test('发送 202 后 pendingEcho 记录并在完成后清除', async () => {
+  // 202 后立即有回显；job 到达非 failed 终态时消息必已落盘，未对账的回显兜底清除
+  const echoStates = [];
   const b = boot(async(url) => {
     if(url === "/sessions/sid/message") return {ok:true, status:202, json:async()=>({job_id:"j1"})};
     if(url === "/jobs/j1") return response({status:"done"});
     return response({});
   });
+  b.context.echoStates = echoStates;
   b.context.setTimeout = callback => { callback(); return 1; };
-  b.run('bindSendBox("sid", {})');
+  b.run('curPanel={type:"conv",key:"sid"}; modelDraft("sid", null); bindSendBox("sid", {});');
+  // 每次状态更新时采样回显文本，覆盖 202 后、轮询中的窗口
+  b.run('const _oldUpd2 = updateSendSt; updateSendSt = id => { _oldUpd2(id); echoStates.push(pendingEcho["sid"]?.text); };');
   b.node("msgbox").value = "hello";
   b.node("sendbtn").click();
   for(let i = 0; i < 30; i++) await Promise.resolve();
-  assert.equal(b.run(`pendingEcho["sid"]?.text`), "hello");
+  assert.ok(echoStates.includes("hello"), "202 后应有回显，实际: " + JSON.stringify(echoStates));
+  assert.equal(b.run(`pendingEcho["sid"]`), undefined, "job 完成后回显应兜底清除");
 });
 
 test('job 终态失败后回显标记发送失败', async () => {
@@ -896,7 +902,7 @@ test('job 终态失败后回显标记发送失败', async () => {
 test('旧任务失败不污染最新一条回显', async () => {
   // 托管会话运行中可继续发送：第二条发送覆盖 pendingEcho 后，
   // 第一条的轮询循环才收到 job failed——文本守卫应拦住，不把新回显标成失败
-  let gate, post = 0, j1polls = 0;
+  let gateJ1, gateJ2, post = 0, j1polls = 0, j2polls = 0;
   const b = boot(async(url) => {
     if(url === '/sessions/sid/message'){
       post++;
@@ -904,10 +910,14 @@ test('旧任务失败不污染最新一条回显', async () => {
     }
     if(url === '/jobs/j1'){
       j1polls++;
-      if(j1polls === 1) return new Promise(r => gate = r);   // 挂起第一条的轮询
+      if(j1polls === 1) return new Promise(r => gateJ1 = r);   // 挂起第一条的轮询
       return response({status:'failed', error:'x'});
     }
-    if(url === '/jobs/j2') return response({status:'done'});
+    if(url === '/jobs/j2'){
+      j2polls++;
+      if(j2polls === 1) return new Promise(r => gateJ2 = r);   // 第二条也停在轮询，回显保持在场
+      return response({status:'done'});
+    }
     return response({});
   });
   b.context.setTimeout = callback => { callback(); return 1; };
@@ -917,13 +927,19 @@ test('旧任务失败不污染最新一条回显', async () => {
   for(let i = 0; i < 30; i++) await Promise.resolve();
   assert.equal(b.run(`pendingEcho["sid"]?.text`), 'first');
   b.node('msgbox').value = 'second';
-  await b.node('sendbtn').onclick();                // 第二条完整走完（done）
+  const p2 = b.node('sendbtn').onclick();           // 第二条发送，轮询同样挂起
+  for(let i = 0; i < 30; i++) await Promise.resolve();
   assert.equal(b.run(`pendingEcho["sid"]?.text`), 'second');
-  gate(response({status:'failed', error:'x'}));     // 旧任务此时才失败
+  gateJ1(response({status:'failed', error:'x'}));    // 旧任务此时才失败
   for(let i = 0; i < 50; i++) await Promise.resolve();
-  assert.equal(b.run(`pendingEcho["sid"]?.text`), 'second');
+  assert.equal(b.run(`pendingEcho["sid"]?.text`), 'second',
+    '旧任务的失败不应清除/影响最新回显');
   assert.equal(b.run(`pendingEcho["sid"]?.failed`), undefined,
     '旧任务的失败不应标记最新回显');
+  gateJ2(response({status:'done'}));                 // 第二条 done：兜底清除自己的回显
+  await p2;
+  for(let i = 0; i < 30; i++) await Promise.resolve();
+  assert.equal(b.run(`pendingEcho["sid"]`), undefined, 'done 终态应兜底清除回显');
 });
 
 test('renderConvList 对账：落盘回显退场，未落盘保留', () => {

@@ -857,6 +857,15 @@ class Monitor:
                 sess.last_turn_end_ts = ts_epoch or now_ts()
                 # turn_duration 是权威结束标记：清掉可能因中断而没有结果的 tool id
                 sess.pending_tools.clear()
+                # 中断的 Agent 调用不会再有 tool_result：运行中的子代理条目一并收尾，
+                # 否则“运行中”计数和脉动圆点会永久残留
+                for sub in sess.subagents:
+                    if sub.get("state") == "running":
+                        sub["state"] = "done"
+                        self.emit(sess, "subagent_done",
+                                  {"tid": sub.get("tid"), "state": "done",
+                                   "type": sub.get("type"),
+                                   "description": sub.get("description")})
                 sess.last_api_error = None
                 if not sess.active_agents:
                     self._set_idle(sess)

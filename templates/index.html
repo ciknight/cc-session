@@ -1238,6 +1238,21 @@ function echoHtml(echo){
     `<div class="mhead">用户 · ${echo.failed ? "发送失败" : "发送中…"}</div>` +
     `<div class="ubody">${esc(echo.text)}</div></div>`;
 }
+function markEchoFailed(key, text){
+  // 文本守卫：回显已被后续发送覆盖时不标（旧任务的失败不污染最新一条）；
+  // 标红后立刻重渲染，不等下一次定时刷新
+  const e = pendingEcho[key];
+  if(e && e.text === text && !e.failed){
+    e.failed = true;
+    renderConvList();
+  }
+}
+function settleEcho(key, text){
+  // job 到达非 failed 终态时消息必已落盘：未对账的回显直接清除兜底
+  // （超长命令被后端截断、对账永不命中的场景），避免永久停在“发送中…”
+  const e = pendingEcho[key];
+  if(e && e.text === text && !e.failed) delete pendingEcho[key];
+}
 function panelMatch(id){
   // 当前显示的面板是否属于该任务 key：后台轮询循环在用户切走后仍会存活，
   // 不检查就会把 A 会话的状态写进 B 会话/新建会话的输入区、禁用它们的按钮
@@ -1326,7 +1341,7 @@ function bindNewBox(p){
       for(;;){
         if(Date.now() >= deadline){
           sendJobs[sid || key] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
-          if(pendingEcho[sid] && pendingEcho[sid].text === text) pendingEcho[sid].failed = true;   // sid 未知时无对话区可显示，跳过
+          if(sid) markEchoFailed(sid, text);   // sid 未知时无对话区可显示，跳过
           updateSendSt(sid || key);
           break;
         }
@@ -1361,12 +1376,13 @@ function bindNewBox(p){
         if(jr.status === "running" || jr.status === "queued") continue;
         // 服务端执行失败的回合没有转录落盘，回显不能停在"发送中…"；
         // 文本守卫防止旧任务失败污染已被后续发送覆盖的最新回显
-        if(jr.status === "failed" && pendingEcho[sid] && pendingEcho[sid].text === text) pendingEcho[sid].failed = true;
+        if(jr.status === "failed" && sid) markEchoFailed(sid, text);
+        else if(sid) settleEcho(sid, text);
         break;
       }
     }catch(e){
       sendJobs[sid || key] = {status: "failed", error: String(e)};
-      if(pendingEcho[sid] && pendingEcho[sid].text === text) pendingEcho[sid].failed = true;   // sid 未知时无对话区可显示，跳过
+      if(sid) markEchoFailed(sid, text);   // sid 未知时无对话区可显示，跳过
       updateSendSt(sid || key);
     }
   };
@@ -1441,7 +1457,7 @@ function bindSendBox(id, d){
       const j = await r.json();
       if(r.status !== 202){
         sendJobs[id] = {status: "failed", error: j.error || ("HTTP " + r.status)};
-        if(pendingEcho[id] && pendingEcho[id].text === text) pendingEcho[id].failed = true;
+        markEchoFailed(id, text);
         updateSendSt(id); return;
       }
       const box = document.getElementById("msgbox");
@@ -1460,7 +1476,7 @@ function bindSendBox(id, d){
       for(;;){
         if(Date.now() >= deadline){
           sendJobs[id] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
-          if(pendingEcho[id] && pendingEcho[id].text === text) pendingEcho[id].failed = true;
+          markEchoFailed(id, text);
           updateSendSt(id);
           break;
         }
@@ -1475,13 +1491,14 @@ function bindSendBox(id, d){
         if(jr.status === "running" || jr.status === "queued") continue;
         // 服务端执行失败的回合没有转录落盘，回显不能停在"发送中…"；
         // 文本守卫防止旧任务失败污染已被后续发送覆盖的最新回显
-        if(jr.status === "failed" && pendingEcho[id] && pendingEcho[id].text === text) pendingEcho[id].failed = true;
+        if(jr.status === "failed") markEchoFailed(id, text);
+        else settleEcho(id, text);
         break;
       }
       load();   // 软刷新最终状态，不重建输入区
     }catch(e){
       sendJobs[id] = {status: "failed", error: String(e)};
-      if(pendingEcho[id] && pendingEcho[id].text === text) pendingEcho[id].failed = true;
+      markEchoFailed(id, text);
       updateSendSt(id);
     }
   };
