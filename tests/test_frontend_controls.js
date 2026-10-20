@@ -564,6 +564,20 @@ test('全局待审批计数显示与隐藏', () => {
   b.run('renderPendingBadge()');
   assert.equal(b.node('pendingbadge').style.display,'none');
 });
+test('全局托管计数显示、隐藏与点击跳转', () => {
+  const b=boot();
+  b.run('sessions=[{id:"a",hosted:true},{id:"b",hosted:false},{id:"c",hosted:true}]');
+  b.run('renderHostedBadge()');
+  assert.equal(b.node('hostedbadge').textContent,'托管 2');
+  assert.equal(b.node('hostedbadge').style.display,'inline-block');
+  b.run('sessions=[{id:"a",hosted:false}]');
+  b.run('renderHostedBadge()');
+  assert.equal(b.node('hostedbadge').style.display,'none');
+  // 有托管时点击跳到第一个托管会话
+  b.run('sessions=[{id:"a",project:"/p",hosted:false},{id:"b",project:"/p",hosted:true}]');
+  b.node('hostedbadge').click();
+  assert.deepEqual(b.run('view'), {project:"/p",session:"b",new:false});
+});
 test('项目侧栏按名称固定排序，首次进入仍选中最近活跃项目', () => {
   const b=boot();
   const pairs = [

@@ -87,9 +87,9 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
   （`--permission-timeout` 默认 300 秒，超时自动拒绝），`full` 由服务自动放行。
 - **工作时发送**：托管会话在 `working` 时消息进入 `Hosted.pending` 队列；非托管一次性消息
   进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动派发下一条（每会话上限 32）。
-  网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“工作状态下也发送”
-  默认勾选，会以 `force` 绕过 working 检查。新建会话的托管模式也会把对话框里的审批选择
-  作为首轮 `/hosted` 的 `approval` 提交。
+  网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“工作状态下也发送”与
+  “托管（常驻进程）”默认勾选，前者以 `force` 绕过 working 检查。新建会话的托管模式也会把
+  对话框里的审批选择作为首轮 `/hosted` 的 `approval` 提交。
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有
   `completed/cancelled/discarded/refused/dropped` 结束回合。

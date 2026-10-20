@@ -1,5 +1,6 @@
 import json
 import queue
+import socket
 import subprocess
 import tempfile
 import threading
@@ -61,6 +62,16 @@ class ManagementAPITests(unittest.TestCase):
         with self.assertRaises(HTTPError) as invalid:
             self.request("/sessions/sid-1/model", {"model": []}, {"Content-Type": "application/json"})
         self.assertEqual(invalid.exception.code, 400)
+
+    def test_malformed_request_version_returns_400_without_crashing_logger(self):
+        # 请求行版本号非法时 stdlib 只设置 command(None)，没有 path；
+        # log_request 不应因此崩溃，客户端应收到 400 错误页而不是连接被掐断。
+        # 此时 request_version 回退为 HTTP/0.9，stdlib 不发状态行/头，只有 body
+        with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3) as sock:
+            sock.sendall(b"GET / HTTP/9x.9\r\n\r\n")
+            data = sock.recv(4096)
+        self.assertIn(b"Error code: 400", data)
+        self.assertIn(b"Bad request version", data)
 
     def test_spa_route_serves_index_html(self):
         for path in ("/", "/p/demo%5Cproject"):

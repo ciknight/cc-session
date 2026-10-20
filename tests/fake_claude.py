@@ -84,6 +84,16 @@ for line in sys.stdin:
                                             "destination": "session",
                                             "rules": [{"toolName": "Edit"}]}],
                 "decision_reason": "writes a file"}})
+        elif text == "ask":
+            # AskUserQuestion 的 can_use_tool 兜底路径（PreToolUse hook 未生效时）
+            pending_permission_uuid = uuid
+            emit({"type": "control_request", "request_id": "req-1", "request": {
+                "subtype": "can_use_tool", "tool_name": "AskUserQuestion",
+                "tool_use_id": "ask-1",
+                "input": {"questions": [
+                    {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]}]},
+                "permission_suggestions": [],
+                "decision_reason": "asks the user"}})
         elif text == "plan":
             pending_permission_uuid = uuid
             emit({"type": "control_request", "request_id": "req-1", "request": {

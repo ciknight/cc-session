@@ -702,7 +702,11 @@ class Monitor:
     def hook_command(self):
         args = [sys.executable, str(Path(__file__).resolve()), "hook",
                 "--port", str(self.http_port), "--token", self.hook_token]
-        return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+        if os.name == "nt":
+            # Claude Code 在 Windows 上经 Git Bash 执行 hook，反斜杠路径会被 bash
+            # 当转义吃掉（F:\code\... → F:code... → exit 127），必须换成正斜杠
+            return subprocess.list2cmdline(args).replace("\\", "/")
+        return shlex.join(args)
 
     def pending_interactions(self, sid=None):
         with self.lock:
@@ -1763,7 +1767,15 @@ class Hosted:
         request_id = obj.get("request_id")
         if not request_id:
             return
-        inter = Interaction(request_id, self, obj.get("request") or {})
+        request = obj.get("request") or {}
+        kind = questions = None
+        if request.get("tool_name") == "AskUserQuestion":
+            # PreToolUse hook 未生效时的兜底路径：仍按问答卡呈现，
+            # 网页才能逐题作答，而不是只能整卡放行/拒绝
+            kind = "choice"
+            questions = (request.get("input") or {}).get("questions") or []
+        inter = Interaction(request_id, self, request,
+                            kind=kind, questions=questions)
         with self.mon.lock:
             if request_id in self.mon.interactions:
                 return
@@ -1784,7 +1796,12 @@ class Hosted:
 
     def _write_interaction(self, inter):
         if inter.behavior == "allow":
-            response = {"behavior": "allow", "updatedInput": inter.updated_input}
+            updated_input = inter.updated_input
+            if inter.answers:
+                # choice 作答后把 answers 合入工具输入，CLI 才能拿到用户的回答
+                updated_input = dict(updated_input)
+                updated_input["answers"] = inter.answers
+            response = {"behavior": "allow", "updatedInput": updated_input}
             if inter.scope == "always":
                 response["updatedPermissions"] = inter.suggestions
         else:

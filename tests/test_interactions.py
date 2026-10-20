@@ -145,6 +145,30 @@ class InteractionTests(unittest.TestCase):
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["matcher"],
                          "AskUserQuestion")
 
+    def test_hook_command_posix_paths_for_bash(self):
+        # Claude Code 在 Windows 上经 Git Bash 执行 hook，反斜杠路径会被 bash
+        # 当转义吃掉（生产事故：F:\code\... → F:code...，exit 127，hook 永远失败）
+        self.mon.http_port = 12345
+        self.mon.hook_token = "tok"
+        cmd = self.mon.hook_command()
+        self.assertNotIn("\\", cmd)
+        self.assertIn(" hook ", f" {cmd} ")
+        self.assertIn("--token", cmd)
+
+    def test_can_use_tool_ask_user_question_is_choice(self):
+        # PreToolUse hook 失败时 AskUserQuestion 降级走 can_use_tool；
+        # 仍应构造为可作答的 choice 卡，而不是只能整卡放行的 permission 卡
+        host, job = self.start_host("ask")
+        self.assertTrue(self.wait_for(lambda: self.mon.pending_interactions("fake-session")))
+        pending = self.mon.pending_interactions("fake-session")[0]
+        self.assertEqual(pending["kind"], "choice")
+        self.assertEqual([q["question"] for q in pending["questions"]], ["Q1"])
+        code, _ = self.mon.respond_interaction(
+            pending["id"], {"behavior": "allow", "answers": {"Q1": "A"}})
+        self.assertEqual(code, 200)
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        self.assertEqual(self.mon.jobs[job]["result"], "decision:allow")
+
     def test_exit_plan_mode_is_plan_kind(self):
         host, job = self.start_host("plan")
         self.assertTrue(self.wait_for(lambda: self.mon.pending_interactions("fake-session")))

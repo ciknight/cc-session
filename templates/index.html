@@ -131,6 +131,8 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .choice-free:focus{outline:none;border-color:var(--acc)}
 #pendingbadge,.chip.pending{border-color:rgba(217,119,6,.5);background:rgba(217,119,6,.10);
   color:#b45309;font-weight:600}
+#hostedbadge{border-color:rgba(22,163,74,.45);background:rgba(22,163,74,.10);
+  color:#15803d;font-weight:600}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
 .dot.run{background:#f59e0b;animation:dotpulse 1.2s ease-in-out infinite}
 .dot.done{background:#9ca3af}
@@ -140,6 +142,7 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
   .inter-card{border-left-color:#f59e0b}
   .inter-kind{color:#fbbf24;background:rgba(217,119,6,.18)}
   #pendingbadge,.chip.pending{color:#fbbf24}
+  #hostedbadge{color:#86efac}
 }
 .sysbody{font-size:12.5px;color:var(--mut);white-space:pre-wrap;word-break:break-word;
          border:1px dashed var(--bd);border-radius:6px;padding:4px 8px;max-width:100%}
@@ -187,6 +190,8 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
     </select>
   </label>
   <span class="ctl" id="updated"></span>
+  <button id="hostedbadge" class="back" style="display:none"
+          title="当前托管（常驻进程）的会话数，点击跳转">托管 0</button>
   <button id="pendingbadge" class="back" style="display:none"
           title="有权限请求等待审批，点击跳转">待审批 0</button>
   <span id="err"></span>
@@ -364,7 +369,7 @@ function composerHtml(mode, d){
       ${isNew ? "" : `<label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
         <input type="checkbox" id="forcecb" checked> 工作状态下也发送</label>`}
       <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
-        <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : ""}> 托管（常驻进程，后续消息不再重启）</label>
+        <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : "checked"}> 托管（常驻进程，后续消息不再重启）</label>
       ${!isNew && d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
         <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
     </div>
@@ -1548,12 +1553,20 @@ function renderPendingBadge(){
   el.style.display = total ? "inline-block" : "none";
   el.textContent = "待审批 " + total;
 }
+function renderHostedBadge(){
+  const total = sessions.filter(s => s.hosted).length;
+  const el = document.getElementById("hostedbadge");
+  if(!el) return;
+  el.style.display = total ? "inline-block" : "none";
+  el.textContent = "托管 " + total;
+}
 function renderMain(){
   const projects = groupByProject();
   resolveViewProject(projects);
   renderSidebar(projects);
   document.getElementById("total").textContent = `(${sessions.length})`;
   renderPendingBadge();
+  renderHostedBadge();
   if(view.session){
     syncUrl(view, true);   // 旧格式编码地址自动规整成可读路径
     renderConversation(view.session, false);
@@ -1603,6 +1616,11 @@ function toggleDrawer(open){
 }
 document.getElementById("pendingbadge").onclick = () => {
   const target = sessions.find(s => s.pending_interactions > 0);
+  if(!target) return;
+  navigate({project: target.project, session: target.id, new: false});
+};
+document.getElementById("hostedbadge").onclick = () => {
+  const target = sessions.find(s => s.hosted);
   if(!target) return;
   navigate({project: target.project, session: target.id, new: false});
 };
