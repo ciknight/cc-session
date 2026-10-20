@@ -861,6 +861,8 @@ test('echoVisible 按文本对账', () => {
   assert.equal(b.run(`echoVisible([{role:"assistant", parts:[{type:"text", text:"hi"}]}], {text:"hi"})`), true);
   assert.equal(b.run(`echoVisible(null, {text:"hi"})`), false);
   assert.equal(b.run(`echoVisible([], null)`), false);
+  assert.equal(b.run(`echoVisible([{role:"system", parts:[{type:"command", command:"/model", args:"deepseek"}]}], {text:"/model deepseek"})`), false);
+  assert.equal(b.run(`echoVisible([{role:"system", parts:[{type:"command", command:"/compact"}]}], {text:"/compact"})`), false);
 });
 
 test('发送 202 后 pendingEcho 记录', async () => {
@@ -875,4 +877,18 @@ test('发送 202 后 pendingEcho 记录', async () => {
   b.node("sendbtn").click();
   for(let i = 0; i < 30; i++) await Promise.resolve();
   assert.equal(b.run(`pendingEcho["sid"]?.text`), "hello");
+});
+
+test('job 终态失败后回显标记发送失败', async () => {
+  const b = boot(async(url) => {
+    if(url === "/sessions/sid/message") return {ok:true, status:202, json:async()=>({job_id:"j1"})};
+    if(url === "/jobs/j1") return response({status:"failed", error:"x"});
+    return response({});
+  });
+  b.context.setTimeout = callback => { callback(); return 1; };
+  b.run('bindSendBox("sid", {})');
+  b.node("msgbox").value = "hello";
+  b.node("sendbtn").click();
+  for(let i = 0; i < 30; i++) await Promise.resolve();
+  assert.equal(b.run(`pendingEcho["sid"]?.failed`), true);
 });

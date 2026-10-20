@@ -1219,14 +1219,17 @@ function sendJobText(id){
   return "";
 }
 function echoVisible(messages, echo){
-  // 转录里出现同文本 user 消息后回显退场；只查最近 20 条，避免长对话全量比对
+  // 转录里出现同文本消息后回显退场；只查最近 20 条，避免长对话全量比对
   if(!echo || !echo.text || !messages) return false;
   const t = echo.text.trim();
   for(let i = messages.length - 1; i >= 0 && i >= messages.length - 20; i--){
     const m = messages[i];
-    if(m.role !== "user") continue;
-    for(const p of m.parts || [])
-      if(p.type === "text" && (p.text || "").trim() === t) return false;
+    for(const p of m.parts || []){
+      // 斜杠命令在转录里是 system 角色的 command part（后端已拆分 command/args）
+      if(p.type === "command" && (p.command + (p.args ? " " + p.args : "")) === t) return false;
+      // 普通文本回显只对 user 消息对账
+      if(m.role === "user" && p.type === "text" && (p.text || "").trim() === t) return false;
+    }
   }
   return true;
 }
@@ -1356,6 +1359,8 @@ function bindNewBox(p){
                                 text: (sendJobs[sid || key] || {}).text};
         updateSendSt(sid || key);
         if(jr.status === "running" || jr.status === "queued") continue;
+        // 服务端执行失败的回合没有转录落盘，回显不能停在"发送中…"
+        if(jr.status === "failed" && pendingEcho[sid]) pendingEcho[sid].failed = true;
         break;
       }
     }catch(e){
@@ -1467,6 +1472,8 @@ function bindSendBox(id, d){
                           text: (sendJobs[id] || {}).text};
         updateSendSt(id);
         if(jr.status === "running" || jr.status === "queued") continue;
+        // 服务端执行失败的回合没有转录落盘，回显不能停在"发送中…"
+        if(jr.status === "failed" && pendingEcho[id]) pendingEcho[id].failed = true;
         break;
       }
       load();   // 软刷新最终状态，不重建输入区
