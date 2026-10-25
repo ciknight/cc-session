@@ -145,7 +145,7 @@ test('新建会话托管时把审批模式提交给 /hosted', async () => {
   b.node('hostcb').checked=true;
   b.node('approvalsel').value='full';
   await b.node('sendbtn').onclick();
-  assert.deepEqual(requests,[{cwd:'/project',text:'hello',model:null,approval:'full'}]);
+  assert.deepEqual(requests,[{cwd:'/project',text:'hello',model:null,approval:'full',effort:'default'}]);
 });
 test('运行/排队中仍可发送，只有提交中的防重复点击会禁用', () => {
   const b = boot();
@@ -391,7 +391,7 @@ test('切入 sid 时 profile options 请求仍 pending，/new 与 /hosted 都能
     assert.equal(b.node('modelcustom').hidden,true);
     const target=useHost?'/hosted':'/new';
     const expected=useHost
-      ? {cwd:'/project',text:'hello',model:'vendor-model',approval:'auto'}
+      ? {cwd:'/project',text:'hello',model:'vendor-model',approval:'auto',effort:'default'}
       : {cwd:'/project',text:'hello',model:'vendor-model'};
     assert.deepEqual(sent,[[target,expected]]);
     oldOptionsResolve(response({model_options:[{name:'团队 Sonnet',model:'vendor-model'}]}));
@@ -1875,4 +1875,54 @@ test('终态收敛：外部取消或整体中断快照使旧poll失效，旧job�
   await b.run('loadQueue("a")');
   assert.equal(b.run('sendJobs.a.jobId'),'new'); assert.equal(b.run('sendJobs.a.status'),'queued'); assert.equal(b.run('pendingEcho.a.jobId'),'new'); assert.equal(b.run('pendingEcho.a.failed'),undefined);
  }
+});
+
+test('effort 下拉即切并软同步服务端值', async () => {
+  const requests=[];
+  const b=boot(async(url, opts={})=>{
+    requests.push([url, opts.body]);
+    if(url==='/sessions/sid/effort') return response({effort:'high'});
+    return response({effort:'high', approval:'auto', commands:[]});
+  });
+  b.run('bindSendBox("sid", {})');
+  const sel=b.node('effortsel');
+  sel.value='high';
+  sel.dispatchEvent({type:'change'});
+  await new Promise(r=>setImmediate(r));
+  const effortCall = requests.find(r=>r[0]==='/sessions/sid/effort');
+  assert.ok(effortCall, '应发出 effort POST');
+  assert.equal(effortCall[0], '/sessions/sid/effort');
+  assert.equal(effortCall[1], JSON.stringify({effort:'high'}));
+  // 软同步：detail 带 effort 时回填下拉，commands 进全局目录
+  b.run('updateHostedControls({effort:"low", approval:"auto", commands:["model"]})');
+  assert.equal(sel.value, 'low');
+  assert.equal(b.run('sessionCommands[0]'), 'model');
+});
+
+test('指令 token 提取与前缀过滤', () => {
+  const b=boot();
+  assert.equal(b.run('commandToken("/mod")'), '/mod');
+  assert.equal(b.run('commandToken("/model sonnet")'), null);
+  assert.equal(b.run('commandToken("hi /model")'), null);
+  assert.equal(b.run('commandToken("")'), null);
+  assert.equal(b.run('JSON.stringify(filterCommands(["model","compact","review"], "/m"))'), '["model"]');
+  assert.equal(b.run('JSON.stringify(filterCommands(["model"], "/M"))'), '[]');
+  assert.equal(b.run('JSON.stringify(filterCommands(["model"], null))'), '[]');
+});
+
+test('指令提示面板键盘补全，目录为空不弹', () => {
+  const b=boot();
+  b.run('wireCommandHints(document.getElementById("msgbox"), () => ["model","mcp"])');
+  const box=b.node('msgbox'), panel=b.node('cmdhints');
+  box.value='/m';
+  box.dispatchEvent({type:'input'});
+  assert.equal(panel.hidden, false);
+  box.dispatchEvent({type:'keydown', key:'ArrowDown', preventDefault(){}});
+  box.dispatchEvent({type:'keydown', key:'Tab', preventDefault(){}});
+  assert.equal(box.value, '/mcp ');
+  assert.equal(panel.hidden, true);
+  b.run('wireCommandHints(document.getElementById("msgbox"), () => [])');
+  box.value='/x';
+  box.dispatchEvent({type:'input'});
+  assert.equal(panel.hidden, true);
 });

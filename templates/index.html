@@ -159,6 +159,12 @@ h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-tra
 .model-controls input{min-width:180px;max-width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px}
 .model-controls input[hidden]{display:none}
 .composer textarea{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit}
+#cmdhints{margin-top:4px;max-height:180px;overflow:auto;border:1px solid var(--bd);
+  border-radius:6px;background:var(--bg);display:flex;flex-direction:column}
+#cmdhints[hidden]{display:none}
+.cmd-hint{text-align:left;background:none;border:none;color:var(--fg);padding:6px 10px;
+  font:inherit;font-size:13px;cursor:pointer}
+.cmd-hint.selected{background:var(--accbg)}
 .composer-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:6px}
 .composer-status{white-space:pre-wrap;margin-top:4px}
 .config-path{overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:12px;margin:3px 0}
@@ -260,6 +266,7 @@ const TASK_ZH = {pending: "待办", in_progress: "进行中", completed: "已完
 
 let sessions = [];                 // 最新概览数据
 let view = {project: null, session: null};   // 当前视图
+let sessionCommands = [];   // 当前会话的指令目录（仅托管进程活着时有内容）
 let curPanel = null;               // main 里已渲染的面板 {type:"list"|"conv"|"new", key}，
                                    // 自动刷新只更新数据区域、不重建输入区，避免失焦/丢草稿
 let convCache = {id: null, size: -1};        // 对话缓存标记，避免重复渲染
@@ -535,6 +542,52 @@ function modelControlsHtml(){
     <span class="mut" id="modelst" role="status"></span></div>`;
 }
 // 会话页和新建会话页共用同一个输入对话框，避免两套 textarea/按钮/键盘行为
+function commandToken(value){
+  const m = (value || "").match(/^\/[^\s]*$/);
+  return m ? m[0] : null;
+}
+function filterCommands(commands, token){
+  if(token == null) return [];
+  return (commands || []).filter(name => ("/" + name).startsWith(token));
+}
+function wireCommandHints(box, getCommands){
+  if(!box) return;
+  const panel = document.getElementById("cmdhints");
+  if(!panel) return;
+  let selected = 0;
+  const close = () => { panel.hidden = true; panel.replaceChildren(); selected = 0; };
+  const render = () => {
+    const token = commandToken(box.value);
+    const found = filterCommands(getCommands(), token);
+    if(token == null || !found.length){ close(); return; }
+    if(selected >= found.length) selected = found.length - 1;
+    panel.replaceChildren(...found.map((name, i) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "cmd-hint" + (i === selected ? " selected" : "");
+      btn.textContent = "/" + name;
+      btn.onclick = () => { box.value = "/" + name + " "; close(); box.focus(); };
+      return btn;
+    }));
+    panel.hidden = false;
+  };
+  box.addEventListener("input", () => { selected = 0; render(); });
+  box.addEventListener("keydown", event => {
+    if(panel.hidden) return;
+    const found = filterCommands(getCommands(), commandToken(box.value));
+    if(!found.length) return;
+    if(event.key === "ArrowDown"){
+      event.preventDefault(); selected = Math.min(selected + 1, found.length - 1); render();
+    }else if(event.key === "ArrowUp"){
+      event.preventDefault(); selected = Math.max(selected - 1, 0); render();
+    }else if(event.key === "Tab"){
+      event.preventDefault(); box.value = "/" + found[selected] + " "; close();
+    }else if(event.key === "Escape"){
+      close();
+    }
+  });
+  box.addEventListener("blur", () => setTimeout(close, 150));
+}
 function composerHtml(mode, d){
   const isNew = mode === "new";
   d = d || {};
@@ -543,6 +596,7 @@ function composerHtml(mode, d){
     ${isNew ? '<div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>' : ""}
     ${modelControlsHtml()}
     <textarea id="msgbox" rows="3" placeholder="${isNew ? "输入首条消息…" : "给该会话发消息…"}"></textarea>
+    <div id="cmdhints" hidden></div>
     <div class="composer-actions">
       <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
       ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断并清空队列</button>`}
@@ -551,6 +605,13 @@ function composerHtml(mode, d){
           <option value="auto">自动</option>
           <option value="ask">询问</option>
           <option value="full">全部允许</option>
+        </select></label>
+      <label class="ctl" id="effortwrap" title="托管进程的思考档位；未托管时保存后下次托管生效">思考
+        <select id="effortsel" aria-label="思考档位">
+          <option value="default">默认</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
         </select></label>
       ${isNew ? "" : `<label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
         <input type="checkbox" id="forcecb" checked> 工作状态下也发送</label>`}
@@ -1305,6 +1366,9 @@ async function respondInteraction(card, act, scope, reason){
 function updateHostedControls(d){
   const sel = document.getElementById("approvalsel");
   if(sel && d && d.approval) sel.value = d.approval;
+  const effortSel = document.getElementById("effortsel");
+  if(effortSel && d && d.effort) effortSel.value = d.effort;
+  sessionCommands = d && Array.isArray(d.commands) ? d.commands : [];
   const intBtn = document.getElementById("intbtn");
   if(intBtn && d){
     intBtn.disabled = !(d.hosted && d.hosted_busy);
@@ -1725,11 +1789,20 @@ function bindNewBox(p){
   const key = "new:" + p.cwd;
   bindMessageDraft(key);
   bindComposerKeys();
+  wireCommandHints(document.getElementById("msgbox"), () => []);
+  const hostcb = document.getElementById("hostcb"),
+        newEffortSel = document.getElementById("effortsel");
+  if(hostcb && newEffortSel){
+    const syncEffort = () => { newEffortSel.disabled = !hostcb.checked; };
+    hostcb.addEventListener("change", syncEffort);
+    syncEffort();
+  }
   btn.onclick = async () => {
     const submitted = captureMessageDraft(key), text = submitted.rawText.trim();
     if(!text) return;
     const useHost = document.getElementById("hostcb").checked;
     const approval = document.getElementById("approvalsel")?.value || "auto";
+    const effort = newEffortSel && !newEffortSel.disabled ? newEffortSel.value : "default";
     const selectedModel = modelSnapshot(key);
     if(selectedModel === undefined) return;
     const token = ++submissionToken;
@@ -1770,9 +1843,9 @@ function bindNewBox(p){
     try{
       const r = await fetchT(useHost ? "/hosted" : "/new", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        // 非托管 /new 不接受 approval；托管时把对话框里的选择带给首轮进程
+        // 非托管 /new 不接受 approval/effort；托管时把对话框里的选择带给首轮进程
         body: JSON.stringify(useHost
-          ? {cwd: p.cwd, text, model: selectedModel, approval}
+          ? {cwd: p.cwd, text, model: selectedModel, approval, effort}
           : {cwd: p.cwd, text, model: selectedModel}),
       }, 30000);
       const j = await r.json();
@@ -1845,6 +1918,8 @@ function bindSendBox(id, d){
   if(!btn) return;
   bindMessageDraft(id);
   bindComposerKeys();
+  wireCommandHints(document.getElementById("msgbox"),
+    () => (view.session === id ? sessionCommands : []));
   const un = document.getElementById("unhostbtn");
   if(un) un.onclick = async () => {
     if(!d.hosted_id) return;
@@ -1889,6 +1964,21 @@ function bindSendBox(id, d){
         r.ok ? "审批模式已更新" : ("失败: " + (j.error || r.status));
     }catch(e){
       document.getElementById("sendst").textContent = "审批模式保存失败: " + e;
+    }
+  };
+  const effortSel = document.getElementById("effortsel");
+  if(effortSel) effortSel.onchange = async () => {
+    try{
+      const r = await fetchT("/sessions/" + encodeURIComponent(id) + "/effort", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({effort: effortSel.value}),
+      });
+      const j = await r.json();
+      document.getElementById("sendst").textContent =
+        r.ok ? (j.warning ? ("思考档位已保存（" + j.warning + "）") : "思考档位已更新")
+             : ("思考档位失败: " + (j.error || r.status));
+    }catch(e){
+      document.getElementById("sendst").textContent = "思考档位保存失败: " + e;
     }
   };
   btn.onclick = async () => {
