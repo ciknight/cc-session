@@ -11,6 +11,8 @@ UNSET = object()
 
 APPROVAL_MODES = ("ask", "auto", "full")
 
+EFFORT_LEVELS = ("low", "medium", "high")
+
 
 def validate_model(model):
     if model is None:
@@ -46,6 +48,32 @@ def model_args(args, model):
             result.append(arg)
         i += 1
     return result + ["--model=" + validate_model(model)]
+
+
+def validate_effort(level):
+    """effort 接口值：low / medium / high；default 规范化为 None（模型默认）。"""
+    if level == "default":
+        return None
+    if level not in EFFORT_LEVELS:
+        raise ValueError("effort 必须是 low / medium / high / default")
+    return level
+
+
+def effort_args(args, effort):
+    """有档位时剥掉用户自带的 --effort 再追加，模式与 model_args 一致。"""
+    if effort is None:
+        return list(args)
+    result = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--effort":
+            i += 2
+            continue
+        if not arg.startswith("--effort="):
+            result.append(arg)
+        i += 1
+    return result + ["--effort=" + validate_effort(effort)]
 
 
 def validate_metadata_patch(patch):
@@ -204,6 +232,72 @@ class ModelPreferences:
             if temp and os.path.exists(temp):
                 os.unlink(temp)
         self.models = updated
+
+
+class EffortPreferences:
+    """看板独立的托管思考档位；spawn 带 --effort，使重托管后保持。"""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.efforts = {}
+        self.touched = set()
+        self.error = None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict) or data.get("version") != 1
+                    or not isinstance(data.get("efforts"), dict)):
+                raise ValueError("格式或版本不支持")
+            for sid, level in data["efforts"].items():
+                if not isinstance(sid, str) or level not in EFFORT_LEVELS:
+                    raise ValueError("思考档位记录无效")
+            self.efforts = data["efforts"]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            self.error = "思考档位文件无法读取或格式损坏，请先修复或移走该文件"
+
+    def get(self, sid):
+        with self.lock:
+            return self.efforts.get(sid)
+
+    def set(self, sid, level):
+        if level is not None and level not in EFFORT_LEVELS:
+            raise ValueError("思考档位必须是 low / medium / high，或 null")
+        with self.lock:
+            self._save(sid, level)
+            self.touched.add(sid)
+        return level
+
+    def bind(self, sid, level):
+        """新会话拿到 sid 后关联首轮选择，不覆盖随后手动保存的选择。"""
+        with self.lock:
+            if sid not in self.efforts and sid not in self.touched and level is not None:
+                self._save(sid, level)
+
+    def _save(self, sid, level):
+        if self.error:
+            raise ValueError(self.error)
+        updated = dict(self.efforts)
+        if level is None:
+            updated.pop(sid, None)
+        else:
+            updated[sid] = level
+        temp = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temp = tempfile.mkstemp(prefix="efforts-", suffix=".tmp", dir=self.path.parent)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "efforts": updated}, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, self.path)
+        except OSError as exc:
+            raise ValueError("思考档位保存失败，请检查目录权限或磁盘空间") from exc
+        finally:
+            if temp and os.path.exists(temp):
+                os.unlink(temp)
+        self.efforts = updated
 
 
 class ApprovalPreferences:

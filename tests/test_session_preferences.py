@@ -300,5 +300,57 @@ class SessionMetadataTests(unittest.TestCase):
         self.assertEqual(store.get("a"), dict(self.defaults(1), pinned=True))
 
 
+class EffortPreferenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "efforts.json"
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_validate_effort(self):
+        self.assertEqual(prefs.validate_effort("low"), "low")
+        self.assertEqual(prefs.validate_effort("high"), "high")
+        self.assertIsNone(prefs.validate_effort("default"))
+        for level in ("", "default ", "high ", "ultra", None, 1, [], {}):
+            with self.subTest(level=level), self.assertRaises(ValueError):
+                prefs.validate_effort(level)
+
+    def test_arguments_override_only_effort(self):
+        args = ["--effort", "low", "--verbose", "--effort=high"]
+        self.assertEqual(prefs.effort_args(args, None), args)
+        self.assertEqual(prefs.effort_args(args, "medium"), ["--verbose", "--effort=medium"])
+        self.assertEqual(args[1], "low")
+
+    def test_persist_and_clear_by_session(self):
+        store = prefs.EffortPreferences(self.path)
+        self.assertIsNone(store.get("a"))
+        store.set("a", "high")
+        store.set("b", "low")
+        self.assertEqual(prefs.EffortPreferences(self.path).get("a"), "high")
+        store.set("a", None)
+        self.assertIsNone(store.get("a"))
+        self.assertEqual(store.get("b"), "low")
+        self.assertEqual(json.loads(self.path.read_text("utf-8"))["version"], 1)
+
+    def test_invalid_level_rejected_and_corrupt_file(self):
+        store = prefs.EffortPreferences(self.path)
+        with self.assertRaises(ValueError):
+            store.set("a", "ultra")
+        self.assertIsNone(store.get("a"))
+        self.path.write_text("broken", encoding="utf-8")
+        broken = prefs.EffortPreferences(self.path)
+        self.assertTrue(broken.error)
+        with self.assertRaises(ValueError):
+            broken.set("a", "low")
+        self.assertEqual(self.path.read_text("utf-8"), "broken")
+
+    def test_bind_does_not_replace_later_choice(self):
+        store = prefs.EffortPreferences(self.path)
+        store.set("a", "low")
+        store.bind("a", "high")
+        self.assertEqual(store.get("a"), "low")
+        store.bind("b", "medium")
+        self.assertEqual(store.get("b"), "medium")
+
+
 if __name__ == "__main__":
     unittest.main()
