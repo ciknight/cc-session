@@ -1578,9 +1578,9 @@ test('队列：独立容器事实快照、FIFO/待派发、取消权限、最近
  });
  b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}');
  await b.run('loadQueue("a")');
- assert.equal(b.node('queue').hidden,false,'有执行/等待时摘要行可见');
+ assert.equal(b.node('queue').hidden,false,'有执行/等待时摘要 chip 可见');
  const markup=b.node('queue').innerHTML;
- assert.match(markup,/queue-bar/); assert.match(markup,/执行中 1/); assert.match(markup,/等待 2/);
+ assert.match(markup,/queue-summary/); assert.match(markup,/执行中 1/); assert.match(markup,/等待 2/);
  assert.match(markup,/&lt;执行&gt;/); assert.match(markup,/默认/); assert.match(markup,/待派发/); assert.match(markup,/最近结束/);
  assert.match(markup,/data-cancel-job="q"/); assert.doesNotMatch(markup,/data-cancel-job="r"|data-cancel-job="p"/);
  assert.match(markup,/data-dkey="queue:a:recent"/);
@@ -1897,6 +1897,19 @@ test('effort 下拉即切并软同步服务端值', async () => {
   b.run('updateHostedControls({effort:"low", approval:"auto", commands:["model"]})');
   assert.equal(sel.value, 'low');
   assert.equal(b.run('sessionCommands[0]'), 'model');
+});
+
+test('composer 结构：队列 chip 在模型行内、次要控件包进 extra、概览含计数', () => {
+  const b=boot();
+  const conv=b.run('composerHtml("conv",{hosted:false})');
+  assert.match(conv,/queue-chip" id="queue"/);
+  assert.doesNotMatch(conv,/queue-wrap/);
+  assert.match(conv,/composer-extra/);
+  assert.match(conv,/id="cogbtn"/);
+  const fresh=b.run('composerHtml("new",{})');
+  assert.match(fresh,/queue-chip" id="queue"/);
+  assert.match(fresh,/composer-extra/);
+  assert.match(b.run('overviewHtml({id:"a"})'),/id="convcount"/);
 });
 
 test('指令 token 提取与前缀过滤', () => {
