@@ -158,7 +158,11 @@ h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-tra
 .model-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
 .model-controls input{min-width:180px;max-width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px}
 .model-controls input[hidden]{display:none}
+.composer{position:relative}
 .composer textarea{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit}
+/* 次要控件：桌面原样展开；窄屏藏进 ⚙ 浮层（DOM 不动、事件不重挂） */
+.composer-extra{display:contents}
+.composer-cog{display:none}
 #cmdhints{margin-top:4px;max-height:180px;overflow:auto;border:1px solid var(--bd);
   border-radius:6px;background:var(--bg);display:flex;flex-direction:column}
 #cmdhints[hidden]{display:none}
@@ -207,6 +211,13 @@ main:has(>#conv) .composer{flex:none;margin:10px 18px 12px}
   .conv-head h2{font-size:14px;margin:4px 0}
   #conv{padding:4px 10px}
   main:has(>#conv) .composer{margin:8px 10px}
+  .composer-cog{display:inline-block}
+  .composer-extra{display:none}
+  .composer.open .composer-extra{display:flex;position:absolute;right:0;bottom:calc(100% + 6px);
+    z-index:30;flex-direction:column;align-items:flex-start;gap:8px;background:var(--bg);
+    border:1px solid var(--bd);border-radius:8px;padding:10px 12px;
+    box-shadow:0 8px 24px rgba(0,0,0,.16);max-height:60vh;overflow-y:auto}
+  .composer textarea{height:4.6em}
   .ubody{max-width:92%}
   aside{position:fixed;top:0;bottom:0;left:0;width:min(75vw,300px);z-index:20;background:var(--bg);
         transform:translateX(-100%);transition:transform .2s ease}
@@ -603,25 +614,29 @@ function composerHtml(mode, d){
     <div class="composer-actions">
       <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
       ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断并清空队列</button>`}
-      <label class="ctl" id="approvalwrap">审批
-        <select id="approvalsel" aria-label="托管审批模式">
-          <option value="auto">自动</option>
-          <option value="ask">询问</option>
-          <option value="full">全部允许</option>
-        </select></label>
-      <label class="ctl" id="effortwrap" title="托管进程的思考档位；未托管时保存后下次托管生效">思考
-        <select id="effortsel" aria-label="思考档位">
-          <option value="default">默认</option>
-          <option value="low">low</option>
-          <option value="medium">medium</option>
-          <option value="high">high</option>
-        </select></label>
-      ${isNew ? "" : `<label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
-        <input type="checkbox" id="forcecb" checked> 工作状态下也发送</label>`}
-      <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
-        <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : "checked"}> 托管（常驻进程，后续消息不再重启）</label>
-      ${!isNew && d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
-        <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
+      <button class="back composer-cog" id="cogbtn" aria-label="发送选项"
+              title="审批 / 思考 / 发送选项">⚙</button>
+      <span class="composer-extra">
+        <label class="ctl" id="approvalwrap">审批
+          <select id="approvalsel" aria-label="托管审批模式">
+            <option value="auto">自动</option>
+            <option value="ask">询问</option>
+            <option value="full">全部允许</option>
+          </select></label>
+        <label class="ctl" id="effortwrap" title="托管进程的思考档位；未托管时保存后下次托管生效">思考
+          <select id="effortsel" aria-label="思考档位">
+            <option value="default">默认</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select></label>
+        ${isNew ? "" : `<label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
+          <input type="checkbox" id="forcecb" checked> 工作状态下也发送</label>`}
+        <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
+          <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : "checked"}> 托管（常驻进程，后续消息不再重启）</label>
+        ${!isNew && d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
+          <button class="back" id="unhostbtn" title="让常驻进程做完当前一轮后正常退出">退出托管</button>` : ""}
+      </span>
     </div>
     <div class="mut composer-status" id="sendst"></div>
   </div>`;
@@ -2184,6 +2199,11 @@ document.getElementById("main").addEventListener("click", e => {
   // 队列摘要 chip 点击展开/收起（触屏没有 hover）；只有文字本身是热区
   const chip = e.target.closest && e.target.closest(".queue-chip");
   if(chip){ chip.classList.toggle("open"); return; }
+  // 窄屏 ⚙ 浮层开合（次要控件收纳，桌面不显示该按钮）
+  const cog = e.target.closest && e.target.closest("#cogbtn");
+  if(cog && cog.parentElement && cog.parentElement.parentElement){
+    cog.parentElement.parentElement.classList.toggle("open"); return;
+  }
   const cancel = e.target.closest && e.target.closest("[data-cancel-job]");
   if(cancel){ e.preventDefault?.(); cancelQueueJob(cancel.dataset.sid, cancel.dataset.cancelJob); return; }
   const management = e.target.closest && e.target.closest("[data-meta]");
