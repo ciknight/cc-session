@@ -56,7 +56,7 @@ main{overflow-y:auto;padding:12px 18px;min-width:0}
 ul{margin:6px 0;padding-left:18px}
 .completed{text-decoration:line-through;color:var(--mut)}
 .in_progress{font-weight:600}
-h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .fold{margin:8px 0 2px}
 .fold>summary{font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;list-style:none;user-select:none}
 .fold>summary::-webkit-details-marker{display:none}
@@ -164,11 +164,29 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .config-path{overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:12px;margin:3px 0}
 button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 .metadata-actions{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:8px}
-#aliasinput{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:4px 8px;max-width:100%;margin:6px}
 #pendingnav{margin:10px;width:calc(100% - 20px);text-align:left}
 .queue-job{padding:8px 0;border-top:1px solid var(--bd)}
 .queue-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:8em;overflow:auto}
-#queue h4,#queue h5{margin:8px 0}
+.queue-pop h5{margin:8px 0 0;font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+/* 会话视图：聊天窗口布局——头部固定、消息区滚动、发送区沉底 */
+main:has(>#conv){display:flex;flex-direction:column;overflow:hidden;padding:0}
+.conv-top{flex:none;padding:10px 18px 4px;border-bottom:1px solid var(--bd)}
+.conv-top h2{font-size:16px;margin:8px 0 4px}
+#conv{flex:1;min-height:0;overflow-y:auto;padding:6px 18px}
+main:has(>#conv) .composer{flex:none;margin:10px 18px 12px}
+.conv-count{margin:6px 0 2px}
+.load-earlier{display:block;width:fit-content;max-width:100%;margin:0 auto 10px;padding:4px 18px;
+  border:1px dashed var(--bd);border-radius:999px;background:var(--card);color:var(--mut);
+  font:inherit;font-size:13px;cursor:pointer}
+.load-earlier:hover{color:var(--fg);border-color:var(--acc)}
+.conv-overview>summary{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 队列融合进发送区：默认一行摘要，hover/点击浮出详情 */
+.queue-wrap{position:relative}
+.queue-bar{font-size:12px;color:var(--mut);padding:0 0 6px;cursor:default}
+.queue-pop{display:none;position:absolute;left:0;right:0;bottom:calc(100% + 6px);z-index:30;
+  max-height:45vh;overflow-y:auto;background:var(--bg);border:1px solid var(--bd);
+  border-radius:8px;padding:8px 12px;box-shadow:0 8px 24px rgba(0,0,0,.16)}
+.queue-wrap:hover .queue-pop,.queue-wrap:focus-within .queue-pop,.queue-wrap.open .queue-pop{display:block}
 /* 移动端：抽屉式侧栏 */
 #menu{display:none}
 #mask{display:none}
@@ -177,6 +195,9 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
   #menu{display:inline-block}
   header{padding:8px 10px;gap:10px}
   main{padding:8px 10px}
+  .conv-top{padding:8px 10px 4px}
+  #conv{padding:4px 10px}
+  main:has(>#conv) .composer{margin:8px 10px}
   .ubody{max-width:92%}
   aside{position:fixed;top:0;bottom:0;left:0;width:min(75vw,300px);z-index:20;background:var(--bg);
         transform:translateX(-100%);transition:transform .2s ease}
@@ -361,7 +382,7 @@ function fmtTok(n){
 const projName = cwd => (cwd || "?").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
 const sessTitle = s => s.alias || ((!s.title || s.title.includes("�")) ? (s.first_user_message || s.id.slice(0, 8)) : s.title);
 
-const metadataCache = new Map(), metadataSaves = new Map(), aliasDrafts = new Map(), detailMetadata = new Map();
+const metadataCache = new Map(), metadataSaves = new Map(), detailMetadata = new Map();
 function mergeMetadata(data){
   if(!data?.id) return data;
   const old = metadataCache.get(data.id), revision = Number(data.metadata_revision) || 0;
@@ -376,42 +397,17 @@ function metadataActionsHtml(s){
     <button class="back" data-meta="archive" data-sid="${esc(s.id)}">${s.archived ? "恢复" : "归档"}</button>
     ${s.archived ? '<span class="chip">已归档</span>' : ""}<span class="mut" data-meta-status="${esc(s.id)}"></span></span>`;
 }
-function metadataEditorHtml(d){
-  if(d.is_subagent || d.id?.includes("::")) return "";
-  return `<div class="info-panel"><div id="metadataactions">${metadataActionsHtml(mergeMetadata(d))}</div>
-    <label for="aliasinput">会话别名</label><input id="aliasinput" maxlength="120" placeholder="留空恢复原始标题">
-    <button class="back" id="aliassave">保存别名</button><button class="back" id="aliasclear">清除别名</button>
-    <span id="metadatast" class="mut" role="status"></span></div>`;
-}
 function updateMetadataControls(d){
   if(!panelMatch(d.id) || !composerRouteMatch(d.id)) return;
   const title = document.getElementById("detailtitle");
   if(title) title.textContent = sessTitle(d);
-  const actions = document.getElementById("metadataactions");
-  if(actions) actions.innerHTML = metadataActionsHtml(d);
-  const draft = aliasDrafts.get(d.id), input = document.getElementById("aliasinput");
-  if(input && draft && !draft.dirty){ draft.value = d.alias || ""; input.value = draft.value; }
-}
-function bindMetadata(d){
-  if(d.is_subagent || d.id?.includes("::")) return;
-  const input = document.getElementById("aliasinput");
-  if(!input) return;
-  let draft = aliasDrafts.get(d.id);
-  if(!draft){ draft = {value: d.alias || "", version: 0, dirty: false}; aliasDrafts.set(d.id, draft); }
-  input.value = draft.value;
-  input.oninput = () => { draft.value = input.value; draft.version++; draft.dirty = true; };
-  document.getElementById("aliassave").onclick = () => saveMetadata(d.id, {alias: draft.value.trim() || null});
-  document.getElementById("aliasclear").onclick = () => {
-    input.value = ""; input.oninput(); return saveMetadata(d.id, {alias: null});
-  };
 }
 function metadataStatus(sid, text){
-  if(panelMatch(sid) && composerRouteMatch(sid)) document.getElementById("metadatast").textContent = text;
+  // 置顶/归档操作只在列表页卡片上，状态文本写进卡片上的 data-meta-status 节点
   document.querySelectorAll?.("[data-meta-status]").forEach(el => { if(el.dataset.metaStatus === sid) el.textContent = text; });
 }
 function saveMetadata(sid, patch){
   if(sid.includes("::")) return Promise.resolve();
-  const aliasVersion = aliasDrafts.get(sid)?.version;
   const previous = metadataSaves.get(sid) || Promise.resolve();
   const task = previous.catch(() => {}).then(async () => {
     metadataStatus(sid, "保存中…");
@@ -420,11 +416,9 @@ function saveMetadata(sid, patch){
         method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
       const data = await r.json();
       if(!r.ok || data.error || data.id !== sid) throw Error(data.error || "HTTP " + r.status);
-      const merged = mergeMetadata(data);
+      mergeMetadata(data);   // 副作用：更新 metadataCache
       sessions = sessions.map(s => s.id === sid ? {...s, ...metadataCache.get(sid)} : s);
       sessionsVersion++;
-      const draft = aliasDrafts.get(sid);
-      if("alias" in patch && draft?.version === aliasVersion){ draft.dirty = false; draft.value = merged.alias || ""; }
       const detail = detailMetadata.get(sid) || sessions.find(s => s.id === sid);
       if(detail) updateMetadataControls({...detail, ...metadataCache.get(sid)});
       metadataStatus(sid, "已保存");
@@ -545,6 +539,7 @@ function composerHtml(mode, d){
   const isNew = mode === "new";
   d = d || {};
   return `<div class="info-panel composer">
+    ${isNew ? "" : '<div class="queue-wrap" id="queue" hidden></div>'}
     ${isNew ? '<div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>' : ""}
     ${modelControlsHtml()}
     <textarea id="msgbox" rows="3" placeholder="${isNew ? "输入首条消息…" : "给该会话发消息…"}"></textarea>
@@ -868,8 +863,8 @@ function applySessionDetail(d){
   updateMetadataControls(d);
   const badge = document.getElementById("statebadge");
   if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
-  const panel = document.getElementById("infopanel");
-  if(panel) panel.innerHTML = infoHtml(d);
+  const overview = document.getElementById("overviewwrap");
+  if(overview) overview.innerHTML = overviewHtml(d);
   renderApiError(d.last_api_error);
   updateModelSt(d.id || convState.id || "");
 }
@@ -900,7 +895,7 @@ function updateLiveBubble(text){
 }
 function renderLiveBubble(){
   const conv = document.getElementById("conv");
-  if(!conv || !conv.insertBefore) return;
+  if(!conv || !conv.appendChild) return;
   let el = document.getElementById("livebubble");
   if(!liveText){
     if(el && el.remove) el.remove();
@@ -911,7 +906,7 @@ function renderLiveBubble(){
     el.id = "livebubble";
     el.className = "msg assistant";
     el.innerHTML = '<div class="mhead">助手 · 正在输入…</div><div class="abody"></div>';
-    conv.insertBefore(el, conv.firstChild);
+    conv.appendChild(el);
   }
   const body = el.querySelector ? el.querySelector(".abody") : null;
   if(body) body.textContent = liveText;
@@ -1072,6 +1067,24 @@ function infoHtml(d){
     })() : ""}
     ${d.tasks && d.tasks.length ? `<details class="fold"${detailsAttrs(`info:${sid}:tasks`, true)}><summary>任务 ${d.tasks_completed}/${d.tasks_total}</summary><ul>` +
       d.tasks.map(x => `<li class="${x.status}">[${TASK_ZH[x.status] || x.status}] ${esc(x.subject)}</li>`).join("") + "</ul></details>" : ""}`;
+}
+// 概览折叠：summary 一行摘要，展开是完整统计；key 带 sid，跨刷新保留展开状态
+function overviewSummary(d){
+  const t = d.tokens || {};
+  const run = (d.subagents || []).filter(a => a.state === "running").length;
+  return [
+    d.model || "",
+    d.git_branch ? "⎇ " + d.git_branch : "",
+    `消息 ${d.user_msgs || 0}/${d.assistant_msgs || 0}`,
+    t.output ? `输出 ${fmtTok(t.output)} tok` : "",
+    d.context_tokens ? `上下文 ${fmtTok(d.context_tokens)}` : "",
+    (d.subagents || []).length ? `${d.subagents.length} 子代理${run ? ` · ${run} 运行中` : ""}` : "",
+    d.tasks_total ? `任务 ${d.tasks_completed || 0}/${d.tasks_total}` : "",
+  ].filter(Boolean).map(esc).join(" · ") || "暂无统计";
+}
+function overviewHtml(d){
+  return `<details class="fold conv-overview"${detailsAttrs(`info:${d.id || ""}:overview`)}>` +
+    `<summary>概览 · ${overviewSummary(d)}</summary><div id="infopanel">${infoHtml(d)}</div></details>`;
 }
 
 function diffHtml(text){
@@ -1301,17 +1314,20 @@ function updateHostedControls(d){
 
 let convLoading = null;     // 请求实例；旧请求的 finally 不得释放后继请求。
 let convRequestGeneration = 0;
+function scrollConvBottom(){
+  const c = document.getElementById("conv");
+  if(c) c.scrollTop = c.scrollHeight;
+}
 function renderConvList(){
   const el = document.getElementById("conv");
   if(!el) return;
   const echo = pendingEcho[convState.id];
   if(echo && !echoVisible(convState.msgs, echo)) delete pendingEcho[convState.id];
   const echoOut = pendingEcho[convState.id] ? echoHtml(pendingEcho[convState.id]) : "";
-  el.innerHTML = echoOut + convHtml(convState.msgs.slice().reverse()) +
-    (convState.hasMore
-      ? '<div style="text-align:center;margin:10px 0">' +
-        '<button class="back" id="loadearlier">加载更早</button></div>'
-      : "");
+  // 聊天窗口顺序：旧消息在上、新消息和未落盘回显在下；加载更早的胶囊固定在顶部
+  el.innerHTML = (convState.hasMore
+      ? '<button class="load-earlier" id="loadearlier">加载更早</button>' : "")
+    + convHtml(convState.msgs) + echoOut;
   const btn = document.getElementById("loadearlier");
   if(btn) btn.onclick = loadEarlier;
   const count = document.getElementById("convcount");
@@ -1327,8 +1343,8 @@ async function loadEarlier(){
   convLoading = null;   // 分页与增量共享索引，取代尚未提交的旧刷新。
   convState.loadingEarlier = generation;
   const state = convState, id = state.id, route = routeGeneration;
-  const main = document.getElementById("main");
-  const oldHeight = main.scrollHeight, oldScroll = main.scrollTop;
+  const convEl = document.getElementById("conv");
+  const oldHeight = convEl?.scrollHeight || 0, oldScroll = convEl?.scrollTop || 0;
   try{
     const r = await fetch(`/sessions/${encodeURIComponent(convState.id)}/messages` +
       `?before=${convState.start}&limit=100`);
@@ -1344,7 +1360,8 @@ async function loadEarlier(){
       if(echo.after != null) echo.after += page.shift || 0;
     convState.cursor += page.shift || 0;   // 服务端前插了新块，末尾索引整体后移
     renderConvList();
-    main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
+    // 前插加载的旧块在上方展开，补偿高度差保持当前视野
+    if(convEl) convEl.scrollTop = oldScroll + (convEl.scrollHeight - oldHeight);
   }catch(e){ /* 下次点击重试 */ }
   finally{ if(state.loadingEarlier === generation) state.loadingEarlier = false; }
 }
@@ -1378,27 +1395,26 @@ async function renderConversation(id, force){
                    hasMore: !!m.has_more, loadingEarlier: false};
       if(isNew){
         main.innerHTML = `
-          <button class="back" id="back">← 返回列表</button>
-          <h2 style="font-size:16px;margin:8px 0">
-            <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
-            ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
-            <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
-            <span class="mut">${esc(d.cwd || "")}</span></h2>
-          ${metadataEditorHtml(d)}
-          <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
-          <div id="interactions"></div>
-          <div id="apierr" class="apierr" style="display:none"></div>
-          ${composerHtml("conv", d)}
-          ${id.includes("::") ? "" : '<div class="info-panel" id="queue"></div>'}
-          <h4 id="convcount">对话</h4>
-          <div id="conv"></div>`;
+          <div class="conv-top">
+            <button class="back" id="back">← 返回列表</button>
+            <h2 style="font-size:16px;margin:8px 0 4px">
+              <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
+              ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
+              <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
+              <span class="mut">${esc(d.cwd || "")}</span></h2>
+            <div id="overviewwrap">${overviewHtml(mergeMetadata(d))}</div>
+            <div id="interactions"></div>
+            <div id="apierr" class="apierr" style="display:none"></div>
+            <div class="mut conv-count" id="convcount"></div>
+          </div>
+          <div id="conv"></div>
+          ${composerHtml("conv", d)}`;
         document.getElementById("back").onclick = () => {
           navigate({project: view.project, session: null, new: false});
         };
         // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
         bindSendBox(id, d);
         curPanel = {type: "conv", key: id};
-        bindMetadata(mergeMetadata(d));
         bindModel(id, d.selected_model);
         loadModelOptions(id, d.cwd);
         connectSessionSse(id);
@@ -1411,12 +1427,12 @@ async function renderConversation(id, force){
       loadQueue(id);
       renderInteractions(d.interactions || []);
       updateHostedControls(d);
-      if(isNew){
-        updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
-        main.scrollTop = 0;
-      }
       clearLiveBubble();
       renderConvList();
+      if(isNew){
+        updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
+        scrollConvBottom();   // 聊天窗口：进入时停在最新消息
+      }
       confirmDisplayedMessages(id, requestEnd);
       return;
     }
@@ -1447,18 +1463,18 @@ async function renderConversation(id, force){
                    start: fresh.start || 0, size: fresh.size || 0,
                    hasMore: !!fresh.has_more, loadingEarlier: false};
       renderConvList();
-      main.scrollTop = 0;
+      scrollConvBottom();
     } else if(m.messages && m.messages.length){
-      const oldHeight = main.scrollHeight, oldScroll = main.scrollTop;
-      const nearTop = oldScroll < 80;
+      const convEl = document.getElementById("conv");
+      // 贴底时新消息自动跟底；正在翻看历史时不打扰
+      const nearBottom = !convEl || convEl.scrollHeight - convEl.scrollTop - convEl.clientHeight < 80;
       convState.msgs.push(...m.messages);
       convState.total = m.total;
       convState.cursor = m.end;
       convState.size = m.size;
       clearLiveBubble();
       renderConvList();
-      if(nearTop) main.scrollTop = 0;
-      else main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
+      if(nearBottom) scrollConvBottom();
     } else {
       convState.total = m.total;
       convState.cursor = m.end != null ? m.end : convState.cursor;
@@ -1490,14 +1506,27 @@ function renderQueue(sid){
   const el = document.getElementById("queue");
   if(!el) return;
   const state = queueState(sid), data = state.snapshot;
-  el.innerHTML = `<h4>发送队列</h4><div class="mut">仅保留本次服务进程的有限历史，重启不恢复。</div>` +
+  const running = data?.running || [], queued = data?.queued || [], recent = data?.recent || [];
+  // 无执行/等待且无错误/通知时不占发送区的空间；摘要行常驻，详情 hover/点击浮出（触屏无 hover）
+  const show = running.length || queued.length || state.error || state.notice;
+  el.hidden = !show;
+  if(!show){ el.classList.remove("open"); return; }
+  const bits = [];
+  if(running.length) bits.push(`▶ 执行中 ${running.length}`);
+  if(queued.length) bits.push(`⏳ 等待 ${queued.length}`);
+  if(state.error) bits.push("⚠ 队列查询失败");
+  if(state.notice) bits.push(state.notice);
+  el.innerHTML = `<div class="queue-bar" title="移入或点击查看队列详情">${bits.join(" · ")}</div>
+    <div class="queue-pop">
+      <div class="mut" style="margin:0 0 4px">仅保留本次服务进程的有限历史，重启不恢复。</div>` +
     (state.error ? `<div class="terror" role="status">${esc(state.error)}</div>` : "") +
     (state.notice ? `<div role="status">${esc(state.notice)}</div>` : "") +
     (!data ? '<div class="mut">队列尚未加载</div>' :
-      `<h5>执行中 (${data.running.length})</h5>${data.running.map(j => queueJobHtml(j, "running", sid)).join("")}
-       <h5>等待发送 (${data.queued.length})</h5>${data.queued.map(j => queueJobHtml(j, "queued", sid)).join("")}
-       ${!data.running.length && !data.queued.length ? '<div class="mut">暂无执行或等待项</div>' : ""}
-       <details class="fold"${detailsAttrs("queue:" + sid + ":recent")}><summary>最近结束 (${data.recent.length})</summary>${data.recent.map(j => queueJobHtml(j, "recent", sid)).join("")}</details>`);
+      `<h5>执行中 (${running.length})</h5>${running.map(j => queueJobHtml(j, "running", sid)).join("")}
+       <h5>等待发送 (${queued.length})</h5>${queued.map(j => queueJobHtml(j, "queued", sid)).join("")}
+       ${!running.length && !queued.length ? '<div class="mut">暂无执行或等待项</div>' : ""}
+       <details class="fold"${detailsAttrs("queue:" + sid + ":recent")}><summary>最近结束 (${recent.length})</summary>${recent.map(j => queueJobHtml(j, "recent", sid)).join("")}</details>`) +
+    `</div>`;
 }
 async function loadQueue(sid){
   if(sid.includes("::")) return;
@@ -2058,6 +2087,9 @@ document.getElementById("projs").addEventListener("click", e => {
   navigate({project: item.dataset.cwd, session: null, new: false});
 });
 document.getElementById("main").addEventListener("click", e => {
+  // 队列摘要行点击展开/收起（触屏没有 hover）
+  const qbar = e.target.closest && e.target.closest(".queue-bar");
+  if(qbar && qbar.parentElement){ qbar.parentElement.classList.toggle("open"); return; }
   const cancel = e.target.closest && e.target.closest("[data-cancel-job]");
   if(cancel){ e.preventDefault?.(); cancelQueueJob(cancel.dataset.sid, cancel.dataset.cancelJob); return; }
   const management = e.target.closest && e.target.closest("[data-meta]");

@@ -14,7 +14,7 @@ function boot(fetch = async () => { throw Error('unexpected fetch'); }) {
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {value:'', checked:false, textContent:'', innerHTML:'', disabled:false,
       dataset:{}, style:{}, options:[], querySelectorAll(){return [];}, appendChild(option){this.options.push(option);}, replaceChildren(){this.options=[];},
-      classList:{toggle(){}, contains(){return false;}}, listeners:{},
+      classList:{add(){}, remove(){}, toggle(){}, contains(){return false;}}, listeners:{},
       addEventListener(type, listener){(this.listeners[type] ||= []).push(listener);},
       dispatchEvent(event){this['on'+event.type]?.(event); for(const listener of this.listeners[event.type] || []) listener(event);},
       click(){this.clickCount=(this.clickCount || 0)+1; if(this.onclick) this.onclick();}});
@@ -1539,13 +1539,12 @@ test('管理：scope、alias 搜索与稳定置顶，不改变完整项目集', 
  assert.equal(b.run('groupByProject()[0].sessions.length'),4);
 });
 
-test('管理：metadata 统一拒旧、POST串行不改回合水位，别名编辑和详情软更新', async () => {
+test('管理：metadata 统一拒旧、POST串行不改回合水位，详情标题软更新', async () => {
  const pending=[]; const requests=[];
  const b=boot((url,opts={})=>{if(url.endsWith('/metadata')){requests.push(JSON.parse(opts.body)); return new Promise(r=>pending.push(r));}return frontendFetch(url);});
- b.run('applySessions([{id:"a",project:"/p",title:"原题",alias:null,metadata_revision:1,last_turn_end_at:10}]); view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; bindMetadata(sessions[0])');
- b.node('aliasinput').value='编辑中'; b.node('aliasinput').oninput();
+ b.run('applySessions([{id:"a",project:"/p",title:"原题",alias:null,metadata_revision:1,last_turn_end_at:10}]); view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}');
  b.run('applySessionDetail({id:"a",title:"原题",alias:"服务器",metadata_revision:3,state:"idle"})');
- assert.equal(b.node('aliasinput').value,'编辑中'); assert.equal(b.node('detailtitle').textContent,'服务器');
+ assert.equal(b.node('detailtitle').textContent,'服务器');
  const first=b.run('saveMetadata("a",{pinned:true})'); const second=b.run('saveMetadata("a",{archived:true})');
  await flush(); assert.equal(requests.length,1);
  pending.shift()(response({id:'a',alias:'旧POST',pinned:true,archived:false,metadata_revision:2})); await flush();
@@ -1554,7 +1553,6 @@ test('管理：metadata 统一拒旧、POST串行不改回合水位，别名编�
  assert.equal(b.run('sessions[0].archived'),true); assert.equal(b.run('turnEndHighWater.get("a")'),10);
  b.run('applySessions([{id:"a",project:"/p",title:"原题",alias:"陈旧SSE",metadata_revision:1,last_turn_end_at:10}])');
  assert.equal(b.run('sessions[0].alias'),'服务器'); assert.equal(b.run('view.session'),'a');
- assert.equal(b.node('aliasinput').value,'编辑中');
 });
 
 test('待处理：精确route、跨项目归档汇总、返回与零入口', async () => {
@@ -1574,17 +1572,22 @@ test('队列：独立容器事实快照、FIFO/待派发、取消权限、最近
  let mode='ok'; const b=boot(async url=>{
    if(url==='/sessions/a/jobs'){
      if(mode==='error') throw Error('offline');
+     if(mode==='empty') return response({session:'a',running:[],queued:[],recent:[]});
      return response({session:'a',running:[{id:'r',status:'running',text:'<执行>',requested_model:null,created_at:1,cancellable:false}],queued:[{id:'q',status:'queued',text:'排队',position:1,cancellable:true},{id:'p',status:'queued',text:'发布前',position:null,cancellable:false}],recent:[{id:'done',status:'cancelled',text:'已取消内容'}]});
    } return frontendFetch(url);
  });
  b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}');
  await b.run('loadQueue("a")');
+ assert.equal(b.node('queue').hidden,false,'有执行/等待时摘要行可见');
  const markup=b.node('queue').innerHTML;
+ assert.match(markup,/queue-bar/); assert.match(markup,/执行中 1/); assert.match(markup,/等待 2/);
  assert.match(markup,/&lt;执行&gt;/); assert.match(markup,/默认/); assert.match(markup,/待派发/); assert.match(markup,/最近结束/);
  assert.match(markup,/data-cancel-job="q"/); assert.doesNotMatch(markup,/data-cancel-job="r"|data-cancel-job="p"/);
  assert.match(markup,/data-dkey="queue:a:recent"/);
  mode='error'; await b.run('loadQueue("a")');
  assert.match(b.node('queue').innerHTML,/排队/); assert.match(b.node('queue').innerHTML,/offline/);
+ mode='empty'; await b.run('loadQueue("a")');
+ assert.equal(b.node('queue').hidden,true,'空闲且无错误/通知时摘要行隐藏');
  assert.match(b.run('composerHtml("conv",{})'),/中断并清空队列/);
 });
 
@@ -1678,25 +1681,13 @@ test('管理：卡片动作拦导航，归档确认不触发interrupt，失败�
  fail=false; await b.run('metadataAction("a","archive")');
  assert.equal(b.run('sessions[0].archived'),true); assert.ok(requests.every(([url])=>url.endsWith('/metadata')));
  b.run('navigate({project:"/p",session:"a"})'); await flush();
- assert.equal(b.run('view.session'),'a'); assert.match(b.node('metadataactions').innerHTML,/恢复/);
+ assert.equal(b.run('view.session'),'a');
+ assert.doesNotMatch(b.node('main').innerHTML,/metadataactions|aliasinput/, '会话页不再渲染置顶/归档/别名');
  const panelWrites=b.node('main').htmlWrites; typeDraft(b,'keep composer');
  b.run('applySessionDetail({id:"a",title:"原标题",alias:"<新标题>",archived:true,metadata_revision:3,state:"idle"})');
  assert.equal(b.node('detailtitle').textContent,'<新标题>'); assert.equal(b.node('msgbox').value,'keep composer'); assert.equal(b.node('main').htmlWrites,panelWrites);
-});
-
-test('管理：切页后的别名保存不写其他sid，编辑版本胜过旧POST，失败保留输入', async () => {
- const pending=[]; const b=boot((url,opts={})=>url.endsWith('/metadata')?new Promise(r=>pending.push(r)):frontendFetch(url));
- b.run('sessions=[{id:"a",project:"/p"},{id:"b",project:"/q"}]; navigate({project:"/p",session:"a"})'); await flush();
- b.node('aliasinput').value='first'; b.node('aliasinput').oninput(); const first=b.node('aliassave').onclick(); await flush();
- b.node('aliasinput').value='second'; b.node('aliasinput').oninput();
- pending[0](response({id:'a',alias:'first',metadata_revision:1})); await first;
- assert.equal(b.node('aliasinput').value,'second');
- const failed=b.node('aliassave').onclick(); await flush(); pending[1]({ok:false,status:500,json:async()=>({error:'disk'})}); await failed;
- assert.match(b.node('metadatast').textContent,/disk/); assert.equal(b.node('aliasinput').value,'second');
- const leaving=b.node('aliassave').onclick(); await flush(); b.run('navigate({project:"/q",session:"b"})'); await flush();
- b.node('aliasinput').value='B editing'; b.node('aliasinput').oninput(); b.node('metadatast').textContent='B state';
- pending[2](response({id:'a',alias:'second',metadata_revision:2})); await leaving;
- assert.equal(b.node('aliasinput').value,'B editing'); assert.equal(b.node('metadatast').textContent,'B state');
+ b.run('listConditions("/p").scope="all"; navigate({project:"/p",session:null})'); await flush();
+ assert.match(b.node('sessioncards').innerHTML,/恢复/, '归档操作保留在外层列表页');
 });
 
 test('待处理：进入与前后退保留草稿，snapshot清零退出项目条件并保留入口', async () => {
