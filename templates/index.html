@@ -177,10 +177,11 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 /* 会话视图：聊天窗口布局——头部固定、消息区滚动、发送区沉底 */
 main:has(>#conv){display:flex;flex-direction:column;overflow:hidden;padding:0}
 .conv-top{flex:none;padding:10px 18px 4px;border-bottom:1px solid var(--bd)}
-.conv-top h2{font-size:16px;margin:8px 0 4px}
+.conv-head{display:flex;align-items:center;gap:8px}
+.conv-head h2{font-size:16px;margin:8px 0 4px;flex:1;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 #conv{flex:1;min-height:0;overflow-y:auto;padding:6px 18px}
 main:has(>#conv) .composer{flex:none;margin:10px 18px 12px}
-.conv-count{margin:6px 0 2px}
 .load-earlier{display:block;width:fit-content;max-width:100%;margin:0 auto 10px;padding:4px 18px;
   border:1px dashed var(--bd);border-radius:999px;background:var(--card);color:var(--mut);
   font:inherit;font-size:13px;cursor:pointer}
@@ -202,6 +203,8 @@ main:has(>#conv) .composer{flex:none;margin:10px 18px 12px}
   header{padding:8px 10px;gap:10px}
   main{padding:8px 10px}
   .conv-top{padding:8px 10px 4px}
+  .conv-cwd{display:none}
+  .conv-head h2{font-size:14px;margin:4px 0}
   #conv{padding:4px 10px}
   main:has(>#conv) .composer{margin:8px 10px}
   .ubody{max-width:92%}
@@ -1145,7 +1148,7 @@ function overviewSummary(d){
 }
 function overviewHtml(d){
   return `<details class="fold conv-overview"${detailsAttrs(`info:${d.id || ""}:overview`)}>` +
-    `<summary>概览 · ${overviewSummary(d)}</summary><div id="infopanel">${infoHtml(d)}</div></details>`;
+    `<summary>概览 · <span id="convcount"></span>${overviewSummary(d)}</summary><div id="infopanel">${infoHtml(d)}</div></details>`;
 }
 
 function diffHtml(text){
@@ -1460,16 +1463,17 @@ async function renderConversation(id, force){
       if(isNew){
         main.innerHTML = `
           <div class="conv-top">
-            <button class="back" id="back">← 返回列表</button>
-            <h2 style="font-size:16px;margin:8px 0 4px">
-              <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
-              ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
-              <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
-              <span class="mut">${esc(d.cwd || "")}</span></h2>
+            <div class="conv-head">
+              <button class="back" id="back">← 返回</button>
+              <h2>
+                <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
+                ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
+                <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
+                <span class="mut conv-cwd">${esc(d.cwd || "")}</span></h2>
+            </div>
             <div id="overviewwrap">${overviewHtml(mergeMetadata(d))}</div>
             <div id="interactions"></div>
             <div id="apierr" class="apierr" style="display:none"></div>
-            <div class="mut conv-count" id="convcount"></div>
           </div>
           <div id="conv"></div>
           ${composerHtml("conv", d)}`;
