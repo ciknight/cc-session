@@ -51,6 +51,8 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
    `/events` 是 SSE 流（连接先发 `snapshot`，随后推增量），`/static/` 提供静态文件。
    `/sessions/<id>/messages` 支持 `limit`（默认 100）、`before`、`from` 分页。
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
+   `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
+   设置托管思考档位（low/medium/high/default）。
 4. **远程发消息/托管**（`send_message` + `Hosted`）：`POST /sessions/<id>/message` 用
    `claude -p --resume` 跑一轮（异步 job，`GET /jobs/<id>` 查询）；`POST /hosted` 启动
    stream-json 双向的常驻 claude 进程，消息写 stdin、忙时排队，已托管会话的
@@ -89,6 +91,12 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 - **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `auto`（交给 CLI 权限模式）**，持久化在
   `~/.claude/claude-sessions/approvals.json`；已有明确保存的模式优先。`ask` 等待网页响应
   （`--permission-timeout` 默认 300 秒，超时自动拒绝），`full` 由服务自动放行。
+- **思考档位（effort）**：仅托管会话；`POST /sessions/<id>/effort` 在线切换
+  （control `apply_flag_settings` 的 `effortLevel`，`default` 传 null 回落模型默认），
+  档位持久化在 `~/.claude/claude-sessions/efforts.json`，重托管 spawn 带 `--effort`（有档位时
+  覆盖用户 `--claude-args` 里的同名参数）；在线切换失败不回滚保存，重托管后生效。
+  托管进程 `system/init` 的 `slash_commands` 去前缀去重存入 Hosted，detail 返回 `commands`；
+  发送框 `/` 单 token 输入时浮出提示面板（↑↓/Tab 补全、Esc 关闭），Enter 直发不校验。
 - **工作时发送**：托管会话在 `working` 时消息进入 `Hosted.pending` 队列；非托管一次性消息
   进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动派发下一条（每会话上限 32）。
   网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“工作状态下也发送”与
@@ -136,9 +144,11 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 发送区固定底部。进入会话滚到底部；增量刷新贴底时自动跟底、翻看历史时不打扰；加载更早
 按高度补偿保持视野。置顶/归档/别名不在会话页显示，只在外层列表卡片操作（别名暂无前端入口，
 后端 API 保留）。发送队列融合进发送区（`#queue` 即摘要行容器）：无执行/等待且无错误/通知时隐藏，
-否则常驻一行摘要，hover/聚焦/点击摘要行浮出详情（取消按钮、最近结束折叠；点击兼容触屏）。发送区提供中断按钮和审批
-模式选择；审批默认 `auto`，发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用
-同一个 `composerHtml` 输入对话框；`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，
+否则常驻一行摘要，hover/聚焦/点击摘要行浮出详情（取消按钮、最近结束折叠；点击兼容触屏）。发送区提供中断按钮、审批
+模式选择与思考档位（effort）下拉（托管中 onchange 即切，未托管保存待下次托管生效；新建页未勾选
+托管时禁用）；审批默认 `auto`，发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用
+同一个 `composerHtml` 输入对话框；输入框下有斜杠指令提示面板（`wireCommandHints`，目录来自
+detail 轮询的 `commands`，仅托管会话有），`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，
 自动刷新/整页刷新后恢复（`sessionStorage`）。子代理折叠区与会话卡片显示运行中数量
 （条目带状态圆点，运行中在前）；发送后对话末尾有本地回显气泡（`pendingEcho`，转录出现
 同文本 user 消息或 command part 后退场，失败标红）；斜杠命令渲染为命令气泡（输出折叠），
