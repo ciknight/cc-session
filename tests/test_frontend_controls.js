@@ -13,12 +13,17 @@ function boot(fetch = async () => { throw Error('unexpected fetch'); }) {
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {value:'', checked:false, textContent:'', innerHTML:'', disabled:false,
-      dataset:{}, style:{}, options:[], appendChild(option){this.options.push(option);}, replaceChildren(){this.options=[];},
+      dataset:{}, style:{}, options:[], querySelectorAll(){return [];}, appendChild(option){this.options.push(option);}, replaceChildren(){this.options=[];},
       classList:{toggle(){}, contains(){return false;}}, listeners:{},
       addEventListener(type, listener){(this.listeners[type] ||= []).push(listener);},
-      dispatchEvent(event){for(const listener of this.listeners[event.type] || []) listener(event);},
+      dispatchEvent(event){this['on'+event.type]?.(event); for(const listener of this.listeners[event.type] || []) listener(event);},
       click(){this.clickCount=(this.clickCount || 0)+1; if(this.onclick) this.onclick();}});
-    return nodes.get(id);
+    const el=nodes.get(id);
+    if(!el.trackHTML){
+      let markup=el.innerHTML; el.htmlWrites=0; el.trackHTML=true;
+      Object.defineProperty(el,'innerHTML',{get:()=>markup,set:value=>{markup=value;el.htmlWrites++;}});
+    }
+    return el;
   };
   const documentListeners = {};
   const historyCalls = [];
@@ -576,7 +581,7 @@ test('全局托管计数显示、隐藏与点击跳转', () => {
   // 有托管时点击跳到第一个托管会话
   b.run('sessions=[{id:"a",project:"/p",hosted:false},{id:"b",project:"/p",hosted:true}]');
   b.node('hostedbadge').click();
-  assert.deepEqual(b.run('view'), {project:"/p",session:"b",new:false});
+  assert.deepEqual({...b.run('view')}, {project:"/p",session:"b",new:false});
 });
 test('项目侧栏按名称固定排序，首次进入仍选中最近活跃项目', () => {
   const b=boot();
@@ -813,7 +818,7 @@ test('会话卡片 chip 显示运行中子代理数', () => {
     {id:"s1", state:"idle", subagent_count:3, subagents_running:2},
     {id:"s2", state:"idle", subagent_count:1, subagents_running:0},
   ], out:0})`);
-  const html = b.node("main").innerHTML;
+  const html = b.node("sessioncards").innerHTML;
   assert.ok(html.includes('3 子代理 · 2 运行中'));
   assert.ok(html.includes('1 子代理'));
   assert.ok(!html.includes('1 子代理 ·'));   // 无运行中时不追加
@@ -936,11 +941,11 @@ test('旧任务失败不污染最新一条回显', async () => {
   });
   b.context.setTimeout = callback => { callback(); return 1; };
   b.run('bindSendBox("sid", {})');
-  b.node('msgbox').value = 'first';
+  typeDraft(b, 'first');
   b.node('sendbtn').click();                        // 第一条发送并停在轮询
   for(let i = 0; i < 30; i++) await Promise.resolve();
   assert.equal(b.run(`pendingEcho["sid"]?.text`), 'first');
-  b.node('msgbox').value = 'second';
+  typeDraft(b, 'second');
   const p2 = b.node('sendbtn').onclick();           // 第二条发送，轮询同样挂起
   for(let i = 0; i < 30; i++) await Promise.resolve();
   assert.equal(b.run(`pendingEcho["sid"]?.text`), 'second');
@@ -968,4 +973,412 @@ test('renderConvList 对账：落盘回显退场，未落盘保留', () => {
   b.run('renderConvList()');
   assert.ok(b.node('conv').innerHTML.includes('pending'));
   assert.ok(b.node('conv').innerHTML.includes('not yet'));
+});
+
+test('筛选：会话信息普通子串搜索覆盖元信息，大小写中文特殊字符空值与原排序', () => {
+  const b=boot();
+  const items=[{id:'a',title:'Alpha <x>',first_user_message:'开始',last_user_message:'最近请求',project:'/Repo',cwd:'/work',git_branch:'Feature',model:'Vendor-X',selected_model:'never-search'},
+    {id:'b',title:'Beta',last_user_message:'second'}, {id:'empty'}];
+  b.context.items=items;
+  for(const query of [' alpha ','<x>','开始','最近','/repo','/WORK','feature','vendor-x']){
+    b.context.query=query;
+    assert.equal(b.run('filterProjectSessions(items,{query,filter:"all"}).map(s=>s.id).join()'),'a',query);
+  }
+  for(const query of ['never-search','.*','missing']){
+    b.context.query=query; assert.equal(b.run('filterProjectSessions(items,{query,filter:"all"}).length'),0,query);
+  }
+  assert.equal(b.run('filterProjectSessions(items,{query:" ",filter:"all"}).map(s=>s.id).join()'),'a,b,empty');
+});
+
+test('筛选：单一状态与搜索AND，待审批严格正数，新回复独立于working与子代理', () => {
+  const b=boot();
+  b.run('const items=[{id:"a",title:"same",state:"working",hosted:true,pending_interactions:0},{id:"b",title:"same",state:"idle",pending_interactions:2,subagents_running:2},{id:"c",title:"other",state:"stale",pending_interactions:-1}]; unreadSessions.add("b")');
+  for(const [filter,expected] of [['all','a,b,c'],['working','a'],['hosted','a'],['pending','b'],['unread','b']]){
+    b.context.filter=filter;
+    assert.equal(b.run('filterProjectSessions(items,{query:"",filter}).map(s=>s.id).join()'),expected);
+  }
+  assert.equal(b.run('filterProjectSessions(items,{query:"other",filter:"pending"}).length'),0);
+});
+
+test('筛选：稳定工具栏不随输入和快照重建，统计保留原总量，项目条件独立保留', async () => {
+  const b=boot(frontendFetch);
+  b.run('sessions=[{id:"a",title:"Alpha <x>",project:"/p",hosted:true,pending_interactions:2,state:"working",tokens:{output:10}},{id:"b",title:"Beta",project:"/p",state:"idle",tokens:{output:20}},{id:"c",title:"Gamma",project:"/q",state:"idle"}]; navigate({project:"/p",session:null})');
+  const main=b.node('main'), search=b.node('sessionquery'), select=b.node('sessionfilter');
+  assert.match(main.innerHTML,/<label[^>]*for="sessionquery"[^>]*>搜索会话信息/);
+  assert.match(main.innerHTML,/<label[^>]*for="sessionfilter"/);
+  const writes=main.htmlWrites;
+  for(const text of ['A','Al','Alpha','中文']){
+    search.value=text; search.dispatchEvent({type:'input',isComposing:true});
+    assert.equal(main.htmlWrites,writes);
+    assert.equal(search.value,text,'合成期间不改写输入值');
+  }
+  assert.equal(b.node('listcount').textContent,'匹配 0 / 共 2');
+  assert.match(b.node('sessioncards').innerHTML,/没有匹配的会话/);
+  assert.match(b.node('listmeta').textContent,/输出合计 30 tok/);
+  assert.equal(b.node('pendingbadge').textContent,'待审批 2');
+  assert.equal(b.node('hostedbadge').textContent,'托管 1');
+  search.value='Alpha'; search.dispatchEvent({type:'input'});
+  select.value='hosted'; select.dispatchEvent({type:'change'});
+  assert.equal(b.node('listcount').textContent,'匹配 1 / 共 2');
+  assert.match(b.node('sessioncards').innerHTML,/Alpha &lt;x&gt;/);
+  assert.doesNotMatch(b.node('sessioncards').innerHTML,/Beta/);
+  b.run('applySessions(sessions.map(s=>({...s,last_event_at:100})))');
+  assert.equal(main.htmlWrites,writes); assert.equal(b.node('sessionquery'),search);
+  assert.equal(b.node('ccpanel').ccPanel,'list:/p');
+  b.run('navigate({project:"/q",session:null})');
+  assert.equal(search.value,''); assert.equal(select.value,'all');
+  search.value='Gamma'; search.dispatchEvent({type:'input'});
+  b.run('navigate({project:"/p",session:"a"})'); await flush();
+  b.run('navigate({project:"/p",session:null})');
+  assert.equal(search.value,'Alpha'); assert.equal(select.value,'hosted');
+  b.node('clearconditions').click();
+  assert.equal(search.value,''); assert.equal(select.value,'all');
+  assert.equal(b.node('listcount').textContent,'匹配 2 / 共 2');
+  b.run('renderSessionList({cwd:"/empty",sessions:[],out:0})');
+  assert.equal(b.node('listcount').textContent,'匹配 0 / 共 0');
+  assert.match(b.node('sessioncards').innerHTML,/此项目暂无会话/);
+});
+
+test('未读：首次包括null只建基线，严格推进高水位，旧时间与stale不误报', () => {
+  const b=boot(); b.run('renderMain=()=>{}');
+  b.run('applySessions([{id:"a",last_turn_end_at:10},{id:"b",last_turn_end_at:null}])');
+  assert.equal(b.run('unreadSessions.size'),0);
+  b.run('applySessions([{id:"a",last_turn_end_at:11,subagents_running:2},{id:"b",last_turn_end_at:20},{id:"new",last_turn_end_at:999}])');
+  assert.equal(b.run('unreadSessions.size'),2);
+  b.run('unreadSessions.clear(); applySessions([{id:"a",last_turn_end_at:11},{id:"b",last_turn_end_at:19}]); applySessions([{id:"a",last_turn_end_at:null},{id:"b",last_turn_end_at:"bad"}])');
+  assert.equal(b.run('unreadSessions.size'),0);
+  b.run('applySessions([{id:"a",last_turn_end_at:10,state:"working"}]); applySessions([{id:"a",last_turn_end_at:11,state:"stale"}])');
+  assert.equal(b.run('unreadSessions.size'),0);
+  b.run('applySessions([{id:"a",last_turn_end_at:12,state:"working"}])');
+  assert.equal(b.run('unreadSessions.has("a")'),true,'新一轮工作不清上一轮未读');
+});
+
+test('未读：详情成功展示且可见才清除，加载中失败隐藏均不清', async () => {
+  let detailResolve, messagesResolve;
+  const b=boot(async url=>{
+    if(url==='/sessions/a') return new Promise(r=>detailResolve=r);
+    if(url.includes('/messages')) return new Promise(r=>messagesResolve=r);
+    return frontendFetch(url);
+  });
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:null}]); applySessions([{id:"a",project:"/p",last_turn_end_at:10}]); navigate({project:"/p",session:"a"})');
+  assert.equal(b.run('unreadSessions.has("a")'),true);
+  detailResolve(response({error:'not ready'})); messagesResolve(response({messages:[]})); await flush();
+  assert.equal(b.run('unreadSessions.has("a")'),true);
+  b.context.document.hidden=true;
+  b.run('renderConversation("a",true)'); detailResolve(response(detailData('a'))); messagesResolve(response({messages:[]})); await flush();
+  assert.equal(b.run('unreadSessions.has("a")'),true);
+  b.context.document.hidden=false;
+  b.documentListeners.visibilitychange[0]();
+  assert.equal(b.run('unreadSessions.has("a")'),false);
+  assert.doesNotMatch(b.node('projs').innerHTML,/1 新回复/);
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:11}])');
+  assert.equal(b.run('unreadSessions.has("a")'),true,'旧内容可见不能确认新完成');
+  detailResolve(response(detailData('a'))); await flush();
+  messagesResolve(response({size:1,total:0,end:0,messages:[]})); await flush();
+  assert.equal(b.run('unreadSessions.has("a")'),false,'成功展示新水位消息后才清除');
+  b.context.document.hidden=true;
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:12}])');
+  assert.equal(b.run('unreadSessions.has("a")'),true);
+  b.run('view={project:"/p",session:"b"}'); b.context.document.hidden=false;
+  b.documentListeners.visibilitychange[0]();
+  assert.equal(b.run('unreadSessions.has("a")'),true,'路由面板不一致不可清除');
+});
+
+test('未读：旧消息响应不能确认请求后推进的完成水位，成功追赶后才清除', async () => {
+  let finish;
+  const b=boot(async url=>url.includes('/messages')?new Promise(r=>finish=r):frontendFetch(url));
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:1}]); navigate({project:"/p",session:"a"}); renderMain=()=>renderSidebar(groupByProject()); const refreshes=[]; scheduleConvRefresh=id=>refreshes.push(id)');
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:2}])');
+  finish(response({size:1,total:1,end:1,messages:[]})); await flush();
+  assert.equal(b.run('unreadSessions.has("a")'),true,'旧响应不能消费新完成');
+  assert.ok(b.run('refreshes.includes("a")'),'旧响应必须安排下一次刷新');
+  assert.match(b.node('projs').innerHTML,/1 新回复/);
+  const next=b.run('renderConversation("a",false)'); await flush();
+  finish(response({size:2,total:2,end:2,messages:[{role:'assistant',parts:[]}]})); await next;
+  assert.equal(b.run('unreadSessions.has("a")'),false);
+  assert.doesNotMatch(b.node('projs').innerHTML,/1 新回复/);
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:1}]); applySessions([{id:"a",project:"/p",last_turn_end_at:2}])');
+  assert.equal(b.run('unreadSessions.has("a")'),false,'旧快照不能重新点亮已读');
+  b.run('navigate({project:"/p",session:null}); renderSessionList(groupByProject()[0])');
+  assert.doesNotMatch(b.node('sessioncards').innerHTML,/新回复/);
+});
+
+test('未读：旧面板的新完成遇到消息失败或HTTP非200时保持未读，恢复可见不提前消费', async () => {
+  for(const failure of ['throw','http','error']){
+    let mode='ok';
+    const b=boot(async url=>{
+      if(url.includes('/messages')){
+        if(mode==='throw') throw Error('offline');
+        if(mode==='http') return {ok:false,status:503,json:async()=>({size:2,total:0,end:0,messages:[]})};
+        if(mode==='error') return response({error:'not ready'});
+        return response({size:1,total:0,end:0,messages:[]});
+      }
+      return frontendFetch(url);
+    });
+    b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:1}]); navigate({project:"/p",session:"a"})'); await flush();
+    b.run('renderMain=()=>renderSidebar(groupByProject()); scheduleConvRefresh=()=>{}');
+    b.context.document.hidden=true;
+    b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:2}])');
+    b.context.document.hidden=false; b.documentListeners.visibilitychange[0]();
+    assert.equal(b.run('unreadSessions.has("a")'),true,'恢复可见仍只展示旧内容');
+    mode=failure; await b.run('renderConversation("a",false)');
+    assert.equal(b.run('unreadSessions.has("a")'),true,failure);
+    // 可见面板也不能阻止下一次完成被标记。
+    b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:3}])');
+    assert.equal(b.run('unreadSessions.has("a")'),true);
+    mode='ok'; await b.run('renderConversation("a",false)');
+    assert.equal(b.run('unreadSessions.has("a")'),false,'成功消息刷新才清除');
+  }
+});
+
+test('未读：分页未追到末尾不清除，最后一页或截断重取成功才能确认', async () => {
+  let page={size:1,total:0,end:0,messages:[]};
+  const b=boot(async url=>url.includes('/messages')?response(page):frontendFetch(url));
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:1}]); navigate({project:"/p",session:"a"})'); await flush();
+  b.run('renderMain=()=>{}; const refreshes=[]; scheduleConvRefresh=id=>refreshes.push(id); applySessions([{id:"a",project:"/p",last_turn_end_at:2}])');
+  page={size:2,total:3,end:2,messages:[{role:'assistant',parts:[]}]};
+  await b.run('renderConversation("a",false)');
+  assert.equal(b.run('unreadSessions.has("a")'),true);
+  assert.ok(b.run('refreshes.includes("a")'));
+  page={size:2,total:3,end:3,messages:[{role:'assistant',parts:[]}]};
+  await b.run('renderConversation("a",false)');
+  assert.equal(b.run('unreadSessions.has("a")'),false);
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:3}])');
+  page={size:1,total:1,end:1,messages:[]};
+  await b.run('renderConversation("a",false)');
+  assert.equal(b.run('unreadSessions.has("a")'),false,'截断重取成功也可确认');
+});
+
+test('未读：初始分页未追完不确认，缺少完成时间的旧数据仍能正常展示', async () => {
+  let page={size:1,total:3,end:2,messages:[]};
+  const b=boot(async url=>url.includes('/messages')?response(page):frontendFetch(url));
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:1}]); applySessions([{id:"a",project:"/p",last_turn_end_at:2}]); const refreshes=[]; scheduleConvRefresh=id=>refreshes.push(id); navigate({project:"/p",session:"a"})'); await flush();
+  assert.equal(b.run('unreadSessions.has("a")'),true);
+  assert.ok(b.run('refreshes.includes("a")'));
+  page={size:1,total:3,end:3,messages:[]}; await b.run('renderConversation("a",false)');
+  assert.equal(b.run('unreadSessions.has("a")'),false);
+  b.run('navigate({project:"/p",session:"legacy"})'); await flush();
+  assert.equal(b.run('displayedSession'),'legacy');
+  assert.equal(b.run('unreadSessions.has("legacy")'),false);
+});
+
+test('未读：已读水位不被更晚返回的旧请求回退，初始与截断重取HTTP失败不确认', async () => {
+  const waiting=[];
+  const b=boot(async url=>url.includes('/messages')?new Promise(r=>waiting.push(r)):frontendFetch(url));
+  b.run('renderMain=()=>{}; scheduleConvRefresh=()=>{}; applySessions([{id:"a",project:"/p",last_turn_end_at:1}]); view={project:"/p",session:"a"}');
+  const old=b.run('renderConversation("a",true)');
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:2}])');
+  const newer=b.run('renderConversation("a",true)');
+  waiting[1](response({size:2,total:0,end:0,messages:[]})); await newer;
+  assert.equal(b.run('unreadSessions.has("a")'),false);
+  waiting[0](response({size:1,total:0,end:0,messages:[]})); await old;
+  assert.equal(b.run('displayedTurnEnd.get("a")'),2);
+  assert.equal(b.run('unreadSessions.has("a")'),false);
+  for(const stage of ['initial','detail','truncated']){
+    let failing=false;
+    const c=boot(async url=>{
+      if(failing && (stage==='detail'?url==='/sessions/a':url.includes('/messages') &&
+          (stage==='initial'||!url.includes('?from='))))
+        return {ok:false,status:503,json:async()=>({size:0,total:0,end:0,messages:[]})};
+      if(url.includes('/messages')) return response({size:failing?0:1,total:0,end:0,messages:[]});
+      return frontendFetch(url);
+    });
+    c.run('renderMain=()=>{}; scheduleConvRefresh=()=>{}; applySessions([{id:"a",project:"/p",last_turn_end_at:1}]); view={project:"/p",session:"a"}');
+    if(stage!=='initial') await c.run('renderConversation("a",true)');
+    c.run('applySessions([{id:"a",project:"/p",last_turn_end_at:2}])');
+    failing=true; await c.run('renderConversation("a",false)');
+    assert.equal(c.run('unreadSessions.has("a")'),true,stage+' HTTP失败不能确认');
+    failing=false; await c.run('renderConversation("a",false)');
+    assert.equal(c.run('unreadSessions.has("a")'),false,stage+' 重试成功才确认');
+  }
+});
+
+test('未读：全局snapshot与HTTP共用高水位，旧HTTP不得覆盖更新SSE列表', async () => {
+  let finish;
+  const b=boot(async url=>url==='/sessions'?new Promise(r=>finish=r):frontendFetch(url));
+  b.run('applySessions([{id:"a",project:"/p",last_turn_end_at:1}])');
+  const pending=b.run('load()');
+  b.run('onGlobalSse({data:JSON.stringify({type:"snapshot",seq:1,data:{sessions:[{id:"a",project:"/p",last_turn_end_at:3,title:"new"}]}})})');
+  finish(response([{id:'a',project:'/p',last_turn_end_at:2,title:'old'}])); await pending;
+  assert.equal(b.run('sessions[0].title'),'new');
+  assert.equal(b.run('unreadSessions.has("a")'),true);
+  assert.match(b.node('projs').innerHTML,/1 新回复/);
+  assert.match(b.node('sessioncards').innerHTML,/新回复/);
+  b.run('onGlobalSse({data:JSON.stringify({type:"turn_finished",seq:2,session:"a",data:{}})})');
+  b.run('unreadSessions.clear(); applySessions([{id:"a",project:"/p",last_turn_end_at:3}])');
+  assert.equal(b.run('unreadSessions.size'),0,'事件不另建标记判据，重复snapshot也不重复标记');
+  assert.doesNotMatch(b.node('projs').innerHTML,/1 新回复/);
+});
+
+const flush = async () => { for(let i=0;i<40;i++) await Promise.resolve(); };
+const detailData = id => ({id,cwd:'/p',project:'/p',state:'idle',tokens:{},tool_uses:{},subagents:[],tasks:[]});
+const frontendFetch = async url => {
+  if(url.startsWith('/cc-switch?')) return response({model_options:[]});
+  if(url.includes('/messages')) return response({size:1,total:0,messages:[]});
+  if(url==='/sessions') return response(['a','b'].map(detailData));
+  if(url.startsWith('/sessions/')) return response(detailData(url.split('/')[2]));
+  throw Error('unexpected fetch '+url);
+};
+function typeDraft(b, text){ b.node('msgbox').value=text; b.node('msgbox').dispatchEvent({type:'input'}); }
+
+test('草稿：会话、列表、新建项目与浏览器前进后退隔离，托管重建保留', async () => {
+  const b=boot(frontendFetch);
+  b.run('sessions=[{id:"a",project:"/p"},{id:"b",project:"/q"}]; navigate({project:"/p",session:"a"})');
+  await flush(); typeDraft(b,' A raw \n');
+  b.run('navigate({project:"/q",session:"b"})'); await flush();
+  assert.equal(b.node('msgbox').value,''); typeDraft(b,'B');
+  b.run('navigate({project:"/p",session:null}); navigate({project:"/p",new:true})');
+  assert.equal(b.node('msgbox').value,''); typeDraft(b,'new P');
+  b.run('navigate({project:"/q",new:true})');
+  assert.equal(b.node('msgbox').value,''); typeDraft(b,'new Q');
+  b.location.pathname='/p/p/new'; b.run('onPopState()');
+  assert.equal(b.node('msgbox').value,'new P');
+  b.location.pathname='/p/q/new'; b.run('onPopState()');
+  assert.equal(b.node('msgbox').value,'new Q');
+  b.run('navigate({project:"/p",session:"a"})'); await flush();
+  assert.equal(b.node('msgbox').value,' A raw \n');
+  typeDraft(b,'after hosting'); b.run('curPanel=null; renderConversation("a",true)'); await flush();
+  assert.equal(b.node('msgbox').value,'after hosting');
+  // 导航必须按旧 DOM 的 key 保存，即使 curPanel 已被托管更新清空。
+  b.node('msgbox').value='programmatic final'; b.run('curPanel=null; navigate({project:"/q",session:"b"})'); await flush();
+  assert.equal(b.node('msgbox').value,'B');
+  assert.equal(b.run('messageDrafts.get("a").text'),'programmatic final');
+});
+
+test('草稿：延迟202只清源提交版本，不清其他面板或后续同文输入，失败保留', async () => {
+  for(const mode of ['switch','edit','same','clear','failure','route-only']){
+    let finish;
+    const b=boot(async(url,opts={})=>url==='/sessions/a/message'
+      ? new Promise(resolve=>finish=resolve) : frontendFetch(url));
+    b.context.setTimeout = callback => { callback(); return 1; };
+    b.context.fetch=async(url,opts={})=>{
+      if(url==='/sessions/a/message') return new Promise(resolve=>finish=resolve);
+      if(url==='/jobs/j') return response({status:'done'});
+      if(mode==='route-only' && url.startsWith('/sessions/b')) return new Promise(()=>{});
+      return frontendFetch(url);
+    };
+    b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; bindSendBox("a",{hosted:true})');
+    typeDraft(b,' raw '); const pending=b.node('sendbtn').onclick();
+    if(mode==='switch'){
+      b.run('navigate({project:"/q",session:"b"})'); await flush(); typeDraft(b,'B unsent');
+    }else if(mode==='edit') typeDraft(b,'later');
+    else if(mode==='same'){ typeDraft(b,'different'); typeDraft(b,' raw '); }
+    else if(mode==='route-only') b.run('view={project:"/q",session:"b"}');
+    finish(mode==='failure' ? {ok:false,status:500,json:async()=>({error:'no'})}
+      : {ok:true,status:202,json:async()=>({job_id:'j'})});
+    await pending; await flush();
+    assert.equal(b.run('messageDrafts.get("a").text'),
+      ['switch','clear','route-only'].includes(mode)?'':mode==='edit'?'later':' raw ',mode);
+    if(mode==='switch') assert.equal(b.node('msgbox').value,'B unsent');
+    if(mode==='same') assert.equal(b.node('msgbox').value,' raw ');
+    if(mode==='clear') assert.equal(b.node('msgbox').value,'');
+    if(mode==='route-only') assert.equal(b.node('msgbox').value,' raw ','路由已切但旧面板还在时不能清DOM');
+  }
+});
+
+test('草稿：加载期间旧输入框不能在202后导航时复活已提交草稿', async () => {
+  for(const revisit of [false,true]){
+    let finishPost, delayA = false;
+    const delayedA = [];
+    const b=boot(async(url,opts={})=>{
+      if(url==='/sessions/a/message') return new Promise(resolve=>finishPost=resolve);
+      if(url==='/jobs/j') return response({status:'done'});
+      if(delayA && url.startsWith('/sessions/a'))
+        return new Promise(resolve=>delayedA.push([url,resolve]));
+      if(url.startsWith('/sessions/b')) return new Promise(()=>{});
+      return frontendFetch(url);
+    });
+    b.context.setTimeout=callback=>{callback();return 1;};
+    b.run('sessions=[{id:"a",project:"/p"},{id:"b",project:"/p"}]; navigate({project:"/p",session:"a"})');
+    await flush(); typeDraft(b,'submitted');
+    const pending=b.node('sendbtn').onclick();
+    b.run('navigate({project:"/p",session:"b"})');
+    finishPost({ok:true,status:202,json:async()=>({job_id:'j'})});
+    await pending; await flush();
+    assert.equal(b.run('messageDrafts.get("a").text'),'');
+    assert.equal(b.node('msgbox').value,'submitted','加载期间仍是旧输入框');
+    if(revisit){
+      delayA=true;
+      b.run('navigate({project:"/p",session:"a"})');
+    }
+    b.run('navigate({project:"/p",session:null})');
+    assert.equal(b.run('messageDrafts.get("a").text'),'','即使路由再次匹配A，旧版本也不能写回');
+    delayA=false;
+    for(const [url,resolve] of delayedA) resolve(await frontendFetch(url));
+    await flush();
+    b.run('navigate({project:"/p",session:"a"})'); await flush();
+    assert.equal(b.node('msgbox').value,'');
+    typeDraft(b,'new unsent');
+    b.run('navigate({project:"/p",session:null})');
+    assert.equal(b.run('messageDrafts.get("a").text'),'new unsent');
+  }
+});
+
+test('草稿：直接返回旧DOM的A成功加载后同步过期版本且保留请求期间输入', async () => {
+  for(const edit of [false,true]){
+    let finishPost, delayA=false;
+    const delayed=[]; const sent=[];
+    const b=boot(async(url,opts={})=>{
+      if(url==='/sessions/a/message'){
+        sent.push(JSON.parse(opts.body).text);
+        if(sent.length===1) return new Promise(r=>finishPost=r);
+        return {ok:true,status:202,json:async()=>({job_id:'j'})};
+      }
+      if(url==='/jobs/j') return response({status:'done'});
+      if(url.startsWith('/sessions/b')) return new Promise(()=>{});
+      if(delayA && url.startsWith('/sessions/a')) return new Promise(r=>delayed.push([url,r]));
+      return frontendFetch(url);
+    });
+    b.context.setTimeout=callback=>{callback();return 1;};
+    b.run('sessions=[{id:"a",project:"/p"},{id:"b",project:"/p"}]; navigate({project:"/p",session:"a"})');
+    await flush(); typeDraft(b,'submitted');
+    const pending=b.node('sendbtn').onclick();
+    b.run('navigate({project:"/p",session:"b"})');
+    finishPost({ok:true,status:202,json:async()=>({job_id:'j'})}); await pending; await flush();
+    delayA=true; b.run('navigate({project:"/p",session:"a"})');
+    if(edit) typeDraft(b,'during request');
+    delayA=false;
+    for(const [url,resolve] of delayed) resolve(await frontendFetch(url));
+    await flush();
+    assert.equal(b.node('msgbox').value,edit?'during request':'','直接复用DOM，不通过列表重建');
+    typeDraft(b,edit?'during request + next':'next');
+    await b.node('sendbtn').onclick(); await flush();
+    assert.deepEqual(sent,['submitted',edit?'during request + next':'next']);
+  }
+});
+
+test('草稿：新建202及sid迁移保护源页面、后续输入和目标已有草稿', async () => {
+  for(const mode of ['stay','leave','occupied','unchanged','failure']){
+    for(const hosted of [false,true]){
+      let finishPost, finishJob;
+      const b=boot(async(url,opts={})=>{
+        if((url==='/new'||url==='/hosted')&&opts.method==='POST') return new Promise(r=>finishPost=r);
+        if(url==='/jobs/j') return new Promise(r=>finishJob=r);
+        if(url==='/hosted') return response([{hosted_id:'h',session_id:'created'}]);
+        return frontendFetch(url);
+      });
+      b.context.setTimeout=callback=>{callback();return 1;};
+      b.run('sessions=[{id:"a",project:"/p"},{id:"b",project:"/q"}]; navigate({project:"/p",new:true})');
+      b.node('hostcb').checked=hosted; typeDraft(b,'first');
+      const pending=b.node('sendbtn').onclick();
+      if(mode==='leave') { typeDraft(b,'left unsent'); b.run('navigate({project:"/q",new:true})'); typeDraft(b,'other project'); }
+      else if(mode!=='unchanged'&&mode!=='failure') typeDraft(b,'unsent next');
+      if(mode==='occupied') b.run('saveMessageDraft("created","existing target")');
+      finishPost(mode==='failure'?{ok:false,status:500,json:async()=>({error:'no'})}
+        :{ok:true,status:202,json:async()=>({job_id:'j',hosted_id:'h'})});
+      await flush();
+      if(mode!=='failure') finishJob(response({status:'done',result_session_id:'created'}));
+      await pending; await flush();
+      if(mode==='leave'){
+        assert.equal(b.run('view.project'),'/q'); assert.equal(b.node('msgbox').value,'other project');
+        assert.equal(b.run('messageDrafts.get("new:/p").text'),'left unsent');
+        assert.equal(b.run('messageDrafts.has("created")'),false);
+      }else if(mode==='failure') assert.equal(b.node('msgbox').value,'first');
+      else{
+        assert.equal(b.run('view.session'),'created');
+        assert.equal(b.node('msgbox').value,mode==='occupied'?'existing target':mode==='unchanged'?'':'unsent next');
+        assert.equal(b.run('messageDrafts.get("new:/p").text'),mode==='occupied'?'unsent next':'');
+      }
+    }
+  }
 });

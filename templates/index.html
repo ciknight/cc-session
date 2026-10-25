@@ -37,7 +37,13 @@ main{overflow-y:auto;padding:12px 18px;min-width:0}
 .newbtn:hover{border-color:var(--acc);color:var(--fg)}
 .pname{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pmeta{font-size:12px;color:var(--mut)}
-/* 会话卡片 */
+/* 会话卡片与稳定的项目内工具栏 */
+.list-toolbar{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin:12px 0}
+.list-toolbar label{display:block;font-size:12px;color:var(--mut);margin-bottom:3px}
+.list-search{flex:1 1 220px;min-width:0}
+.list-toolbar input{width:100%;min-width:0;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:4px 8px;font:inherit}
+.list-toolbar select{font:inherit;padding:4px 6px}
+.list-toolbar input:focus-visible,.list-toolbar select:focus-visible,.list-toolbar button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .scard{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin:8px 0;cursor:pointer}
 .scard:hover{border-color:var(--acc)}
 .stitle{font-weight:600;margin:2px 0}
@@ -241,6 +247,87 @@ let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
                                    // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
 let pendingEcho = {};              // sid -> {text, failed} 发送后未落盘的本地回显
+const turnEndHighWater = new Map(), displayedTurnEnd = new Map(), unreadSessions = new Set();
+let sessionsVersion = 0, displayedSession = null;
+function viewingSession(id){
+  return !document.hidden && !view.new && view.session === id && displayedSession === id
+    && curPanel?.type === "conv" && curPanel.key === id && convState.id === id;
+}
+function markDisplayedRead(){
+  const id = view.session;
+  if(viewingSession(id) && (displayedTurnEnd.get(id) || 0) >= (turnEndHighWater.get(id) || 0)
+     && unreadSessions.delete(id)) renderSidebar(groupByProject());
+}
+function confirmDisplayedMessages(id, requestEnd){
+  displayedSession = id;
+  const caughtUp = convState.cursor >= convState.total;
+  // 消息响应最多确认请求开始时已观察到的完成；旧响应不能消费请求期间的新回合。
+  if(caughtUp) displayedTurnEnd.set(id, Math.max(displayedTurnEnd.get(id) || 0, requestEnd));
+  markDisplayedRead();
+  if(!caughtUp || requestEnd < (turnEndHighWater.get(id) || 0)) scheduleConvRefresh(id);
+}
+function applySessions(next){
+  if(!Array.isArray(next)) throw Error("会话列表响应无效");
+  for(const s of next){
+    const end = typeof s.last_turn_end_at === "number" && Number.isFinite(s.last_turn_end_at)
+      && s.last_turn_end_at > 0 ? s.last_turn_end_at : 0;
+    if(!turnEndHighWater.has(s.id)){ turnEndHighWater.set(s.id, end); continue; }
+    if(end > turnEndHighWater.get(s.id)){
+      turnEndHighWater.set(s.id, end);
+      unreadSessions.add(s.id);
+    }
+  }
+  sessions = next;
+  sessionsVersion++;
+  markDisplayedRead();
+  renderMain();
+}
+const messageDrafts = new Map();   // 独立于模型草稿；只在当前页面内存保存
+function saveMessageDraft(key, text, input = false){
+  const draft = messageDrafts.get(key) || {text: "", version: 0};
+  if(input || draft.text !== text) draft.version++;
+  draft.text = text;
+  messageDrafts.set(key, draft);
+  return draft;
+}
+function saveComposerDraft(){
+  const box = document.getElementById("msgbox"), key = box?.dataset.draftKey;
+  // 导航加载期间旧 DOM 可能仍在，但提交已消费其版本，不能再把旧文本写回。
+  if(key && Number(box.dataset.draftVersion) === messageDrafts.get(key)?.version){
+    box.dataset.draftVersion = String(saveMessageDraft(key, box.value).version);
+  }
+}
+function bindMessageDraft(key){
+  const box = document.getElementById("msgbox");
+  if(!box) return;
+  const draft = saveMessageDraft(key, messageDrafts.get(key)?.text || "");
+  box.dataset.draftKey = key;
+  box.dataset.draftVersion = String(draft.version);
+  box.value = draft.text;
+  box.oninput = () => {
+    box.dataset.draftVersion = String(saveMessageDraft(key, box.value, true).version);
+  };
+}
+function captureMessageDraft(key){
+  saveComposerDraft();
+  const draft = messageDrafts.get(key) || saveMessageDraft(key, "");
+  return {key, rawText: draft.text, version: draft.version};
+}
+function composerRouteMatch(key){
+  return key.startsWith("new:") ? !!view.new && "new:" + view.project === key
+    : !view.new && view.session === key;
+}
+function clearSubmittedDraft(submitted){
+  const draft = messageDrafts.get(submitted.key);
+  if(!draft || draft.version !== submitted.version || draft.text !== submitted.rawText) return;
+  const cleared = saveMessageDraft(submitted.key, "");
+  const box = document.getElementById("msgbox");
+  if(composerRouteMatch(submitted.key) && panelMatch(submitted.key)
+     && box?.dataset.draftKey === submitted.key && box.value === submitted.rawText){
+    box.value = "";
+    box.dataset.draftVersion = String(cleared.version);
+  }
+}
 
 /* ---------- 工具 ---------- */
 function relTime(ts){
@@ -621,8 +708,7 @@ function onSessionSse(event){
 function handleSseMessage(msg){
   if(msg.type === "snapshot"){
     if(msg.data.sessions){
-      sessions = msg.data.sessions;
-      renderMain();
+      applySessions(msg.data.sessions);
     }
     if(msg.data.session && view.session === msg.session){
       applySessionDetail(msg.data.session);
@@ -741,6 +827,7 @@ function groupByProject(){
     .map(([cwd, ss]) => ({
       cwd, sessions: ss,
       working: ss.filter(s => s.state === "working").length,
+      unread: ss.filter(s => unreadSessions.has(s.id)).length,
       wt: ss.filter(s => s.cwd && s.cwd !== s.project).length,
       out: ss.reduce((a, s) => a + ((s.tokens || {}).output || 0), 0),
       last: Math.max(...ss.map(s => s.last_event_at || 0)),
@@ -754,37 +841,84 @@ function groupByProject(){
 /* ---------- 渲染：项目侧栏 ---------- */
 function renderSidebar(projects){
   const sig = JSON.stringify([view.project,
-    projects.map(p => [p.cwd, p.sessions.length, p.working, p.wt, p.last])]);
+    projects.map(p => [p.cwd, p.sessions.length, p.working, p.wt, p.last, p.unread])]);
   if(sig === lastSidebarSig) return;
   lastSidebarSig = sig;
   document.getElementById("projs").innerHTML = projects.map(p => `
     <div class="pitem ${p.cwd === view.project ? "active" : ""}" data-cwd="${esc(p.cwd)}">
       <div class="pname">${esc(projName(p.cwd))}
-        ${p.working ? `<span class="b working">${p.working}</span>` : ""}</div>
+        ${p.working ? `<span class="b working">${p.working}</span>` : ""}
+        ${p.unread ? `<span class="chip" aria-label="${p.unread} 个会话有新回复">${p.unread} 新回复</span>` : ""}</div>
       <div class="pmeta">${p.sessions.length} 会话${p.wt ? ` · ${p.wt} 子目录` : ""} · ${relTime(p.last)}</div>
       <button class="newbtn" data-cwd="${esc(p.cwd)}" title="在此项目新建会话">＋</button>
     </div>`).join("") || '<div class="empty">暂无项目</div>';
 }
 
 /* ---------- 渲染：会话列表 ---------- */
+const projectConditions = new Map();
+function listConditions(cwd){
+  if(!projectConditions.has(cwd)) projectConditions.set(cwd, {query: "", filter: "all"});
+  return projectConditions.get(cwd);
+}
+function filterProjectSessions(items, conditions){
+  const query = (conditions.query || "").trim().toLowerCase();
+  return items.filter(s => {
+    const filter = conditions.filter;
+    if(filter === "working" && s.state !== "working"
+       || filter === "hosted" && !s.hosted
+       || filter === "pending" && !(s.pending_interactions > 0)
+       || filter === "unread" && !unreadSessions.has(s.id)) return false;
+    return !query || [sessTitle(s), s.title, s.project, s.cwd, s.git_branch, s.model,
+      s.first_user_message, s.last_user_message].some(value => String(value ?? "").toLowerCase().includes(query));
+  });
+}
 function renderSessionList(p){
-  const previousPanel = curPanel;
+  const samePanel = curPanel?.type === "list" && curPanel.key === p.cwd;
   curPanel = {type: "list", key: p.cwd};
-  const sig = JSON.stringify([p.cwd, p.sessions]);
-  if(sig === lastListSig && previousPanel && previousPanel.type === "list"
-     && previousPanel.key === p.cwd) return;
+  const conditions = listConditions(p.cwd);
+  const sig = JSON.stringify([p.cwd, p.sessions, p.out, conditions, [...unreadSessions]]);
+  if(samePanel && sig === lastListSig) return;
   lastListSig = sig;
-  const main = document.getElementById("main");
-  main.innerHTML = `
-    <h2 style="font-size:16px;margin:4px 0">${esc(projName(p.cwd))}
-      <span class="mut">${esc(p.cwd)} · ${p.sessions.length} 会话 · 输出合计 ${fmtTok(p.out)} tok</span>
-      <button class="back" id="newp" style="float:right">＋ 新建会话</button></h2>
-    ${ccHtml()}
-    ${p.sessions.map(s => `
+  if(!samePanel){
+    document.getElementById("main").innerHTML = `
+      <h2 style="font-size:16px;margin:4px 0">${esc(projName(p.cwd))}
+        <span class="mut" id="listmeta"></span>
+        <button class="back" id="newp" style="float:right">＋ 新建会话</button></h2>
+      ${ccHtml()}
+      <div class="list-toolbar">
+        <div class="list-search"><label for="sessionquery">搜索会话信息</label>
+          <input id="sessionquery" type="search" placeholder="标题、目录、分支、模型或用户输入"></div>
+        <div><label for="sessionfilter">筛选会话</label>
+          <select id="sessionfilter"><option value="all">全部</option><option value="working">工作中</option>
+            <option value="hosted">托管中</option><option value="pending">待审批</option><option value="unread">新回复</option></select></div>
+        <button class="back" id="clearconditions">清除条件</button>
+        <span class="mut" id="listcount" role="status"></span>
+      </div>
+      <div id="sessioncards"></div>`;
+    const search = document.getElementById("sessionquery"), select = document.getElementById("sessionfilter");
+    search.value = conditions.query; select.value = conditions.filter;
+    const refresh = () => {
+      if(curPanel?.type !== "list" || curPanel.key !== p.cwd) return;
+      // 输入期间不回写 value，也不替换工具栏，保留焦点和输入法合成状态。
+      conditions.query = search.value; conditions.filter = select.value;
+      const current = groupByProject().find(project => project.cwd === p.cwd) || p;
+      renderSessionList(current);
+    };
+    search.oninput = refresh; select.onchange = refresh;
+    document.getElementById("clearconditions").onclick = () => {
+      search.value = ""; select.value = "all"; refresh();
+    };
+    bindCc(p.cwd);
+  }
+  document.getElementById("listmeta").textContent = `${p.cwd} · ${p.sessions.length} 会话 · 输出合计 ${fmtTok(p.out)} tok`;
+  const matching = filterProjectSessions(p.sessions, conditions);
+  document.getElementById("listcount").textContent = `匹配 ${matching.length} / 共 ${p.sessions.length}`;
+  document.getElementById("sessioncards").innerHTML = matching.map(s => `
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
         ${s.hosted ? '<span class="chip" title="消息直接写入常驻 claude 进程">⚙ 托管中</span>' : ""}
         ${s.pending_interactions ? `<span class="chip pending">待审批 ${s.pending_interactions}</span>` : ""}
+        ${unreadSessions.has(s.id) ? '<span class="chip" title="本页面观察到主回合结束；不代表任务成功或后台子代理全部结束">新回复</span>' : ""}
         <span class="stitle">${esc(sessTitle(s))}</span>
         <div class="mut">${[
           s.cwd !== s.project ? "⎇ " + projName(s.cwd) : null,
@@ -796,8 +930,7 @@ function renderSessionList(p){
           s.tokens && s.tokens.output && `输出 ${fmtTok(s.tokens.output)} tok`,
         ].filter(Boolean).map(esc).join(" · ")}</div>
         <div class="mut" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.last_user_message || "")}</div>
-      </div>`).join("")}`;
-  bindCc(p.cwd);
+      </div>`).join("") || `<div class="empty">${p.sessions.length ? "没有匹配的会话，请调整或清除条件" : "此项目暂无会话"}</div>`;
 }
 
 /* ---------- 渲染：会话详情 + 对话 ---------- */
@@ -1101,16 +1234,17 @@ async function renderConversation(id, force){
   if(!force && convLoading === id) return;
   convLoading = id;
   const main = document.getElementById("main");
-  const draft = document.getElementById("msgbox")?.value || "";   // 整体重建面板时保留草稿
   try{
     const isNew = !(curPanel && curPanel.type === "conv" && curPanel.key === id
                     && document.getElementById("conv"));
     if(isNew || force || convState.id !== id){
+      const requestEnd = turnEndHighWater.get(id) || 0;
       const [dRes, mRes] = await Promise.all([
         fetch("/sessions/" + encodeURIComponent(id)),
         fetch(`/sessions/${encodeURIComponent(id)}/messages?limit=100`),
       ]);
       const d = await dRes.json(), m = await mRes.json();
+      if(!dRes.ok || !mRes.ok || m.error) return;
       if(view.session !== id) return;   // 已切换走
       if(d.error){   // 转录尚未被轮询发现（常见于刚创建的会话）
         if(isNew) main.innerHTML = '<div class="empty">会话转录尚未就绪，稍候自动刷新…</div>';
@@ -1137,13 +1271,17 @@ async function renderConversation(id, force){
         document.getElementById("back").onclick = () => {
           navigate({project: view.project, session: null, new: false});
         };
-        document.getElementById("msgbox").value = draft;
+        // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
         bindSendBox(id, d);
         curPanel = {type: "conv", key: id};
         bindModel(id, d.selected_model);
         loadModelOptions(id, d.cwd);
         connectSessionSse(id);
       }
+      // 返回尚未替换的旧面板时仅同步过期草稿；请求期间 input 已更新版本则不碰输入框。
+      const box = document.getElementById("msgbox");
+      if(!isNew && (box?.dataset.draftKey !== id
+         || Number(box.dataset.draftVersion) !== messageDrafts.get(id)?.version)) bindMessageDraft(id);
       applySessionDetail(d);
       renderInteractions(d.interactions || []);
       updateHostedControls(d);
@@ -1153,6 +1291,7 @@ async function renderConversation(id, force){
       }
       clearLiveBubble();
       renderConvList();
+      confirmDisplayedMessages(id, requestEnd);
       return;
     }
 
@@ -1160,20 +1299,22 @@ async function renderConversation(id, force){
     const dRes = await fetch("/sessions/" + encodeURIComponent(id));
     const d = await dRes.json();
     if(view.session !== id) return;
-    if(d.error) return;
+    if(!dRes.ok || d.error) return;
     applySessionDetail(d);
     renderInteractions(d.interactions || []);
     updateHostedControls(d);
     updateSendSt(id);
+    let requestEnd = turnEndHighWater.get(id) || 0;
     const mRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages` +
       `?from=${convState.cursor}&limit=500`);
     const m = await mRes.json();
-    if(view.session !== id) return;
+    if(!mRes.ok || m.error || view.session !== id) return;
     if(convState.id !== id || m.size < convState.size || m.total < convState.total){
       // 文件被截断/替换：重新取最近一页
+      requestEnd = turnEndHighWater.get(id) || 0;
       const freshRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages?limit=100`);
       const fresh = await freshRes.json();
-      if(view.session !== id) return;
+      if(!freshRes.ok || fresh.error || view.session !== id) return;
       convState = {id, msgs: (fresh.messages || []).slice(),
                    total: fresh.total || 0, cursor: fresh.end || 0,
                    start: fresh.start || 0, size: fresh.size || 0,
@@ -1191,12 +1332,12 @@ async function renderConversation(id, force){
       renderConvList();
       if(nearTop) main.scrollTop = 0;
       else main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
-      if(m.end < m.total) scheduleConvRefresh(id);
     } else {
       convState.total = m.total;
       convState.cursor = m.end != null ? m.end : convState.cursor;
       convState.size = m.size;
     }
+    confirmDisplayedMessages(id, requestEnd);
   }catch(e){ /* 下次刷新重试 */ }
   finally{ if(convLoading === id) convLoading = null; }
 }
@@ -1288,7 +1429,6 @@ function renderNewSession(p){
     updateSendSt("new:" + p.cwd);   // 面板已在页面上：只更新状态行，不动输入框
     return;
   }
-  const draft = document.getElementById("msgbox")?.value || "";   // 整体重建面板时保留草稿
   main.innerHTML = `
     <button class="back" id="back">← 返回列表</button>
     <h2 style="font-size:16px;margin:8px 0">新建会话 <span class="mut">${esc(p.cwd)}</span></h2>
@@ -1296,7 +1436,7 @@ function renderNewSession(p){
   document.getElementById("back").onclick = () => {
     navigate({project: view.project, session: null, new: false});
   };
-  document.getElementById("msgbox").value = draft;
+  // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
   bindNewBox(p);
   curPanel = {type: "new", key: p.cwd};
   bindModel("new:" + p.cwd, null);
@@ -1307,13 +1447,14 @@ function renderNewSession(p){
 function bindNewBox(p){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
+  const key = "new:" + p.cwd;
+  bindMessageDraft(key);
   bindComposerKeys();
   btn.onclick = async () => {
-    const text = document.getElementById("msgbox").value.trim();
+    const submitted = captureMessageDraft(key), text = submitted.rawText.trim();
     if(!text) return;
     const useHost = document.getElementById("hostcb").checked;
     const approval = document.getElementById("approvalsel")?.value || "auto";
-    const key = "new:" + p.cwd;
     const selectedModel = modelSnapshot(key);
     if(selectedModel === undefined) return;
     sendJobs[key] = {status: "sending", requested_model: selectedModel, text};
@@ -1326,6 +1467,18 @@ function bindNewBox(p){
       delete sendJobs[key];
       pendingEcho[sid] = {text};   // 新会话转录尚未就绪，先在对话顶部本地回显
       if(view.new && view.project === p.cwd){
+        saveComposerDraft();
+        const remaining = messageDrafts.get(key)?.text || "";
+        // 只有确实自动导航时迁移；目标已有草稿优先，源草稿保留以免丢失。
+        if(remaining && !messageDrafts.get(sid)?.text){
+          saveMessageDraft(sid, remaining);
+          const cleared = saveMessageDraft(key, "");
+          const box = document.getElementById("msgbox");
+          if(box?.dataset.draftKey === key){
+            box.value = "";
+            box.dataset.draftVersion = String(cleared.version);
+          }
+        }
         // 新建页是一次性入口，用 replace 换成会话地址，返回时直接回到项目列表
         navigate({project: p.cwd, session: sid, new: false}, {replace: true});
       }
@@ -1343,7 +1496,7 @@ function bindNewBox(p){
         sendJobs[key] = {status: "failed", error: j.error || ("HTTP " + r.status)};
         updateSendSt(key); return;
       }
-      document.getElementById("msgbox").value = "";
+      clearSubmittedDraft(submitted);
       const deadline = Date.now() + SEND_POLL_TIMEOUT_MS;
       for(;;){
         if(Date.now() >= deadline){
@@ -1398,6 +1551,7 @@ function bindNewBox(p){
 function bindSendBox(id, d){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
+  bindMessageDraft(id);
   bindComposerKeys();
   const un = document.getElementById("unhostbtn");
   if(un) un.onclick = async () => {
@@ -1446,7 +1600,7 @@ function bindSendBox(id, d){
     }
   };
   btn.onclick = async () => {
-    const text = document.getElementById("msgbox").value.trim();
+    const submitted = captureMessageDraft(id), text = submitted.rawText.trim();
     if(!text) return;
     const force = document.getElementById("forcecb").checked;
     const selectedModel = modelSnapshot(id);
@@ -1467,8 +1621,7 @@ function bindSendBox(id, d){
         markEchoFailed(id, text);
         updateSendSt(id); return;
       }
-      const box = document.getElementById("msgbox");
-      if(box) box.value = "";
+      clearSubmittedDraft(submitted);
       // 202 后立刻解除“发送中”锁定：托管会话可以继续排队，不必等整轮结束。
       sendJobs[id] = {jobId: j.job_id, status: j.status || "queued",
                       text: (sendJobs[id] || {}).text};
@@ -1477,7 +1630,7 @@ function bindSendBox(id, d){
       updateSendSt(id);
       // 本次刚启动托管时重建一次面板，让“托管中/退出托管”控件立即出现；
       // 已有托管或一次性消息只做软刷新，避免打断正在输入的下一条消息。
-      if(useHost) curPanel = null;
+      if(useHost && composerRouteMatch(id) && panelMatch(id)) curPanel = null;
       load();
       const deadline = Date.now() + SEND_POLL_TIMEOUT_MS;
       for(;;){
@@ -1528,6 +1681,7 @@ function syncUrl(v, replace){
   try{ (replace ? h.replaceState : h.pushState).call(h, null, "", next); }catch(e){ }
 }
 function clearSessionView(){
+  displayedSession = null;
   disconnectSessionSse();
   clearLiveBubble();
   convCache = {id: null, size: -1};
@@ -1535,6 +1689,7 @@ function clearSessionView(){
                hasMore: false, loadingEarlier: false};
 }
 function navigate(next, opts){
+  saveComposerDraft();   // 此时路由尚未改变；以旧输入框所属 key 保存，不能依赖 curPanel。
   next = next || {project: null, session: null, new: false};
   const leaving = view.session !== (next.session || null);
   view = next;
@@ -1597,12 +1752,15 @@ async function load(){
   if(loading) return;
   loading = true;
   lastListLoad = Date.now();
+  const version = sessionsVersion;
   try{
     const r = await fetch("/sessions");
-    sessions = await r.json();
+    const next = await r.json();
+    if(version !== sessionsVersion) return;   // 请求期间已有 SSE 快照，旧 HTTP 列表不能覆盖它。
+    if(!r.ok) throw Error("HTTP " + r.status);
+    applySessions(next);
     document.getElementById("err").textContent = "";
     document.getElementById("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
-    renderMain();
   }catch(e){
     document.getElementById("err").textContent = "连接失败: " + e.message;
   }finally{
@@ -1659,6 +1817,11 @@ document.getElementById("main").addEventListener("click", e => {
 
 // toggle 不冒泡，用捕获阶段记录用户手动展开/折叠的 <details>
 if(document.addEventListener){
+  document.addEventListener("visibilitychange", () => {
+    if(document.hidden) return;
+    markDisplayedRead();
+    if(view.session && unreadSessions.has(view.session)) scheduleConvRefresh(view.session);
+  });
   document.addEventListener("toggle", event => {
     const el = event.target;
     if(el && el.tagName === "DETAILS" && el.dataset && el.dataset.dkey){
