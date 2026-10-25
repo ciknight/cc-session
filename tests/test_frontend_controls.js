@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const html = fs.readFileSync(path.join(__dirname, '../templates/index.html'), 'utf8');
-const source = html.match(/<script>([\s\S]*?)<\/script>/)[1]
+const source = html.match(/<script>([\s\S]*?)<\/script>/)[1].replace(/\r\n/g, '\n')
   .replace(/\{\{ refresh_interval \| round\(3\) \}\}/, '3')
   .replace(/\nload\(\);\nresetTimer\(\);/, '\n');
 function boot(fetch = async () => { throw Error('unexpected fetch'); }) {
@@ -559,7 +559,7 @@ test('审批卡片与富工具结果渲染，中断按钮随托管状态启用',
   b.run('updateHostedControls({hosted:true,hosted_busy:true,approval:"ask"})');
   assert.equal(b.node('intbtn').disabled,false);
 });
-test('全局待审批计数显示与隐藏', () => {
+test('全局待审批计数显示且零时入口保留', () => {
   const b=boot();
   b.run('sessions=[{id:"a",pending_interactions:1},{id:"b",pending_interactions:2}]');
   b.run('renderPendingBadge()');
@@ -567,7 +567,7 @@ test('全局待审批计数显示与隐藏', () => {
   assert.equal(b.node('pendingbadge').style.display,'inline-block');
   b.run('sessions=[{id:"a",pending_interactions:0}]');
   b.run('renderPendingBadge()');
-  assert.equal(b.node('pendingbadge').style.display,'none');
+  assert.equal(b.node('pendingbadge').style.display,'inline-block');
 });
 test('全局托管计数显示、隐藏与点击跳转', () => {
   const b=boot();
@@ -1162,6 +1162,55 @@ test('未读：初始分页未追完不确认，缺少完成时间的旧数据�
   assert.equal(b.run('unreadSessions.has("legacy")'),false);
 });
 
+test('对话请求：旧初始响应不能回退新消息DOM、清新请求锁或重建新草稿', async () => {
+  const waiting=[];
+  const b=boot(async url=>url.includes('/messages')?new Promise(r=>waiting.push(r)):frontendFetch(url));
+  b.run('renderMain=()=>{}; scheduleConvRefresh=()=>{}; view={project:"/p",session:"a"}; turnEndHighWater.set("a",10)');
+  const old=b.run('renderConversation("a",true)');
+  b.run('turnEndHighWater.set("a",20)');
+  const newer=b.run('renderConversation("a",true)');
+  const page=text=>response({size:20,total:1,end:1,messages:[{role:'assistant',parts:[{type:'text',text}]}]});
+  waiting[1](page('NEW_REPLY')); await newer;
+  typeDraft(b,'new input during refresh');
+  const writes=b.node('main').htmlWrites;
+  const latest=b.run('renderConversation("a",true)');
+  waiting[0](page('OLD_REPLY')); await old;
+  assert.equal(b.run('convState.msgs[0].parts[0].text'),'NEW_REPLY');
+  assert.match(b.node('conv').innerHTML,/NEW_REPLY/);
+  assert.doesNotMatch(b.node('conv').innerHTML,/OLD_REPLY/);
+  assert.equal(b.node('main').htmlWrites,writes);
+  assert.equal(b.node('msgbox').value,'new input during refresh');
+  assert.notEqual(b.run('convLoading'),null,'旧finally不能解除新请求锁');
+  assert.equal(b.run('displayedTurnEnd.get("a")'),20);
+  waiting[2](page('LATEST_REPLY')); await latest;
+  assert.match(b.node('conv').innerHTML,/LATEST_REPLY/);
+  assert.equal(b.node('msgbox').value,'new input during refresh');
+});
+
+test('对话请求：分页、增量与截断fallback被force刷新取代，A-B-A拒旧实例', async () => {
+  for(const stage of ['earlier','incremental','fallback','navigation']){
+    const waiting=[]; let delayed=false;
+    const b=boot(async url=>delayed&&url.includes('/messages')?new Promise(r=>waiting.push([url,r])):frontendFetch(url));
+    b.run('renderMain=()=>{}; view={project:"/p",session:"a"}');
+    await b.run('renderConversation("a",true)');
+    b.run('convState.hasMore=true; convState.size=10; convState.total=10; convState.cursor=10; convState.start=5');
+    delayed=true;
+    const old=b.run(stage==='earlier'?'loadEarlier()':'renderConversation("a",false)'); await flush();
+    if(stage==='fallback'){
+      waiting.shift()[1](response({size:0,total:0,end:0,messages:[]})); await flush();
+      assert.match(waiting[0][0],/limit=100/);
+    }
+    if(stage==='navigation') b.run('navigate({project:"/p",session:"b"}); navigate({project:"/p",session:"a"})');
+    const newer=b.run(stage==='navigation'?'renderConversation("a",false)':'renderConversation("a",true)'); await flush();
+    waiting.pop()[1](response({size:20,total:1,end:1,messages:[{role:'user',parts:[{type:'text',text:'CURRENT'}]}]})); await newer;
+    const writes=b.node('conv').htmlWrites;
+    waiting.shift()[1](response({size:10,total:10,end:10,start:0,messages:[{role:'user',parts:[{type:'text',text:'STALE'}]}]})); await old;
+    assert.equal(b.node('conv').htmlWrites,writes,stage);
+    assert.equal(b.run('convState.msgs[0].parts[0].text'),'CURRENT',stage);
+    assert.match(b.node('conv').innerHTML,/CURRENT/);
+  }
+});
+
 test('未读：已读水位不被更晚返回的旧请求回退，初始与截断重取HTTP失败不确认', async () => {
   const waiting=[];
   const b=boot(async url=>url.includes('/messages')?new Promise(r=>waiting.push(r)):frontendFetch(url));
@@ -1215,6 +1264,7 @@ const detailData = id => ({id,cwd:'/p',project:'/p',state:'idle',tokens:{},tool_
 const frontendFetch = async url => {
   if(url.startsWith('/cc-switch?')) return response({model_options:[]});
   if(url.includes('/messages')) return response({size:1,total:0,messages:[]});
+  if(url.endsWith('/jobs')) return response({session:url.split('/')[2],running:[],queued:[],recent:[]});
   if(url==='/sessions') return response(['a','b'].map(detailData));
   if(url.startsWith('/sessions/')) return response(detailData(url.split('/')[2]));
   throw Error('unexpected fetch '+url);
@@ -1347,6 +1397,96 @@ test('草稿：直接返回旧DOM的A成功加载后同步过期版本且保留�
   }
 });
 
+test('新建回显：提交1000、user1000.1、发现sid1002，running即可对账且不借发现时窗口', async () => {
+  for(const hosted of [false,true]){
+    let now=1000000; const jobs=[];
+    const user={role:'user',ts:1000.1,parts:[{type:'text',text:'first'}]};
+    const b=boot(async(url,opts={})=>{
+      if((url==='/new'||url==='/hosted')&&opts.method==='POST') return {status:202,json:async()=>({job_id:'j',hosted_id:hosted?'hid':undefined})};
+      if(url==='/jobs/j') return new Promise(r=>jobs.push(r));
+      if(url==='/hosted') return response([{hosted_id:'hid',session_id:'created'}]);
+      if(url.includes('/messages')) return response({size:10,total:1,end:1,messages:[user]});
+      return frontendFetch(url);
+    });
+    b.context.Date=class extends Date {static now(){return now;}};
+    b.context.setTimeout=callback=>{callback();return 1;};
+    b.run('sessions=[{id:"created",project:"/p"}]; navigate({project:"/p",new:true})');
+    b.node('hostcb').checked=hosted; typeDraft(b,'first');
+    const pending=b.node('sendbtn').onclick(); await flush();
+    now=1002000;
+    // 用户可在sid发现查询返回前从列表进入已出现的会话；其中已有本次user。
+    b.run('navigate({project:"/p",session:"created"})'); await flush();
+    jobs.shift()(response({status:'running',session:hosted?'hid':undefined,result_session_id:hosted?undefined:'created'})); await flush();
+    assert.equal(b.run('sendJobs.created.status'),'running');
+    assert.equal(b.run('pendingEcho.created.submittedAt'),1000);
+    assert.equal(b.run('pendingEcho.created.after'),0);
+    b.run('renderConvList()');
+    assert.equal(b.run('pendingEcho.created'),undefined,'真实user已落盘，无须等job终态清回显');
+    assert.doesNotMatch(b.node('conv').innerHTML,/pending/);
+    jobs.shift()(response({status:'done',session:'created'})); await pending;
+  }
+});
+
+test('新建校正：持续采用job.session，保留echo与草稿，不抢切走路由或覆盖较新目标', async () => {
+  for(const mode of ['stay','leave','occupied']){
+    const jobs=[];
+    const b=boot(async(url,opts={})=>{
+      if(url==='/hosted'&&opts.method==='POST') return {status:202,json:async()=>({job_id:'j',hosted_id:'hid'})};
+      if(url==='/hosted') return response([{hosted_id:'hid',session_id:'pregenerated'}]);
+      if(url==='/jobs/j') return new Promise(r=>jobs.push(r));
+      return frontendFetch(url);
+    });
+    b.context.setTimeout=callback=>{callback();return 1;};
+    b.run('sessions=[{id:"a",project:"/p"}]; navigate({project:"/p",new:true})');
+    b.node('hostcb').checked=true; typeDraft(b,'first');
+    const pending=b.node('sendbtn').onclick(); await flush();
+    jobs.shift()(response({status:'running',session:'hid'})); await flush();
+    assert.equal(b.run('view.session'),'pregenerated','hosted id不能当作sid');
+    const echo=b.run('pendingEcho.pregenerated');
+    typeDraft(b,'unsent next');
+    if(mode==='leave'){b.run('navigate({project:"/p",session:"a"})');await flush();typeDraft(b,'other page');}
+    if(mode==='occupied') b.run('sendJobs.corrected={token:999,jobId:"second",status:"running"}; pendingEcho.corrected={token:999,text:"second"}; saveMessageDraft("corrected","target draft"); modelDrafts.corrected={value:"target-model",version:999}');
+    jobs.shift()(response({status:'running',session:'corrected',result_session_id:'corrected'})); await flush();
+    assert.equal(b.run('sendJobs.pregenerated'),undefined,mode+'释放旧sid源');
+    assert.equal(b.run('pendingEcho.pregenerated'),undefined);
+    if(mode==='occupied'){
+      await pending;
+      assert.equal(b.run('sendJobs.corrected.token'),999);
+      assert.equal(b.run('pendingEcho.corrected.text'),'second');
+      assert.equal(b.run('modelDrafts.corrected.value'),'target-model');
+      assert.equal(b.run('messageDrafts.get("corrected").text'),'target draft');
+      assert.equal(b.run('view.session'),'pregenerated');
+    }else{
+      assert.equal(b.run('sendJobs.corrected.jobId'),'j');
+      assert.equal(b.run('pendingEcho.corrected'),echo,'沿用原始echo对象');
+      assert.equal(b.run('view.session'),mode==='leave'?'a':'corrected');
+      assert.equal(b.node('msgbox').value,mode==='leave'?'other page':'unsent next');
+      if(mode==='stay') assert.equal(b.run('messageDrafts.get("corrected").text'),'unsent next');
+      jobs.shift()(response({status:'done',session:'corrected'})); await pending;
+    }
+  }
+});
+
+test('新建源槽：发现sid前目标有较新提交仍释放源且不接管目标', async () => {
+  let finishJob;
+  const b=boot(async(url,opts={})=>{
+    if(url==='/new') return {status:202,json:async()=>({job_id:'first'})};
+    if(url==='/jobs/first') return new Promise(r=>finishJob=r);
+    return frontendFetch(url);
+  });
+  b.context.setTimeout=callback=>{callback();return 1;};
+  b.run('sessions=[{id:"created",project:"/p"}]; navigate({project:"/p",new:true})');
+  typeDraft(b,'first'); const sending=b.node('sendbtn').onclick(); await flush();
+  b.run('navigate({project:"/p",session:"created"}); sendJobs.created={token:999,jobId:"second",status:"running"}; pendingEcho.created={token:999,text:"second"}');
+  await flush();
+  finishJob(response({status:'running',result_session_id:'created'})); await sending;
+  assert.equal(b.run('sendJobs["new:/p"]'),undefined);
+  assert.equal(b.run('sendJobs.created.token'),999);
+  assert.equal(b.run('pendingEcho.created.text'),'second');
+  b.run('navigate({project:"/p",new:true})');
+  assert.equal(b.node('sendbtn').disabled,false);
+});
+
 test('草稿：新建202及sid迁移保护源页面、后续输入和目标已有草稿', async () => {
   for(const mode of ['stay','leave','occupied','unchanged','failure']){
     for(const hosted of [false,true]){
@@ -1381,4 +1521,367 @@ test('草稿：新建202及sid迁移保护源页面、后续输入和目标已�
       }
     }
   }
+});
+
+
+test('管理：scope、alias 搜索与稳定置顶，不改变完整项目集', () => {
+ const b=boot(); b.context.items=[{id:'a',project:'/p',title:'原题',alias:'<别名>',archived:true,pinned:true},{id:'b',project:'/p'},{id:'c',project:'/p',pinned:true},{id:'d',project:'/p',pinned:true}];
+ assert.equal(b.run('filterProjectSessions(items,{}).map(s=>s.id).join()'),'c,d,b');
+ assert.equal(b.run('filterProjectSessions(items,{scope:"all",query:"原题"}).map(s=>s.id).join()'),'a');
+ assert.equal(b.run('filterProjectSessions(items,{scope:"archived"}).map(s=>s.id).join()'),'a');
+ assert.equal(b.run('sessTitle(items[0])'),'<别名>');
+ assert.equal(b.run('items.map(s=>s.id).join()'),'a,b,c,d');
+ b.run('sessions=items; renderSessionList(groupByProject()[0])');
+ assert.equal(b.node('listcount').textContent,'匹配 3 / 共 4');
+ assert.match(b.node('main').innerHTML,/sessionscope/);
+ b.run('listConditions("/p").scope="archived"; renderSessionList(groupByProject()[0])');
+ assert.match(b.node('sessioncards').innerHTML,/&lt;别名&gt;/);
+ assert.equal(b.run('groupByProject()[0].sessions.length'),4);
+});
+
+test('管理：metadata 统一拒旧、POST串行不改回合水位，别名编辑和详情软更新', async () => {
+ const pending=[]; const requests=[];
+ const b=boot((url,opts={})=>{if(url.endsWith('/metadata')){requests.push(JSON.parse(opts.body)); return new Promise(r=>pending.push(r));}return frontendFetch(url);});
+ b.run('applySessions([{id:"a",project:"/p",title:"原题",alias:null,metadata_revision:1,last_turn_end_at:10}]); view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; bindMetadata(sessions[0])');
+ b.node('aliasinput').value='编辑中'; b.node('aliasinput').oninput();
+ b.run('applySessionDetail({id:"a",title:"原题",alias:"服务器",metadata_revision:3,state:"idle"})');
+ assert.equal(b.node('aliasinput').value,'编辑中'); assert.equal(b.node('detailtitle').textContent,'服务器');
+ const first=b.run('saveMetadata("a",{pinned:true})'); const second=b.run('saveMetadata("a",{archived:true})');
+ await flush(); assert.equal(requests.length,1);
+ pending.shift()(response({id:'a',alias:'旧POST',pinned:true,archived:false,metadata_revision:2})); await flush();
+ assert.equal(requests.length,2); assert.equal(b.run('sessions[0].alias'),'服务器');
+ pending.shift()(response({id:'a',alias:'服务器',pinned:true,archived:true,metadata_revision:4})); await first; await second;
+ assert.equal(b.run('sessions[0].archived'),true); assert.equal(b.run('turnEndHighWater.get("a")'),10);
+ b.run('applySessions([{id:"a",project:"/p",title:"原题",alias:"陈旧SSE",metadata_revision:1,last_turn_end_at:10}])');
+ assert.equal(b.run('sessions[0].alias'),'服务器'); assert.equal(b.run('view.session'),'a');
+ assert.equal(b.node('aliasinput').value,'编辑中');
+});
+
+test('待处理：精确route、跨项目归档汇总、返回与零入口', async () => {
+ const b=boot(frontendFetch);
+ assert.equal(b.run('routePath({pending:true})'),'/pending'); assert.equal(b.run('parseRoute("/pending").pending'),true); assert.equal(b.run('parseRoute("/pending/no")'),null);
+ b.run('sessions=[{id:"a",project:"/p",pending_interactions:2,archived:true,alias:"<待办>",state:"working"},{id:"b",project:"/q",pending_interactions:1,state:"idle"}]; listConditions("/p").query="missing"; navigate({pending:true,project:null,session:null,new:false})');
+ assert.equal(b.location.pathname,'/pending'); assert.equal(b.run('view.project'),null);
+ assert.match(b.node('main').innerHTML,/2 个会话 \/ 3 项待处理/); assert.match(b.node('main').innerHTML,/已归档/); assert.match(b.node('main').innerHTML,/&lt;待办&gt;/);
+ b.node('main').dispatchEvent({type:'click',target:{closest:selector=>selector==='.scard'?{dataset:{id:'b'}}:null}}); await flush();
+ assert.equal(b.run('view.project'),'/q'); assert.equal(b.run('view.session'),'b');
+ b.location.pathname='/pending'; b.run('onPopState(); sessions=[]; renderMain()');
+ assert.match(b.node('main').innerHTML,/暂无待处理事项/); assert.match(b.node('projs').innerHTML,/pendingnav/); assert.equal(b.node('pendingbadge').style.display,'inline-block');
+});
+
+
+test('队列：独立容器事实快照、FIFO/待派发、取消权限、最近折叠与GET失败保留', async () => {
+ let mode='ok'; const b=boot(async url=>{
+   if(url==='/sessions/a/jobs'){
+     if(mode==='error') throw Error('offline');
+     return response({session:'a',running:[{id:'r',status:'running',text:'<执行>',requested_model:null,created_at:1,cancellable:false}],queued:[{id:'q',status:'queued',text:'排队',position:1,cancellable:true},{id:'p',status:'queued',text:'发布前',position:null,cancellable:false}],recent:[{id:'done',status:'cancelled',text:'已取消内容'}]});
+   } return frontendFetch(url);
+ });
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}');
+ await b.run('loadQueue("a")');
+ const markup=b.node('queue').innerHTML;
+ assert.match(markup,/&lt;执行&gt;/); assert.match(markup,/默认/); assert.match(markup,/待派发/); assert.match(markup,/最近结束/);
+ assert.match(markup,/data-cancel-job="q"/); assert.doesNotMatch(markup,/data-cancel-job="r"|data-cancel-job="p"/);
+ assert.match(markup,/data-dkey="queue:a:recent"/);
+ mode='error'; await b.run('loadQueue("a")');
+ assert.match(b.node('queue').innerHTML,/排队/); assert.match(b.node('queue').innerHTML,/offline/);
+ assert.match(b.run('composerHtml("conv",{})'),/中断并清空队列/);
+});
+
+test('队列：取消使旧GET失效，409不假取消，路由和generation保护面板', async () => {
+ const waiting=[]; let conflict=false;
+ const b=boot(async(url,opts={})=>{
+   if(opts.method==='POST') return conflict?{ok:false,status:409,json:async()=>({error:'claimed'})}:response({id:'q',status:'cancelled'});
+   if(url.endsWith('/jobs')) return new Promise(resolve=>waiting.push({url,resolve}));
+   return frontendFetch(url);
+ });
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}');
+ b.run('renderConversation=()=>{}');
+ const old=b.run('loadQueue("a")');
+ const cancel=b.run('cancelQueueJob("a","q")'); await flush();
+ assert.equal(waiting.length,2);
+ waiting[1].resolve(response({session:'a',running:[],queued:[],recent:[{id:'q',status:'cancelled',text:'取消成功'}]})); await cancel;
+ waiting[0].resolve(response({session:'a',running:[],queued:[{id:'q',text:'旧队列',cancellable:true}],recent:[]})); await old;
+ assert.doesNotMatch(b.node('queue').innerHTML,/旧队列/);
+ conflict=true; const failed=b.run('cancelQueueJob("a","r")'); await flush();
+ waiting[2].resolve(response({session:'a',running:[{id:'r',text:'执行中',status:'running'}],queued:[],recent:[]})); await failed;
+ assert.match(b.node('queue').innerHTML,/已开始执行，未取消/); assert.match(b.node('queue').innerHTML,/执行中/);
+ const left=b.run('loadQueue("a")'); b.run('navigate({pending:true})'); const writes=b.node('queue').htmlWrites;
+ waiting[3].resolve(response({session:'a',running:[],queued:[{id:'x',text:'不得跨页'}],recent:[]})); await left;
+ assert.equal(b.node('queue').htmlWrites,writes);
+});
+
+test('发送所有权：旧任务查询异常不能盖新sending，同文旧终态不能清新回显', async () => {
+ for(const result of ['done','failed','error']){
+   const posts=[], polls=[];
+   const b=boot((url,opts={})=>{
+     if(url.endsWith('/message')) return new Promise(r=>posts.push(r));
+     if(url.startsWith('/jobs/')) return new Promise((resolve,reject)=>polls.push({resolve,reject}));
+     return frontendFetch(url);
+   });
+   b.context.setTimeout=callback=>{callback();return 1;};
+   b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; bindSendBox("a",{hosted:true})');
+   typeDraft(b,'same'); const first=b.node('sendbtn').onclick(); posts[0]({ok:true,status:202,json:async()=>({job_id:'j1'})}); await flush();
+   typeDraft(b,'same'); const second=b.node('sendbtn').onclick();
+   if(result==='error') polls[0].reject(Error('offline')); else polls[0].resolve(response({status:result,error:'old failed'}));
+   await first; assert.equal(b.run('sendJobs.a.status'),'sending');
+   posts[1]({ok:true,status:202,json:async()=>({job_id:'j2'})}); await flush();
+   assert.equal(b.run('pendingEcho.a.jobId'),'j2'); assert.equal(b.run('pendingEcho.a.failed'),undefined);
+   polls[1].resolve(response({status:'done'})); await second;
+ }
+});
+
+test('发送所有权：历史同文不能提前清回显，分页shift仅挪动提交后窗口', () => {
+ const b=boot();
+ b.run('convState={id:"a",start:0,cursor:2,msgs:[{role:"user",parts:[{type:"text",text:"same"}]},{role:"assistant",parts:[]}],total:2}; pendingEcho.a={text:"same",token:1,after:2}; renderConvList()');
+ assert.equal(b.run('pendingEcho.a.text'),'same');
+ b.run('convState.msgs.push({role:"user",parts:[{type:"text",text:"same"}]}); convState.total=3; renderConvList()');
+ assert.equal(b.run('pendingEcho.a'),undefined);
+});
+
+
+test('发送所有权：新建sid迁移后首轮失败不覆盖后续发送与同文回显', async () => {
+ const polls=[]; let post=0;
+ const b=boot(async(url,opts={})=>{
+   if(url==='/hosted' && opts.method==='POST') return {ok:true,status:202,json:async()=>({job_id:'first',hosted_id:'h'})};
+   if(url==='/hosted') return response([{hosted_id:'h',session_id:'created'}]);
+   if(url==='/jobs/first') { if(!post++) return response({status:'running'}); return new Promise(r=>polls.push(r)); }
+   if(url==='/sessions/created/message') return {ok:true,status:202,json:async()=>({job_id:'next'})};
+   if(url==='/jobs/next') return new Promise(r=>polls.push(r));
+   return frontendFetch(url);
+ });
+ b.context.setTimeout=fn=>{fn();return 1;};
+ b.run('sessions=[{id:"a",project:"/p"}]; navigate({project:"/p",new:true})');
+ b.node('hostcb').checked=true; typeDraft(b,'same'); const first=b.node('sendbtn').onclick(); await flush();
+ assert.equal(b.run('view.session'),'created');
+ b.run('bindSendBox("created",{hosted:true})'); typeDraft(b,'same'); const next=b.node('sendbtn').onclick(); await flush();
+ assert.equal(b.run('sendJobs.created.jobId'),'next');
+ polls[0](response({status:'failed',error:'first failed'})); await first;
+ assert.equal(b.run('sendJobs.created.jobId'),'next'); assert.equal(b.run('pendingEcho.created.failed'),undefined);
+ polls[1](response({status:'done'})); await next;
+});
+
+
+test('管理：卡片动作拦导航，归档确认不触发interrupt，失败不伪成功，详情保留恢复', async () => {
+ const requests=[]; let fail=true; let warning='';
+ const b=boot(async(url,opts={})=>{
+   if(url.endsWith('/metadata')){requests.push([url,JSON.parse(opts.body)]); return fail?{ok:false,status:500,json:async()=>({error:'disk'})}:response({id:'a',archived:true,pinned:false,alias:null,metadata_revision:2});}
+   return frontendFetch(url);
+ });
+ b.context.window.confirm=text=>{warning=text;return true;};
+ b.run('sessions=[{id:"a",project:"/p",title:"标题",state:"working",hosted_queued:2}]; navigate({project:"/p",session:null})');
+ const writes=b.node('main').htmlWrites, scope=b.node('sessionscope');
+ let stopped=false;
+ b.node('main').dispatchEvent({type:'click',preventDefault(){},stopPropagation(){stopped=true;},target:{closest:selector=>selector==='[data-meta]'?{dataset:{sid:'a',meta:'archive'}}:selector==='.scard'?{dataset:{id:'a'}}:null}});
+ await flush(); assert.equal(stopped,true); assert.equal(b.run('view.session'),null); assert.match(warning,/不会停止执行/); assert.match(warning,/不会清空/);
+ assert.equal(b.run('sessions[0].archived'),undefined); assert.equal(b.node('main').htmlWrites,writes); assert.equal(b.node('sessionscope'),scope);
+ fail=false; await b.run('metadataAction("a","archive")');
+ assert.equal(b.run('sessions[0].archived'),true); assert.ok(requests.every(([url])=>url.endsWith('/metadata')));
+ b.run('navigate({project:"/p",session:"a"})'); await flush();
+ assert.equal(b.run('view.session'),'a'); assert.match(b.node('metadataactions').innerHTML,/恢复/);
+ const panelWrites=b.node('main').htmlWrites; typeDraft(b,'keep composer');
+ b.run('applySessionDetail({id:"a",title:"原标题",alias:"<新标题>",archived:true,metadata_revision:3,state:"idle"})');
+ assert.equal(b.node('detailtitle').textContent,'<新标题>'); assert.equal(b.node('msgbox').value,'keep composer'); assert.equal(b.node('main').htmlWrites,panelWrites);
+});
+
+test('管理：切页后的别名保存不写其他sid，编辑版本胜过旧POST，失败保留输入', async () => {
+ const pending=[]; const b=boot((url,opts={})=>url.endsWith('/metadata')?new Promise(r=>pending.push(r)):frontendFetch(url));
+ b.run('sessions=[{id:"a",project:"/p"},{id:"b",project:"/q"}]; navigate({project:"/p",session:"a"})'); await flush();
+ b.node('aliasinput').value='first'; b.node('aliasinput').oninput(); const first=b.node('aliassave').onclick(); await flush();
+ b.node('aliasinput').value='second'; b.node('aliasinput').oninput();
+ pending[0](response({id:'a',alias:'first',metadata_revision:1})); await first;
+ assert.equal(b.node('aliasinput').value,'second');
+ const failed=b.node('aliassave').onclick(); await flush(); pending[1]({ok:false,status:500,json:async()=>({error:'disk'})}); await failed;
+ assert.match(b.node('metadatast').textContent,/disk/); assert.equal(b.node('aliasinput').value,'second');
+ const leaving=b.node('aliassave').onclick(); await flush(); b.run('navigate({project:"/q",session:"b"})'); await flush();
+ b.node('aliasinput').value='B editing'; b.node('aliasinput').oninput(); b.node('metadatast').textContent='B state';
+ pending[2](response({id:'a',alias:'second',metadata_revision:2})); await leaving;
+ assert.equal(b.node('aliasinput').value,'B editing'); assert.equal(b.node('metadatast').textContent,'B state');
+});
+
+test('待处理：进入与前后退保留草稿，snapshot清零退出项目条件并保留入口', async () => {
+ const b=boot(frontendFetch);
+ b.run('sessions=[{id:"a",project:"/p",pending_interactions:1}]; navigate({project:"/p",session:"a"})'); await flush(); typeDraft(b,'unsent');
+ b.node('pendingbadge').click(); assert.equal(b.run('view.pending'),true); assert.equal(b.run('messageDrafts.get("a").text'),'unsent');
+ b.location.pathname='/p/p/s/a'; b.run('onPopState()'); await flush(); assert.equal(b.node('msgbox').value,'unsent');
+ b.location.pathname='/pending'; b.run('onPopState()');
+ b.run('onGlobalSse({data:JSON.stringify({type:"snapshot",seq:1,data:{sessions:[{id:"a",project:"/p",pending_interactions:0,archived:true}]}})})');
+ assert.match(b.node('main').innerHTML,/暂无待处理事项/); assert.equal(b.location.pathname,'/pending');
+});
+
+test('队列：新事件仅安排GET且snapshot对账不改未读，子代理不写元数据或队列', async () => {
+ const requests=[]; const b=boot(async(url,opts={})=>{requests.push([url,opts.method]); return frontendFetch(url);});
+ b.run('const refresh=[]; scheduleListRefresh=()=>refresh.push("list"); scheduleConvRefresh=sid=>refresh.push(sid); sendJobs.a={token:1,status:"running"}; onGlobalSse({data:JSON.stringify({type:"queue_changed",seq:1,session:"a",data:{status:"done"}})})');
+ assert.equal(b.run('sendJobs.a.status'),'running'); assert.equal(b.run('refresh.join()'),'list,a'); assert.equal(b.run('unreadSessions.size'),0);
+ assert.equal(b.run('SSE_TYPES.includes("queue_changed") && SSE_TYPES.includes("session_metadata_changed")'),true);
+ await b.run('saveMetadata("parent::agent-x",{pinned:true}); loadQueue("parent::agent-x"); cancelQueueJob("parent::agent-x","j")');
+ assert.equal(requests.length,0);
+});
+
+test('发送所有权：当前job查询失败仅未知，HTTP失败不当执行失败且保留回显', async () => {
+ for(const kind of ['throw','http']){
+  const b=boot(async url=>{
+    if(url.endsWith('/message')) return {ok:true,status:202,json:async()=>({job_id:'j'})};
+    if(url==='/jobs/j'){if(kind==='throw') throw Error('offline'); return {ok:false,status:503,json:async()=>({error:'unavailable'})};}
+    return frontendFetch(url);
+  }); b.context.setTimeout=fn=>{fn();return 1;};
+  b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; bindSendBox("a",{hosted:true})'); typeDraft(b,'still running'); await b.node('sendbtn').onclick();
+  assert.equal(b.run('sendJobs.a.status'),'unknown'); assert.equal(b.run('pendingEcho.a.failed'),undefined); assert.match(b.node('sendst').textContent,/任务可能仍在执行/);
+ }
+});
+
+test('发送所有权：已观察total之外才是提交后窗口，早先同文时间戳不误对账', () => {
+ const b=boot(); b.run('convState={id:"a",cursor:5,total:10,start:0,msgs:[]}; const e=submissionEcho("a","same",1,"j")');
+ assert.equal(b.run('e.after'),10);
+ b.run('convState={id:"a",start:0,msgs:[{role:"user",ts:1,parts:[{type:"text",text:"same"}]}],total:1}; pendingEcho.a={text:"same",token:1,after:0,submittedAt:2}; renderConvList()');
+ assert.equal(b.run('pendingEcho.a.text'),'same');
+});
+
+
+test('发送所有权：同文连续提交后首条转录只消费首条回显，不提前消费第二条', async () => {
+ const posts=[], polls=[];
+ const b=boot((url,opts={})=>{
+  if(url.endsWith('/message')) return new Promise(r=>posts.push(r));
+  if(url.startsWith('/jobs/')) return new Promise(r=>polls.push(r));
+  return frontendFetch(url);
+ }); b.context.setTimeout=fn=>{fn();return 1;};
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",msgs:[],start:0,cursor:0,total:0}; bindSendBox("a",{hosted:true})');
+ typeDraft(b,'same'); const first=b.node('sendbtn').onclick(); posts[0]({ok:true,status:202,json:async()=>({job_id:'first'})}); await flush();
+ typeDraft(b,'same'); const second=b.node('sendbtn').onclick(); posts[1]({ok:true,status:202,json:async()=>({job_id:'second'})}); await flush();
+ b.run('convState.msgs=[{role:"user",ts:Date.now()/1000+1,parts:[{type:"text",text:"same"}]}]; convState.total=1; renderConvList()');
+ assert.equal(b.run('pendingEcho.a?.jobId'),'second');
+ b.run('convState.msgs.push({role:"user",ts:Date.now()/1000+2,parts:[{type:"text",text:"same"}]}); convState.total=2; renderConvList()');
+ assert.equal(b.run('pendingEcho.a'),undefined);
+ polls[0](response({status:'done'})); polls[1](response({status:'done'})); await first; await second;
+});
+
+test('队列：取消当前最新项后旧单job响应不得恢复running或残留回显DOM', async () => {
+ let pollResolve;
+ const b=boot(async(url,opts={})=>{
+  if(url.endsWith('/message')) return {ok:true,status:202,json:async()=>({job_id:'j'})};
+  if(url==='/jobs/j') return new Promise(r=>pollResolve=r);
+  if(url.endsWith('/cancel')) return response({id:'j',status:'cancelled'});
+  return frontendFetch(url);
+ }); b.context.setTimeout=fn=>{fn();return 1;};
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",msgs:[],start:0,cursor:0,total:0}; bindSendBox("a",{hosted:true})');
+ typeDraft(b,'cancel me'); const send=b.node('sendbtn').onclick(); await flush();
+ await b.run('cancelQueueJob("a","j")');
+ assert.equal(b.run('sendJobs.a.status'),'cancelled'); assert.doesNotMatch(b.node('conv').innerHTML,/cancel me/);
+ pollResolve(response({status:'running'})); await send;
+ assert.equal(b.run('sendJobs.a.status'),'cancelled');
+});
+
+
+test('队列：取消旧同文等待项后新回显仍能由自己转录对账，分页前插不误认历史', async () => {
+ const b=boot(async(url,opts={})=>{
+   if(url.endsWith('/cancel')) return response({id:'old',status:'cancelled'});
+   if(url.includes('?before=')) return response({start:0,total:4,size:4,shift:2,has_more:false,messages:[{role:'user',parts:[{type:'text',text:'same'}]},{role:'assistant',parts:[]}]});
+   return frontendFetch(url);
+ });
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",start:0,total:0,cursor:0,msgs:[],hasMore:true}; pendingEcho.a={token:2,jobId:"new",text:"same",after:0,previous:{token:1,jobId:"old",text:"same",after:0}}; sendJobs.a={token:2,jobId:"new",text:"same",status:"queued"}');
+ await b.run('cancelQueueJob("a","old")');
+ b.run('convState.msgs=[{role:"user",parts:[{type:"text",text:"same"}]}]; convState.total=1; renderConvList()');
+ assert.equal(b.run('pendingEcho.a'),undefined); assert.equal(b.run('sendJobs.a.jobId'),'new');
+ b.run('convState={id:"a",start:0,total:2,cursor:2,msgs:[{role:"assistant",parts:[]},{role:"assistant",parts:[]}],hasMore:true}; pendingEcho.a={token:3,jobId:"shift",text:"same",after:2}');
+ await b.run('loadEarlier()'); assert.equal(b.run('pendingEcho.a.after'),4);
+ b.run('renderConvList()'); assert.equal(b.run('pendingEcho.a.jobId'),'shift');
+ b.run('convState.msgs.push({role:"user",parts:[{type:"text",text:"same"}]}); renderConvList()'); assert.equal(b.run('pendingEcho.a'),undefined);
+});
+
+
+test('发送所有权：旧POST的202/non202/catch都不能替换最新槽或回显', async () => {
+ for(const result of ['202','500','catch']){
+  let resolve,reject;
+  const b=boot((url,opts={})=>url.endsWith('/message')?new Promise((a,z)=>{resolve=a;reject=z;}):frontendFetch(url));
+  b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; bindSendBox("a",{hosted:true})'); typeDraft(b,'old');
+  const old=b.node('sendbtn').onclick();
+  b.run('sendJobs.a={token:999,jobId:"new",status:"queued",text:"new"}; pendingEcho.a={token:999,jobId:"new",text:"new"}');
+  if(result==='catch') reject(Error('old offline'));
+  else resolve({ok:result==='202',status:Number(result),json:async()=>({job_id:'old',error:result==='500'?'old error':undefined})});
+  await old; assert.equal(b.run('sendJobs.a.jobId'),'new'); assert.equal(b.run('pendingEcho.a.jobId'),'new');
+ }
+});
+
+test('发送所有权：轮询超时仅查询未知不标失败，保留服务端job和回显', async () => {
+ let clock=1000000; let finish;
+ const b=boot(async url=>{
+   if(url.endsWith('/message')) return {ok:true,status:202,json:async()=>({job_id:'j'})};
+   if(url==='/jobs/j') return new Promise(r=>finish=r);
+   return frontendFetch(url);
+ });
+ b.context.Date=class extends Date { static now(){return clock;} };
+ b.context.setTimeout=fn=>{fn();return 1;};
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; bindSendBox("a",{hosted:true})'); typeDraft(b,'long task'); const send=b.node('sendbtn').onclick(); await flush();
+ clock+=31*60*1000; finish(response({status:'running'})); await send;
+ assert.equal(b.run('sendJobs.a.status'),'unknown'); assert.equal(b.run('sendJobs.a.jobId'),'j'); assert.equal(b.run('pendingEcho.a.failed'),undefined);
+ assert.match(b.node('sendst').textContent,/状态查询超时，任务可能仍在执行/);
+});
+
+
+test('发送所有权：旧分页响应切页后不得平移新会话echo窗口', async () => {
+ let finish;
+ const b=boot(async url=>url.includes('?before=')?new Promise(r=>finish=r):frontendFetch(url));
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",msgs:[],hasMore:true,start:1,cursor:2,total:2}');
+ const page=b.run('loadEarlier()');
+ b.run('view={project:"/q",session:"b"}; curPanel={type:"conv",key:"b"}; convState={id:"b",msgs:[],hasMore:true,start:1,cursor:2,total:2}; pendingEcho.b={text:"new",token:2,after:2}');
+ finish(response({messages:[{role:'user',parts:[]}],start:0,total:4,size:4,shift:2})); await page;
+ assert.equal(b.run('pendingEcho.b.after'),2); assert.equal(b.run('convState.msgs.length'),0);
+});
+
+
+test('发送所有权：后台回显收尾不重绘其他会话，当前终态立即移除回显DOM', () => {
+ const b=boot();
+ b.run('view={project:"/q",session:"b"}; curPanel={type:"conv",key:"b"}; convState={id:"b",msgs:[],total:0}; pendingEcho.a={text:"A",token:1}');
+ const writes=b.node('conv').htmlWrites;
+ b.run('markEchoFailed("a",1)'); assert.equal(b.node('conv').htmlWrites,writes);
+ b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",msgs:[],total:0}; pendingEcho.a={text:"A",token:2}; renderConvList(); settleEcho("a",2)');
+ assert.doesNotMatch(b.node('conv').innerHTML,/用户 · 发送中/);
+});
+
+
+test('终态收敛：实际failed轮询保留标红气泡，不被普通转录对账删除', async () => {
+ const b=boot(async url=>{
+  if(url.endsWith('/message')) return {ok:true,status:202,json:async()=>({job_id:'j'})};
+  if(url==='/jobs/j') return response({id:'j',status:'failed',error:'execution error'});
+  return frontendFetch(url);
+ }); b.context.setTimeout=fn=>{fn();return 1;};
+ b.run('renderMain=()=>{}; view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",msgs:[],start:0,cursor:0,total:0}; bindSendBox("a",{hosted:true})');
+ typeDraft(b,'failed message'); await b.node('sendbtn').onclick();
+ assert.equal(b.run('pendingEcho.a?.failed'),true);
+ assert.match(b.node('conv').innerHTML,/pending failed/); assert.match(b.node('conv').innerHTML,/发送失败/); assert.match(b.node('conv').innerHTML,/failed message/);
+ b.run('convState.msgs=[{role:"user",parts:[{type:"text",text:"failed message"}]}]; renderConvList()');
+ assert.equal(b.run('pendingEcho.a?.failed'),true); assert.match(b.node('conv').innerHTML,/pending failed/);
+});
+
+test('终态收敛：unknown槽由队列事实cancelled/failed/done收尾，非终态恢复', async () => {
+ for(const status of ['cancelled','failed','done','running','queued']){
+  const job={id:'j',status,text:'same',error:status==='failed'?'execution error':undefined};
+  const b=boot(async url=>url.endsWith('/jobs')?response({session:'a',running:status==='running'?[job]:[],queued:status==='queued'?[job]:[],recent:['cancelled','failed','done'].includes(status)?[job]:[]}):frontendFetch(url));
+  b.run('renderMain=()=>{}; view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",msgs:[],start:0,total:0,cursor:0}; sendJobs.a={token:1,jobId:"j",text:"same",status:"unknown",error:"query failed"}; pendingEcho.a={token:1,jobId:"j",text:"same",after:0}; renderConvList()');
+  await b.run('loadQueue("a")');
+  assert.equal(b.run('sendJobs.a.status'),status,status);
+  if(status==='failed'){ assert.equal(b.run('pendingEcho.a?.failed'),true); assert.match(b.node('conv').innerHTML,/pending failed/); }
+  else if(status==='done'||status==='cancelled'){ assert.equal(b.run('pendingEcho.a'),undefined); assert.doesNotMatch(b.node('conv').innerHTML,/same/); }
+  else assert.equal(b.run('pendingEcho.a?.text'),'same');
+ }
+});
+
+test('终态收敛：外部取消或整体中断快照使旧poll失效，旧job不得污染最新同文', async () => {
+ for(const terminal of ['cancelled','failed','done']){
+  let finish, polls=0;
+  const b=boot(async url=>{
+   if(url.endsWith('/message')) return {ok:true,status:202,json:async()=>({job_id:'j'})};
+   if(url==='/jobs/j') return ++polls===1 ? new Promise(r=>finish=r) : response({status:'failed',error:'late fallback'});
+   if(url==='/sessions/a/jobs') return response({session:'a',running:[],queued:[],recent:[{id:'j',status:terminal,text:'same',error:terminal==='failed'?'exit error':undefined}]});
+   return frontendFetch(url);
+  }); b.context.setTimeout=fn=>{fn();return 1;};
+  b.run('renderMain=()=>{}; view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; convState={id:"a",msgs:[],total:0,cursor:0,start:0}; bindSendBox("a",{hosted:true})');
+  typeDraft(b,'same'); const send=b.node('sendbtn').onclick(); await flush();
+  await b.run('loadQueue("a")');
+  finish(response({status:'running'})); await send;
+  assert.equal(b.run('sendJobs.a.status'),terminal);
+  b.run('sendJobs.a={token:999,jobId:"new",status:"queued",text:"same"}; pendingEcho.a={token:999,jobId:"new",text:"same",after:0}');
+  await b.run('loadQueue("a")');
+  assert.equal(b.run('sendJobs.a.jobId'),'new'); assert.equal(b.run('sendJobs.a.status'),'queued'); assert.equal(b.run('pendingEcho.a.jobId'),'new'); assert.equal(b.run('pendingEcho.a.failed'),undefined);
+ }
 });

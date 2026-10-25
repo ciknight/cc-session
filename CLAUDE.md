@@ -97,6 +97,16 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有
   `completed/cancelled/discarded/refused/dropped` 结束回合。
+- **队列查询与单项取消**：`GET /sessions/<sid>/jobs` 投影执行、等待及最近终态；取消接口只在
+  owner 锁内移除真实等待成员，已领取（包括切模型）返回 409，不能调用会增加 turns 的回合收尾。
+  非托管 job/队列归 `Monitor.lock`，托管归 `Hosted.ready`；注册表与终态历史归 Monitor，
+  嵌套锁仅允许 Hosted → Monitor。全部活动 job 保留，全局只保留最近 100 个首次终态，
+  每会话最多返回其中 20 条；`started_at` 保持提交时间语义。队列和历史不跨服务重启恢复。
+  `queue_changed` 仅提示刷新，GET/轮询负责对账；前端按 job ID 和提交 token 隔离反馈。
+- **会话整理**：`SessionMetadata` 独立原子保存 `session-metadata.json`，按 sid 存别名、置顶、
+  归档及持久递增 revision；不改转录标题或扫描缓存。HTTP/SSE 使用统一元数据投影，前端按
+  `metadata_revision` 合并，旧响应不能回退新设置。归档只影响默认列表，不停止任务、不删转录，
+  直链及恢复保留；全局待审批来自完整会话集，包含已归档会话。
 - **流式文本**：托管进程带 `--include-partial-messages`；`stream_event` 的
   `text_delta` 按 job 聚合，约 80ms 节流发 `turn_delta`（transient，不进 recent/webhook），
   回合结束发最终文本并清空。
@@ -112,6 +122,7 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 - **URL 路由**：看板视图与地址栏同步，`/p/<项目路径>` 是项目列表，
   `/p/<项目路径>/s/<会话ID>` 是对话，`/p/<项目路径>/new` 是新建；项目路径保留目录层级
   （反斜杠归一为 `/`，冒号保留，仅转义空格等特殊字符），旧的整体编码链接仍可解析。
+  `/pending` 为全局待处理会话列表，只导航到原审批详情、不复制表单。`GET /pending`、
   `GET /p/...` 与 `/` 一样回退渲染同一 SPA 模板。导航统一走 `navigate`（`pushState`），
   首页自动选中项目时用 `replaceState` 避免多余历史记录；`popstate` 重新解析地址并恢复视图。
 
@@ -130,6 +141,10 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 其他面板或后续编辑的草稿；复用旧会话 DOM 时也要同步过期草稿版本，避免显示内容与待发送内容不一致。
 新回复提示只依赖 `last_turn_end_at` 高水位推进，首次见会话只建基线，不以 `stale` 或工具结束
 判断完成；消息展示水位覆盖已观察完成水位且页面可见才视为已读，旧响应、分页未追完或加载失败
-不能消费新回复提示。列表搜索只匹配
-已有会话元信息，条件按项目保存在内存；工具栏节点保持稳定，刷新只更新结果区，不打断焦点
-或输入法。上述新增状态均随整页刷新清空，不新增持久化或后端协议。
+不能消费新回复提示。对话加载还需请求实例与导航代次守卫，过期响应不能回退消息 DOM 或解除新请求锁。
+新建会话持续核对服务端 SID 校正；源提交槽清理与目标槽接管分开，不覆盖目标的新提交或抢回用户导航。
+新建回显沿用点击提交时的时间与消息窗口，SID 发现/校正不能重置它们。
+列表搜索只匹配已有会话元信息，条件按项目保存在内存；工具栏节点保持稳定，刷新只更新结果区，不打断焦点
+或输入法。草稿、未读及搜索条件随整页刷新清空；别名/置顶/归档由独立元数据持久化。
+归档范围与原搜索/状态条件取交集后稳定按置顶分组，组内保留原顺序；详情标题及元数据控件
+软更新，不重建输入区。待处理页和队列区均不能因查看、取消或整理操作提前清除新回复提示。

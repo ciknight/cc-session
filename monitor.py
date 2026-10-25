@@ -92,6 +92,7 @@ from urllib.parse import urlparse, parse_qs
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from scan_cache import ScanCache
 from session_preferences import (APPROVAL_MODES, ApprovalPreferences, ModelPreferences,
+                                 SessionMetadata, validate_metadata_patch,
                                  UNSET, default_model, model_args, validate_model)
 from cc_switch import CCSwitch, SwitchError
 
@@ -394,7 +395,8 @@ class Monitor:
         self.claude_bin = "claude"
         self.claude_args = []
         self.msg_timeout = 600
-        self.jobs = {}             # job_id -> dict
+        self.jobs = {}             # 注册表归 lock；字段归 job._owner.ready 或 lock
+        self.terminal_jobs = deque()  # 首次终态完成顺序，全局保留 100 条
         self.busy = set()          # 正在执行远程消息的 session id
         self.remote_queues = {}    # sid -> deque[(job, text, model)]，非托管一次性消息排队
         self.new_cwd_busy = set()  # 尚未取得 session id 的新会话目录
@@ -402,6 +404,7 @@ class Monitor:
         self.hosted_by_sid = {}    # session id -> Hosted
         self.preferences = ModelPreferences(CLAUDE_DIR / "claude-sessions" / "preferences.json")
         self.approvals = ApprovalPreferences(CLAUDE_DIR / "claude-sessions" / "approvals.json")
+        self.metadata = SessionMetadata(CLAUDE_DIR / "claude-sessions" / "session-metadata.json")
         self.cc_switch = CCSwitch(CLAUDE_DIR)
         # 子代理转录默认不扫描；需要时通过 --scan-subagents 或 include_subagents=1 加载
         self.scan_subagents = False
@@ -413,6 +416,12 @@ class Monitor:
         self.cache_dirty = False
         self.last_cache_save = 0.0
         self.shutdown_event = threading.Event()
+
+    def with_metadata(self, summary):
+        """仅装饰公开投影，不修改 Session/title/扫描缓存。"""
+        if summary is not None:
+            summary.update(self.metadata.get(summary["id"]))
+        return summary
 
     def by_sid(self, sid):
         """按 session id 查找；同名取最近活跃的一个。"""
@@ -517,35 +526,34 @@ class Monitor:
                 return 404, {"error": "session not found"}
             if not sess.cwd or not os.path.isdir(sess.cwd):
                 return 400, {"error": f"session cwd unavailable: {sess.cwd}"}
-            queued = sid in self.busy
-            if queued:
-                pending = self.remote_queues.get(sid)
-                if pending is not None and len(pending) >= REMOTE_QUEUE_LIMIT:
-                    return 429, {"error": "remote message queue is full"}
-            else:
-                if sess.summary(self.stale_after)["state"] == "working" and not force:
-                    return 409, {"error": "session is working (maybe in use in a terminal); "
-                                          "retry when idle, or pass force=true"}
-                self.busy.add(sid)
         try:
             if model is not UNSET:
                 self.preferences.set(sid, selected)
         except ValueError as e:
-            if not queued:
-                with self.lock:
-                    self.busy.discard(sid)
             return 500, {"error": str(e)}
         job = self._new_job(sid, text, selected)
-        if queued:
-            with self.lock:
-                # 排队期间上一轮可能已经结束；此时直接派发，避免任务永远停在 queued
-                if sid in self.busy:
-                    self.remote_queues.setdefault(sid, deque()).append((job, text, selected))
-                    return 202, {"job_id": job["id"], "status": "queued"}
+        with self.lock:
+            queued = sid in self.busy
+            if queued and len(self.remote_queues.get(sid, ())) >= REMOTE_QUEUE_LIMIT:
+                error, code = "remote message queue is full", 429
+            elif not queued and sess.summary(self.stale_after)["state"] == "working" and not force:
+                error, code = "session is working; retry when idle, or pass force=true", 409
+            else:
+                error = None
+            if error:
+                self._terminal_job_locked(job, "failed", error=error)
+            elif queued:
+                self.remote_queues.setdefault(sid, deque()).append((job, text, selected))
+            else:
                 self.busy.add(sid)
-        job["status"] = "running"
-        threading.Thread(target=self._run_job, args=(sess, job, text, selected), daemon=True).start()
-        return 202, {"job_id": job["id"], "status": "running"}
+                job["status"] = "running"
+            status = job["status"]
+        self.queue_changed(sid)
+        if error:
+            return code, {"error": error}
+        if not queued:
+            threading.Thread(target=self._run_job, args=(sess, job, text, selected), daemon=True).start()
+        return 202, {"job_id": job["id"], "status": status}
 
     def _run_job(self, sess, job, text, selected_model=None):
         self.emit(sess, "remote_message_sent", {"job": job["id"], "text": job["text"]})
@@ -553,28 +561,35 @@ class Monitor:
         cmd += model_args(self.claude_args, selected_model)
         print(f"[msg] job {job['id']} 会话 {sess.id} 开始: {job['text']}", flush=True)
         self._exec(job, cmd, sess.cwd, text)
-        print(f"[msg] job {job['id']} {job['status']}"
-              + (f": {job['error']}" if job["error"] else f" {clip(job['result'] or '', 120)}"), flush=True)
-        self.emit(sess, "remote_message_done", {"job": job["id"], "status": job["status"],
-                                                "error": job["error"],
-                                                "result": clip(job["result"] or "", 300)})
+        with self.lock:
+            completed = self._job_public(job)
+        print(f"[msg] job {completed['id']} {completed['status']}"
+              + (f": {completed['error']}" if completed["error"] else f" {clip(completed['result'] or '', 120)}"), flush=True)
+        self.emit(sess, "remote_message_done", {"job": completed["id"], "status": completed["status"],
+                                                "error": completed["error"],
+                                                "result": clip(completed["result"] or "", 300)})
         next_item = None
         with self.lock:
             pending = self.remote_queues.get(sess.id)
             if pending:
                 next_item = pending.popleft()
+                next_item[0]["status"] = "running"
                 if not pending:
                     self.remote_queues.pop(sess.id, None)
             else:
                 self.busy.discard(sess.id)
+        with self.lock:
+            if job.get("finished_at") is not None:
+                self._register_terminal_locked(job)  # 兼容替换 _exec 的本地执行器
+        self.queue_changed(sess.id)
         if next_item:
             next_job, next_text, next_model = next_item
-            next_job["status"] = "running"
             threading.Thread(target=self._run_job,
                              args=(sess, next_job, next_text, next_model), daemon=True).start()
 
     def _exec(self, job, cmd, cwd, text):
-        """同步跑一轮 `claude -p`，把结果写进 job（status/finished_at 在此收尾）。"""
+        """同步跑一轮；结果先存局部，最终在 owner 锁下一次提交。"""
+        result, result_sid, error = None, None, None
         try:
             # 环境变量原样继承，所以 ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY 等自定义配置同样生效
             # 显式 utf-8：Windows 中文系统默认是 gbk，会把中文消息和回复弄乱
@@ -584,23 +599,27 @@ class Monitor:
             out = p.stdout.strip()
             try:
                 data = json.loads(out)
-                job["result"] = data.get("result")
-                job["result_session_id"] = data.get("session_id")
+                result = data.get("result")
+                result_sid = data.get("session_id")
                 if data.get("is_error") or p.returncode != 0:
-                    job["error"] = clip(data.get("result") or p.stderr, 500)
+                    error = clip(data.get("result") or p.stderr, 500)
             except json.JSONDecodeError:
-                job["result"] = clip(out, 2000)
+                result = clip(out, 2000)
                 if p.returncode != 0:
-                    job["error"] = clip(p.stderr or out, 500)
+                    error = clip(p.stderr or out, 500)
         except FileNotFoundError:
-            job["error"] = f"找不到命令 {self.claude_bin!r}，请用 --claude-bin 指定路径"
+            error = f"找不到命令 {self.claude_bin!r}，请用 --claude-bin 指定路径"
         except subprocess.TimeoutExpired:
-            job["error"] = f"超时（{self.msg_timeout}s）"
+            error = f"超时（{self.msg_timeout}s）"
         except Exception as e:
-            job["error"] = str(e)
+            error = str(e)
         finally:
-            job["status"] = "failed" if job["error"] else "done"
-            job["finished_at"] = now_ts()
+            with self.lock:
+                self._terminal_job_locked(job, "failed" if error else "done",
+                                          result=result, result_session_id=result_sid, error=error,
+                                          session=job["session"] or result_sid)
+                sid = job["session"]
+            self.queue_changed(sid)
 
     def new_session(self, cwd, text, model=UNSET):
         """在 cwd 启动一个全新会话；返回 job_id。"""
@@ -618,7 +637,8 @@ class Monitor:
                     return 409, {"error": "该目录的新会话仍在运行，请稍后再试"}
                 self.new_cwd_busy.add(key)
             job = self._new_job(None, text, selected)
-            job["status"] = "running"
+            with self.lock:
+                job["status"] = "running"
             threading.Thread(target=self._run_new_job, args=(cwd, job, text, selected, key), daemon=True).start()
         return 202, {"job_id": job["id"], "status": "running"}
 
@@ -633,7 +653,8 @@ class Monitor:
                 try:
                     self.preferences.bind(sid, selected_model)
                 except ValueError as e:
-                    job["preference_error"] = str(e)
+                    with self.lock:
+                        job["preference_error"] = str(e)
             print(f"[msg] job {job['id']} {job['status']} 新会话={sid}"
                   + (f": {job['error']}" if job["error"] else ""), flush=True)
         finally:
@@ -641,16 +662,116 @@ class Monitor:
                 with self.lock:
                     self.new_cwd_busy.discard(cwd_key)
 
-    def _new_job(self, sid, text, selected_model=None):
+    def _new_job(self, sid, text, selected_model=None, owner=None):
         job = {"id": secrets.token_hex(6), "session": sid, "status": "queued",
                "started_at": now_ts(), "finished_at": None, "text": clip(text, 200),
-               "requested_model": selected_model,
+               "requested_model": selected_model, "_owner": owner,
                "result": None, "error": None, "result_session_id": None}
         with self.lock:
             self.jobs[job["id"]] = job
-            for old in list(self.jobs)[:-100]:      # 只保留最近 100 个任务
-                self.jobs.pop(old, None)
         return job
+
+    def _terminal_job_locked(self, job, status, **fields):
+        """调用者持有字段 owner 锁；唯一允许的嵌套方向为 ready → lock。"""
+        if job.get("finished_at") is not None:
+            return False
+        job.update(fields, status=status, finished_at=now_ts())
+        self._register_terminal_locked(job)
+        return True
+
+    def _register_terminal_locked(self, job):
+        def register():
+            if job.get("_terminal_registered"):
+                return
+            job["_terminal_registered"] = True
+            self.terminal_jobs.append(job["id"])
+            while len(self.terminal_jobs) > 100:
+                self.jobs.pop(self.terminal_jobs.popleft(), None)
+        if job.get("_owner") is None:
+            register()  # 非托管调用者已持有 Monitor.lock（不可重入）
+        else:
+            with self.lock:
+                register()
+
+    @staticmethod
+    def _job_public(job):
+        return {k: v for k, v in job.items() if not k.startswith("_")}
+
+    def job_snapshot(self, jid):
+        with self.lock:
+            job = self.jobs.get(jid)
+        if job is None:
+            return None
+        owner = job.get("_owner")
+        with owner.ready if owner else self.lock:
+            return self._job_public(job)
+
+    @staticmethod
+    def _job_summary(job, position=None):
+        return {"id": job["id"], "status": job["status"], "text": job["text"],
+                "requested_model": job["requested_model"], "created_at": job["started_at"],
+                "finished_at": job["finished_at"], "error": job["error"],
+                "cancellable": position is not None and job["status"] == "queued",
+                "position": position}
+
+    def session_jobs(self, sid):
+        # 仅注册表引用在 lock 下取得；各 owner 的字段/队列在同一锁下投影。
+        with self.lock:
+            refs = list(self.jobs.values())
+            known = self.by_sid(sid) is not None or sid in self.hosted_by_sid
+        groups = {}
+        for job in refs:
+            groups.setdefault(job.get("_owner"), []).append(job)
+        result = {"session": sid, "running": [], "queued": [], "recent": []}
+        for owner, jobs in groups.items():
+            with owner.ready if owner else self.lock:
+                pending = owner.pending if owner else self.remote_queues.get(sid, ())
+                positions = {item[1 if owner else 0]["id"]: n
+                             for n, item in enumerate(pending, 1)}
+                for job in jobs:
+                    if job["session"] != sid:
+                        continue
+                    known = True
+                    bucket = ("recent" if job["finished_at"] is not None else
+                              "running" if job["status"] == "running" else "queued")
+                    result[bucket].append(self._job_summary(job, positions.get(job["id"])))
+        result["queued"].sort(key=lambda j: (j["position"] is None, j["position"] or 0, j["created_at"]))
+        result["recent"].sort(key=lambda j: j["finished_at"], reverse=True)
+        result["recent"] = result["recent"][:20]
+        return (200, result) if known else (404, {"error": "session not found"})
+
+    def cancel_job(self, sid, jid):
+        self.ensure_subagent(sid)
+        with self.lock:
+            sess = self.by_sid(sid)
+            job = self.jobs.get(jid)
+        if sess and sess.is_subagent:
+            return 400, {"error": "子代理会话只读，不能取消消息"}
+        if job is None:
+            return 404, {"error": "job not found"}
+        owner = job.get("_owner")
+        with owner.ready if owner else self.lock:
+            if job["session"] != sid:
+                return 404, {"error": "job not found"}
+            if job["status"] == "cancelled":
+                return 200, self._job_summary(job)
+            pending = owner.pending if owner else self.remote_queues.get(sid, ())
+            item = next((item for item in pending if item[1 if owner else 0] is job), None)
+            if job["status"] != "queued" or item is None:
+                return 409, {"error": "job is already claimed or finished"}
+            pending.remove(item)
+            if not owner and not pending:
+                self.remote_queues.pop(sid, None)
+            self._terminal_job_locked(job, "cancelled")
+            summary = self._job_summary(job)
+        self.queue_changed(sid)
+        return 200, summary
+
+    def queue_changed(self, sid):
+        with self.lock:
+            sess = self.by_sid(sid)
+        if sess:
+            self.emit(sess, "queue_changed", {"session": sid})
 
     def host_session(self, cwd, resume_id, text, force=False, model=UNSET, approval=None):
         # 子代理默认懒加载；补加载以保留“只读、拒绝托管”的 400 语义
@@ -1447,18 +1568,22 @@ class Hosted:
             model = validate_model(model)
         except ValueError as e:
             return 400, {"error": str(e)}
-        job = self.mon._new_job(self.session_id or self.hid, text, model)
-        job["command_uuid"] = str(uuid.uuid4())
+        job = self.mon._new_job(self.session_id or self.hid, text, model, owner=self)
         with self.ready:
+            job["command_uuid"] = str(uuid.uuid4())
+            job["session"] = self.session_id or self.hid
             if self.status == "exited" or self.stopping or self.control_failed:
-                job.update(status="failed", error="hosted process is stopping", finished_at=now_ts())
-                return 409, {"error": job["error"]}
-            if len(self.pending) >= self.max_queued:
-                job.update(status="failed", error="hosted send queue is full", finished_at=now_ts())
-                return 429, {"error": "hosted send queue is full"}
-            self.pending.append((text, job, model))
-            self.ready.notify_all()
-        return 202, {"job_id": job["id"], "status": job["status"], "hosted": self.hid}
+                self.mon._terminal_job_locked(job, "failed", error="hosted process is stopping")
+                code, response = 409, {"error": job["error"]}
+            elif len(self.pending) >= self.max_queued:
+                self.mon._terminal_job_locked(job, "failed", error="hosted send queue is full")
+                code, response = 429, {"error": "hosted send queue is full"}
+            else:
+                self.pending.append((text, job, model))
+                self.ready.notify_all()
+                code, response = 202, {"job_id": job["id"], "status": "queued", "hosted": self.hid}
+        self.mon.queue_changed(job["session"])
+        return code, response
 
     def _write(self, obj):
         data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
@@ -1506,6 +1631,7 @@ class Hosted:
                     self.stream_text = ""
                     self.stream_job = job
                     self.last_delta_emit = 0.0
+                self.mon.queue_changed(job["session"])
                 try:
                     target = model if model is not None else default_model(self.mon.claude_args)
                     if target != self.process_model:
@@ -1520,8 +1646,8 @@ class Hosted:
                     self._write({"type": "user", "uuid": job.get("command_uuid"),
                                  "message": {"role": "user", "content": text}})
                 except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
-                    job.update(status="failed", error=str(e), finished_at=now_ts())
                     with self.ready:
+                        self.mon._terminal_job_locked(job, "failed", error=str(e))
                         if self.current is job:
                             self.current = None
                         self.processing = False
@@ -1529,6 +1655,7 @@ class Hosted:
                         if self.control_failed:
                             self.stopping = True
                         self.ready.notify_all()
+                    self.mon.queue_changed(job["session"])
                     if self.control_failed:
                         break
                     continue
@@ -1545,9 +1672,10 @@ class Hosted:
             with self.ready:
                 self.processing = False
                 for _, job, _ in self.pending:
-                    job.update(status="failed", error="托管进程无法安全发送后续消息", finished_at=now_ts())
+                    self.mon._terminal_job_locked(job, "failed", error="托管进程无法安全发送后续消息")
                 self.pending.clear()
                 self.ready.notify_all()
+            self.mon.queue_changed(self.session_id)
             if self.control_failed and self.proc and self.proc.poll() is None:
                 self.proc.terminate()
 
@@ -1625,9 +1753,10 @@ class Hosted:
                 waiter["error"] = "claude 进程已退出"
                 waiter["event"].set()
             for job in dead:
-                job.update(status="failed", finished_at=now_ts(),
-                           error=job["error"] or f"claude 进程已退出 (code {rc}) {tail}")
+                self.mon._terminal_job_locked(job, "failed",
+                    error=job["error"] or f"claude 进程已退出 (code {rc}) {tail}")
             self.ready.notify_all()
+        self.mon.queue_changed(self.session_id)
         print(f"[hosted] {self.hid} 退出 code={rc} 会话={self.session_id}"
               + (f" stderr: {tail}" if tail else ""), flush=True)
         # 进程已退出：唤醒所有等待审批的线程，避免永久阻塞
@@ -1653,19 +1782,24 @@ class Hosted:
     def _on_init(self, sid):
         if not sid:
             return
-        old = self.session_id
-        self.session_id = sid
-        if old and old != sid and not self.resume_id:
-            print(f"[hosted] {self.hid} session id 不一致: 预生成 {old}, init {sid}", flush=True)
-        with self.mon.lock:
-            self.mon.hosted_by_sid[sid] = self
-            if self.resume_id:
-                self.mon.hosted_by_sid[self.resume_id] = self
-            if old and old != sid:
-                self.mon.hosted_by_sid.pop(old, None)
-                for inter in self.mon.interactions.values():
-                    if inter.hosted_id == self.hid:
-                        inter.session_id = sid
+        with self.ready:
+            old = self.session_id
+            self.session_id = sid
+            if old and old != sid and not self.resume_id:
+                print(f"[hosted] {self.hid} session id 不一致: 预生成 {old}, init {sid}", flush=True)
+            with self.mon.lock:
+                self.mon.hosted_by_sid[sid] = self
+                if self.resume_id:
+                    self.mon.hosted_by_sid[self.resume_id] = self
+                if old and old != sid:
+                    if self.mon.hosted_by_sid.get(old) is self:
+                        self.mon.hosted_by_sid.pop(old, None)
+                    for inter in self.mon.interactions.values():
+                        if inter.hosted_id == self.hid:
+                            inter.session_id = sid
+                for job in self.mon.jobs.values():
+                    if job.get("_owner") is self:
+                        job["session"] = sid
         if self.selected_model is not None:
             try:
                 self.mon.preferences.bind(sid, self.selected_model)
@@ -1720,7 +1854,7 @@ class Hosted:
                 status, error = "cancelled", job.get("error") or "已中断"
             else:
                 status, error = "failed", job.get("error") or f"command {terminal_state}"
-            job.update(status=status, error=error, finished_at=now_ts())
+            self.mon._terminal_job_locked(job, status, error=error)
             if self.interrupt_target is job:
                 self.interrupt_target = None
                 self.interrupting = False
@@ -1734,6 +1868,7 @@ class Hosted:
                 self.stream_job = None
             self.ready.notify_all()
             self.turns += 1
+        self.mon.queue_changed(job["session"])
         print(f"[hosted] {self.hid} 第 {self.turns} 轮 {status} job={job.get('id')}"
               + (" 失败: " + error if error else ""), flush=True)
         if final_text:
@@ -1861,12 +1996,13 @@ class Hosted:
         with self.ready:
             queued_count = len(self.pending)
             for _, queued_job, _ in self.pending:
-                queued_job.update(status="cancelled", error="已中断", finished_at=now_ts())
+                self.mon._terminal_job_locked(queued_job, "cancelled", error="已中断")
             self.pending.clear()
             job = self.current
             self.interrupt_target = job
             self.interrupting = job is not None
             self.ready.notify_all()
+        self.mon.queue_changed(self.session_id)
         try:
             self._write({"type": "control_request",
                          "request_id": f"monitor-int-{self.hid}-{int(time.time() * 1000)}",
@@ -1904,8 +2040,9 @@ class Hosted:
             self.stopping = True
             self.ready.notify_all()
             for _, job, _ in self.pending:
-                job.update(status="failed", error="托管进程退出中，消息未发送", finished_at=now_ts())
+                self.mon._terminal_job_locked(job, "failed", error="托管进程退出中，消息未发送")
             self.pending.clear()
+        self.mon.queue_changed(self.session_id)
         try:
             if kill:
                 self.proc.terminate()
@@ -2309,7 +2446,7 @@ def make_handler(mon, refresh_interval):
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
                 return self._json({"interactions": mon.pending_interactions(sid)})
-            if u.path == "/" or u.path.startswith("/p/"):
+            if u.path in ("/", "/pending") or u.path.startswith("/p/"):
                 # /p/<项目>[/s/<会话>|/new] 都由前端路由裁决，服务端统一回模板
                 return self._index()
             if u.path == "/sessions":
@@ -2329,12 +2466,17 @@ def make_handler(mon, refresh_interval):
                     counts = Counter(i.session_id for i in mon.interactions.values()
                                      if i.state == "pending")
                 for it in items:
+                    mon.with_metadata(it)
                     h = mon.hosted_by_sid.get(it["id"])
                     it["hosted"] = bool(h and h.alive())
                     it["hosted_id"] = h.hid if h else None
                     it["selected_model"] = mon.preferences.get(it["id"])
                     it["pending_interactions"] = counts.get(it["id"], 0)
                 return self._json(items)
+            parts = u.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "jobs":
+                code, payload = mon.session_jobs(parts[1])
+                return self._json(payload, code)
             if u.path.startswith("/sessions/") and u.path.endswith("/messages"):
                 sid = u.path.split("/")[2]
                 qs = parse_qs(u.query)
@@ -2421,6 +2563,7 @@ def make_handler(mon, refresh_interval):
                     if not s:
                         return self._json({"error": "not found"}, 404)
                     d = s.detail(mon.stale_after, mon.project_of(s, mon.project_map()))
+                mon.with_metadata(d)
                 d["selected_model"] = mon.preferences.get(sid)
                 d["approval"] = mon.approvals.get(sid)
                 d["interactions"] = mon.pending_interactions(sid)
@@ -2449,7 +2592,7 @@ def make_handler(mon, refresh_interval):
                     hosts = list(mon.hosted.values())
                 return self._json([h.info() for h in hosts])
             if u.path.startswith("/jobs/"):
-                job = mon.jobs.get(u.path.split("/", 2)[2])
+                job = mon.job_snapshot(u.path.split("/", 2)[2])
                 return self._json(job) if job else self._json({"error": "not found"}, 404)
             if u.path == "/events":
                 return self._sse(parse_qs(u.query).get("session", [None])[0])
@@ -2600,6 +2743,33 @@ def make_handler(mon, refresh_interval):
                 code, resp = mon.new_session(body.get("cwd"), text, body.get("model", UNSET))
                 return self._json(resp, code)
             parts = u.path.strip("/").split("/")
+            if len(parts) == 5 and parts[0] == "sessions" and parts[2] == "jobs" and parts[4] == "cancel":
+                if not self._safe_json_write():
+                    return
+                if self._read_body() != {}:
+                    return self._json({"error": "body must be {}"}, 400)
+                code, payload = mon.cancel_job(parts[1], parts[3])
+                return self._json(payload, code)
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "metadata":
+                if not self._safe_json_write():
+                    return
+                try:
+                    patch = validate_metadata_patch(self._read_body())
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                mon.ensure_subagent(parts[1])
+                with mon.lock:
+                    sess = mon.by_sid(parts[1])
+                if not sess:
+                    return self._json({"error": "session not found"}, 404)
+                if sess.is_subagent:
+                    return self._json({"error": "子代理会话只读，不能修改元数据"}, 400)
+                try:
+                    metadata = mon.metadata.update(parts[1], patch)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 500)
+                mon.emit(sess, "session_metadata_changed", {"id": parts[1], **metadata})
+                return self._json({"id": parts[1], **metadata})
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "model":
                 if not self._safe_json_write():
                     return
@@ -2672,6 +2842,7 @@ def make_handler(mon, refresh_interval):
                     s = mon.by_sid(only)
                     detail = (s.detail(mon.stale_after, mon.project_of(s, mon.project_map()))
                               if s else None)
+                mon.with_metadata(detail)
                 h = mon.hosted_by_sid.get(only)
                 data = {
                     "session": detail,
@@ -2694,6 +2865,7 @@ def make_handler(mon, refresh_interval):
                     counts = Counter(i.session_id for i in mon.interactions.values()
                                      if i.state == "pending")
                 for item in sessions:
+                    mon.with_metadata(item)
                     item["pending_interactions"] = counts.get(item["id"], 0)
                     h = mon.hosted_by_sid.get(item["id"])
                     item["hosted"] = bool(h and h.alive())

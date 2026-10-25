@@ -46,6 +46,88 @@ class ManagementAPITests(unittest.TestCase):
         req = Request(self.base + path, data=body, headers=headers or {}, method="GET" if data is None else "POST")
         return urlopen(req)
 
+    def snapshot(self, sid=None):
+        response = urlopen(self.base + '/events' + ('?session=' + sid if sid else ''), timeout=5)
+        try:
+            while True:
+                line = response.readline().decode()
+                if line.startswith('data:'):
+                    data = json.loads(line[5:])['data']
+                    return [data['session']] if sid else data['sessions']
+        finally:
+            response.close()
+
+    def test_metadata_is_consistent_across_http_and_sse_and_preserves_transcript(self):
+        self._write_transcript(1)
+        original = self.sess.path.read_bytes()
+        self.mon.first_scan_done = True
+        events = queue.Queue()
+        self.mon.subscribers.append(events)
+        headers = {'Content-Type': 'application/json'}
+        result = json.load(self.request('/sessions/sid-1/metadata',
+            {'alias': '  自定义  ', 'pinned': True, 'archived': True}, headers))
+        fields = {'alias': '自定义', 'pinned': True, 'archived': True, 'metadata_revision': 1}
+        self.assertEqual(result, {'id': 'sid-1', **fields})
+        for item in (json.load(self.request('/sessions'))[0],
+                     json.load(self.request('/sessions?full=1'))[0],
+                     json.load(self.request('/sessions/sid-1')),
+                     self.snapshot()[0], self.snapshot('sid-1')[0]):
+            self.assertEqual({k: item[k] for k in fields}, fields)
+        self.assertEqual(events.get_nowait()['type'], 'session_metadata_changed')
+        self.assertEqual(self.sess.path.read_bytes(), original)
+        self.assertEqual(json.load(self.request('/sessions/sid-1/messages'))['total'], 1)
+
+    def test_management_write_validation_and_queue_without_transcript(self):
+        host = monitor.Hosted(self.mon, str(self.project), 'unscanned')
+        host.status = 'running'
+        _, response = host.send('queued', 'opus')
+        jid = response['job_id']
+        path = '/sessions/unscanned/jobs/' + jid + '/cancel'
+        for headers, code in (({}, 415), ({'Content-Type': 'application/json', 'Origin': 'http://evil.invalid'}, 403)):
+            with self.assertRaises(HTTPError) as error:
+                self.request(path, {}, headers)
+            self.assertEqual(error.exception.code, code)
+        result = json.load(self.request('/sessions/unscanned/jobs'))
+        self.assertEqual(set(result), {'session', 'running', 'queued', 'recent'})
+        self.assertTrue(result['queued'][0]['cancellable'])
+        headers = {'Content-Type': 'application/json'}
+        self.assertEqual(json.load(self.request(path, {}, headers))['status'], 'cancelled')
+        self.assertEqual(json.load(self.request(path, {}, headers))['status'], 'cancelled')
+        self.assertNotIn('_owner', json.load(self.request('/jobs/' + jid)))
+        for patch_body in ({}, {'revision': 2}, {'pinned': 1}):
+            with self.assertRaises(HTTPError) as error:
+                self.request('/sessions/sid-1/metadata', patch_body, headers)
+            self.assertEqual(error.exception.code, 400)
+        with patch.object(self.mon.metadata, 'update', side_effect=ValueError('disk failed')):
+            with self.assertRaises(HTTPError) as error:
+                self.request('/sessions/sid-1/metadata', {'archived': True}, headers)
+            self.assertEqual(error.exception.code, 500)
+
+    def test_management_unknown_subagent_and_terminal_status_codes(self):
+        headers = {'Content-Type': 'application/json'}
+        child = monitor.Session('parent::agent-child', self.project / 'child.jsonl')
+        child.is_subagent = True
+        self.mon.sessions[str(child.path)] = child
+        job = self.mon._new_job('sid-1', 'done')
+        with self.mon.lock:
+            self.mon._terminal_job_locked(job, 'done')
+        cases = [
+            ('/sessions/missing/jobs', None, {}, 404),
+            ('/sessions/sid-1/jobs/missing/cancel', {}, headers, 404),
+            ('/sessions/other/jobs/' + job['id'] + '/cancel', {}, headers, 404),
+            ('/sessions/sid-1/jobs/' + job['id'] + '/cancel', {}, headers, 409),
+            ('/sessions/parent::agent-child/jobs/' + job['id'] + '/cancel', {}, headers, 400),
+            ('/sessions/parent::agent-child/metadata', {'alias': 'x'}, headers, 400),
+            ('/sessions/missing/metadata', {'alias': 'x'}, headers, 404),
+            ('/sessions/sid-1/metadata', {'alias': 'x'}, {}, 415),
+            ('/sessions/sid-1/metadata', {'alias': 'x'}, {**headers, 'Origin': 'http://evil.invalid'}, 403),
+        ]
+        for path, body, request_headers, expected in cases:
+            with self.subTest(path=path, expected=expected):
+                with self.assertRaises(HTTPError) as error:
+                    self.request(path, body, request_headers)
+                self.assertEqual(error.exception.code, expected)
+
     def test_model_api_persists_selection_separately_from_actual_model(self):
         response = self.request("/sessions/sid-1/model", {"model": "custom/model"},
                                 {"Content-Type": "application/json"})
@@ -74,7 +156,7 @@ class ManagementAPITests(unittest.TestCase):
         self.assertIn(b"Bad request version", data)
 
     def test_spa_route_serves_index_html(self):
-        for path in ("/", "/p/demo%5Cproject"):
+        for path in ("/", "/p/demo%5Cproject", "/pending"):
             response = self.request(path)
             self.assertEqual(response.headers.get_content_type(), "text/html")
             self.assertIn("Claude Sessions", response.read().decode("utf-8"))

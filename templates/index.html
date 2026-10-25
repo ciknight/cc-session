@@ -163,6 +163,12 @@ h4{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-transf
 .composer-status{white-space:pre-wrap;margin-top:4px}
 .config-path{overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:12px;margin:3px 0}
 button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
+.metadata-actions{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:8px}
+#aliasinput{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:4px 8px;max-width:100%;margin:6px}
+#pendingnav{margin:10px;width:calc(100% - 20px);text-align:left}
+.queue-job{padding:8px 0;border-top:1px solid var(--bd)}
+.queue-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:8em;overflow:auto}
+#queue h4,#queue h5{margin:8px 0}
 /* 移动端：抽屉式侧栏 */
 #menu{display:none}
 #mask{display:none}
@@ -199,7 +205,7 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
   <span class="ctl" id="updated"></span>
   <button id="hostedbadge" class="back" style="display:none"
           title="当前托管（常驻进程）的会话数，点击跳转">托管 0</button>
-  <button id="pendingbadge" class="back" style="display:none"
+  <button id="pendingbadge" class="back"
           title="有权限请求等待审批，点击跳转">待审批 0</button>
   <span id="err"></span>
 </header>
@@ -268,6 +274,7 @@ function confirmDisplayedMessages(id, requestEnd){
 }
 function applySessions(next){
   if(!Array.isArray(next)) throw Error("会话列表响应无效");
+  next = next.map(mergeMetadata);
   for(const s of next){
     const end = typeof s.last_turn_end_at === "number" && Number.isFinite(s.last_turn_end_at)
       && s.last_turn_end_at > 0 ? s.last_turn_end_at : 0;
@@ -352,7 +359,101 @@ function fmtTok(n){
   return String(n);
 }
 const projName = cwd => (cwd || "?").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
-const sessTitle = s => (!s.title || s.title.includes("�")) ? (s.first_user_message || s.id.slice(0, 8)) : s.title;
+const sessTitle = s => s.alias || ((!s.title || s.title.includes("�")) ? (s.first_user_message || s.id.slice(0, 8)) : s.title);
+
+const metadataCache = new Map(), metadataSaves = new Map(), aliasDrafts = new Map(), detailMetadata = new Map();
+function mergeMetadata(data){
+  if(!data?.id) return data;
+  const old = metadataCache.get(data.id), revision = Number(data.metadata_revision) || 0;
+  const metadata = old && old.metadata_revision > revision ? old : {
+    alias: data.alias ?? null, pinned: !!data.pinned, archived: !!data.archived, metadata_revision: revision};
+  metadataCache.set(data.id, metadata);
+  return {...data, ...metadata};
+}
+function metadataActionsHtml(s){
+  if(s.is_subagent || s.id?.includes("::")) return "";
+  return `<span class="metadata-actions"><button class="back" data-meta="pin" data-sid="${esc(s.id)}">${s.pinned ? "取消置顶" : "置顶"}</button>
+    <button class="back" data-meta="archive" data-sid="${esc(s.id)}">${s.archived ? "恢复" : "归档"}</button>
+    ${s.archived ? '<span class="chip">已归档</span>' : ""}<span class="mut" data-meta-status="${esc(s.id)}"></span></span>`;
+}
+function metadataEditorHtml(d){
+  if(d.is_subagent || d.id?.includes("::")) return "";
+  return `<div class="info-panel"><div id="metadataactions">${metadataActionsHtml(mergeMetadata(d))}</div>
+    <label for="aliasinput">会话别名</label><input id="aliasinput" maxlength="120" placeholder="留空恢复原始标题">
+    <button class="back" id="aliassave">保存别名</button><button class="back" id="aliasclear">清除别名</button>
+    <span id="metadatast" class="mut" role="status"></span></div>`;
+}
+function updateMetadataControls(d){
+  if(!panelMatch(d.id) || !composerRouteMatch(d.id)) return;
+  const title = document.getElementById("detailtitle");
+  if(title) title.textContent = sessTitle(d);
+  const actions = document.getElementById("metadataactions");
+  if(actions) actions.innerHTML = metadataActionsHtml(d);
+  const draft = aliasDrafts.get(d.id), input = document.getElementById("aliasinput");
+  if(input && draft && !draft.dirty){ draft.value = d.alias || ""; input.value = draft.value; }
+}
+function bindMetadata(d){
+  if(d.is_subagent || d.id?.includes("::")) return;
+  const input = document.getElementById("aliasinput");
+  if(!input) return;
+  let draft = aliasDrafts.get(d.id);
+  if(!draft){ draft = {value: d.alias || "", version: 0, dirty: false}; aliasDrafts.set(d.id, draft); }
+  input.value = draft.value;
+  input.oninput = () => { draft.value = input.value; draft.version++; draft.dirty = true; };
+  document.getElementById("aliassave").onclick = () => saveMetadata(d.id, {alias: draft.value.trim() || null});
+  document.getElementById("aliasclear").onclick = () => {
+    input.value = ""; input.oninput(); return saveMetadata(d.id, {alias: null});
+  };
+}
+function metadataStatus(sid, text){
+  if(panelMatch(sid) && composerRouteMatch(sid)) document.getElementById("metadatast").textContent = text;
+  document.querySelectorAll?.("[data-meta-status]").forEach(el => { if(el.dataset.metaStatus === sid) el.textContent = text; });
+}
+function saveMetadata(sid, patch){
+  if(sid.includes("::")) return Promise.resolve();
+  const aliasVersion = aliasDrafts.get(sid)?.version;
+  const previous = metadataSaves.get(sid) || Promise.resolve();
+  const task = previous.catch(() => {}).then(async () => {
+    metadataStatus(sid, "保存中…");
+    try{
+      const r = await fetchT("/sessions/" + encodeURIComponent(sid) + "/metadata", {
+        method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
+      const data = await r.json();
+      if(!r.ok || data.error || data.id !== sid) throw Error(data.error || "HTTP " + r.status);
+      const merged = mergeMetadata(data);
+      sessions = sessions.map(s => s.id === sid ? {...s, ...metadataCache.get(sid)} : s);
+      sessionsVersion++;
+      const draft = aliasDrafts.get(sid);
+      if("alias" in patch && draft?.version === aliasVersion){ draft.dirty = false; draft.value = merged.alias || ""; }
+      const detail = detailMetadata.get(sid) || sessions.find(s => s.id === sid);
+      if(detail) updateMetadataControls({...detail, ...metadataCache.get(sid)});
+      metadataStatus(sid, "已保存");
+      renderMain(); scheduleListRefresh();
+    }catch(e){ metadataStatus(sid, "保存失败：" + e.message); }
+  });
+  metadataSaves.set(sid, task);
+  return task;
+}
+function metadataAction(sid, action){
+  const s = sessions.find(s => s.id === sid) || detailMetadata.get(sid);
+  if(!s) return;
+  const d = mergeMetadata(s);
+  if(action === "archive" && !d.archived && !window.confirm("归档不会停止执行，也不会清空发送队列。可随时恢复。确定归档？")) return;
+  return saveMetadata(sid, action === "pin" ? {pinned: !d.pinned} : {archived: !d.archived});
+}
+function renderPendingList(){
+  curPanel = {type: "pending", key: "pending"};
+  const pending = sessions.filter(s => s.pending_interactions > 0);
+  const total = pending.reduce((sum, s) => sum + s.pending_interactions, 0);
+  document.getElementById("main").innerHTML = `<h2>全局待处理</h2><p>${pending.length} 个会话 / ${total} 项待处理</p>` +
+    groupByProject().map(p => {
+      const items = p.sessions.filter(s => s.pending_interactions > 0);
+      return items.length ? `<section><h3>${esc(projName(p.cwd))} <span class="mut">${esc(p.cwd)}</span></h3>` +
+        items.map(s => `<div class="scard" data-id="${esc(s.id)}"><span class="b ${s.state}">${esc(STATE_ZH[s.state] || s.state)}</span>
+          <span class="stitle">${esc(sessTitle(s))}</span> ${s.archived ? '<span class="chip">已归档</span>' : ""}
+          <span class="chip pending">待审批 ${s.pending_interactions}</span><div class="mut">进入会话处理审批</div></div>`).join("") + "</section>" : "";
+    }).join("") + (pending.length ? "" : '<div class="empty">暂无待处理事项</div>');
+}
 
 /* ---------- URL 路由 ---------- */
 // 路径按目录层级展开，保留几乎可读的字符；只转义空格、#、? 等会破坏 URL 的字符
@@ -368,6 +469,7 @@ function projectUrlPath(cwd){
   return normPath(cwd).split("/").filter(Boolean).map(encSeg).join("/");
 }
 function routePath(v){
+  if(v?.pending) return "/pending";
   if(!v || !v.project) return "/";
   const base = "/p/" + projectUrlPath(v.project);
   if(v.session) return base + "/s/" + encSeg(v.session);
@@ -375,6 +477,7 @@ function routePath(v){
   return base;
 }
 function parseRoute(pathname){
+  if(pathname === "/pending") return {pending: true, project: null, session: null, new: false};
   if(!pathname) return null;
   const parts = pathname.split("/").filter(Boolean);
   if(parts.length < 2 || parts[0] !== "p") return null;
@@ -447,7 +550,7 @@ function composerHtml(mode, d){
     <textarea id="msgbox" rows="3" placeholder="${isNew ? "输入首条消息…" : "给该会话发消息…"}"></textarea>
     <div class="composer-actions">
       <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
-      ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断</button>`}
+      ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断并清空队列</button>`}
       <label class="ctl" id="approvalwrap">审批
         <select id="approvalsel" aria-label="托管审批模式">
           <option value="auto">自动</option>
@@ -671,7 +774,7 @@ const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_
   "task_updated", "context_compacted", "api_error", "hosted_turn_done",
   "hosted_api_retry", "hosted_foreign_turn", "interaction_pending",
   "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
-  "remote_message_done", "hosted_exited"];
+  "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed"];
 const raf = window.requestAnimationFrame || (fn => setTimeout(fn, 16));
 
 function listGap(){ return +ival.value || DEFAULT_IVAL; }
@@ -760,6 +863,9 @@ function disconnectSessionSse(){
 }
 function applySessionDetail(d){
   if(!d) return;
+  d = mergeMetadata(d);
+  detailMetadata.set(d.id, d);
+  updateMetadataControls(d);
   const badge = document.getElementById("statebadge");
   if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
   const panel = document.getElementById("infopanel");
@@ -840,29 +946,31 @@ function groupByProject(){
 
 /* ---------- 渲染：项目侧栏 ---------- */
 function renderSidebar(projects){
-  const sig = JSON.stringify([view.project,
+  const sig = JSON.stringify([view.project, !!view.pending,
     projects.map(p => [p.cwd, p.sessions.length, p.working, p.wt, p.last, p.unread])]);
   if(sig === lastSidebarSig) return;
   lastSidebarSig = sig;
-  document.getElementById("projs").innerHTML = projects.map(p => `
+  document.getElementById("projs").innerHTML = `<button class="back" id="pendingnav">全局待处理</button>` + (projects.map(p => `
     <div class="pitem ${p.cwd === view.project ? "active" : ""}" data-cwd="${esc(p.cwd)}">
       <div class="pname">${esc(projName(p.cwd))}
         ${p.working ? `<span class="b working">${p.working}</span>` : ""}
         ${p.unread ? `<span class="chip" aria-label="${p.unread} 个会话有新回复">${p.unread} 新回复</span>` : ""}</div>
       <div class="pmeta">${p.sessions.length} 会话${p.wt ? ` · ${p.wt} 子目录` : ""} · ${relTime(p.last)}</div>
       <button class="newbtn" data-cwd="${esc(p.cwd)}" title="在此项目新建会话">＋</button>
-    </div>`).join("") || '<div class="empty">暂无项目</div>';
+    </div>`).join("") || '<div class="empty">暂无项目</div>');
 }
 
 /* ---------- 渲染：会话列表 ---------- */
 const projectConditions = new Map();
 function listConditions(cwd){
-  if(!projectConditions.has(cwd)) projectConditions.set(cwd, {query: "", filter: "all"});
+  if(!projectConditions.has(cwd)) projectConditions.set(cwd, {query: "", filter: "all", scope: "active"});
   return projectConditions.get(cwd);
 }
 function filterProjectSessions(items, conditions){
   const query = (conditions.query || "").trim().toLowerCase();
   return items.filter(s => {
+    const scope = conditions.scope || "active";
+    if(scope === "active" && s.archived || scope === "archived" && !s.archived) return false;
     const filter = conditions.filter;
     if(filter === "working" && s.state !== "working"
        || filter === "hosted" && !s.hosted
@@ -870,7 +978,7 @@ function filterProjectSessions(items, conditions){
        || filter === "unread" && !unreadSessions.has(s.id)) return false;
     return !query || [sessTitle(s), s.title, s.project, s.cwd, s.git_branch, s.model,
       s.first_user_message, s.last_user_message].some(value => String(value ?? "").toLowerCase().includes(query));
-  });
+  }).sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
 }
 function renderSessionList(p){
   const samePanel = curPanel?.type === "list" && curPanel.key === p.cwd;
@@ -891,22 +999,24 @@ function renderSessionList(p){
         <div><label for="sessionfilter">筛选会话</label>
           <select id="sessionfilter"><option value="all">全部</option><option value="working">工作中</option>
             <option value="hosted">托管中</option><option value="pending">待审批</option><option value="unread">新回复</option></select></div>
+        <div><label for="sessionscope">归档范围</label><select id="sessionscope"><option value="active">未归档</option><option value="archived">已归档</option><option value="all">全部记录</option></select></div>
         <button class="back" id="clearconditions">清除条件</button>
         <span class="mut" id="listcount" role="status"></span>
       </div>
       <div id="sessioncards"></div>`;
     const search = document.getElementById("sessionquery"), select = document.getElementById("sessionfilter");
-    search.value = conditions.query; select.value = conditions.filter;
+    const scope = document.getElementById("sessionscope");
+    search.value = conditions.query; select.value = conditions.filter; scope.value = conditions.scope;
     const refresh = () => {
       if(curPanel?.type !== "list" || curPanel.key !== p.cwd) return;
       // 输入期间不回写 value，也不替换工具栏，保留焦点和输入法合成状态。
-      conditions.query = search.value; conditions.filter = select.value;
+      conditions.query = search.value; conditions.filter = select.value; conditions.scope = scope.value;
       const current = groupByProject().find(project => project.cwd === p.cwd) || p;
       renderSessionList(current);
     };
-    search.oninput = refresh; select.onchange = refresh;
+    search.oninput = refresh; select.onchange = refresh; scope.onchange = refresh;
     document.getElementById("clearconditions").onclick = () => {
-      search.value = ""; select.value = "all"; refresh();
+      search.value = ""; select.value = "all"; scope.value = "active"; refresh();
     };
     bindCc(p.cwd);
   }
@@ -920,6 +1030,7 @@ function renderSessionList(p){
         ${s.pending_interactions ? `<span class="chip pending">待审批 ${s.pending_interactions}</span>` : ""}
         ${unreadSessions.has(s.id) ? '<span class="chip" title="本页面观察到主回合结束；不代表任务成功或后台子代理全部结束">新回复</span>' : ""}
         <span class="stitle">${esc(sessTitle(s))}</span>
+        ${metadataActionsHtml(s)}
         <div class="mut">${[
           s.cwd !== s.project ? "⎇ " + projName(s.cwd) : null,
           s.model, s.git_branch,
@@ -1188,7 +1299,8 @@ function updateHostedControls(d){
   }
 }
 
-let convLoading = null;     // 正在拉取对话的会话 id，防止同一会话的请求叠加
+let convLoading = null;     // 请求实例；旧请求的 finally 不得释放后继请求。
+let convRequestGeneration = 0;
 function renderConvList(){
   const el = document.getElementById("conv");
   if(!el) return;
@@ -1211,28 +1323,38 @@ function renderConvList(){
 }
 async function loadEarlier(){
   if(!convState.id || !convState.hasMore || convState.loadingEarlier) return;
-  convState.loadingEarlier = true;
+  const generation = ++convRequestGeneration;
+  convLoading = null;   // 分页与增量共享索引，取代尚未提交的旧刷新。
+  convState.loadingEarlier = generation;
+  const state = convState, id = state.id, route = routeGeneration;
   const main = document.getElementById("main");
   const oldHeight = main.scrollHeight, oldScroll = main.scrollTop;
   try{
     const r = await fetch(`/sessions/${encodeURIComponent(convState.id)}/messages` +
       `?before=${convState.start}&limit=100`);
     const page = await r.json();
-    if(view.session !== convState.id) return;
+    if(!r.ok || page.error || view.session !== id || convState !== state
+       || route !== routeGeneration || generation !== convRequestGeneration) return;
     convState.msgs = (page.messages || []).concat(convState.msgs);
     convState.start = page.start;
     convState.hasMore = !!page.has_more;
     convState.total = page.total;
     convState.size = page.size;
+    for(let echo = pendingEcho[convState.id]; echo; echo = echo.previous)
+      if(echo.after != null) echo.after += page.shift || 0;
     convState.cursor += page.shift || 0;   // 服务端前插了新块，末尾索引整体后移
     renderConvList();
     main.scrollTop = oldScroll + (main.scrollHeight - oldHeight);
   }catch(e){ /* 下次点击重试 */ }
-  finally{ convState.loadingEarlier = false; }
+  finally{ if(state.loadingEarlier === generation) state.loadingEarlier = false; }
 }
 async function renderConversation(id, force){
-  if(!force && convLoading === id) return;
-  convLoading = id;
+  if(!force && (convLoading?.id === id && convLoading.route === routeGeneration
+     || convState.id === id && convState.loadingEarlier)) return;
+  const request = {id, generation: ++convRequestGeneration, route: routeGeneration};
+  convLoading = request;
+  const current = () => request.generation === convRequestGeneration
+    && request.route === routeGeneration && view.session === id;
   const main = document.getElementById("main");
   try{
     const isNew = !(curPanel && curPanel.type === "conv" && curPanel.key === id
@@ -1245,7 +1367,7 @@ async function renderConversation(id, force){
       ]);
       const d = await dRes.json(), m = await mRes.json();
       if(!dRes.ok || !mRes.ok || m.error) return;
-      if(view.session !== id) return;   // 已切换走
+      if(!current()) return;   // 已切换走
       if(d.error){   // 转录尚未被轮询发现（常见于刚创建的会话）
         if(isNew) main.innerHTML = '<div class="empty">会话转录尚未就绪，稍候自动刷新…</div>';
         return;
@@ -1260,12 +1382,14 @@ async function renderConversation(id, force){
           <h2 style="font-size:16px;margin:8px 0">
             <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
             ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
-            ${esc(sessTitle(d))}
+            <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
             <span class="mut">${esc(d.cwd || "")}</span></h2>
+          ${metadataEditorHtml(d)}
           <div class="info-panel" id="infopanel">${infoHtml(d)}</div>
           <div id="interactions"></div>
           <div id="apierr" class="apierr" style="display:none"></div>
           ${composerHtml("conv", d)}
+          ${id.includes("::") ? "" : '<div class="info-panel" id="queue"></div>'}
           <h4 id="convcount">对话</h4>
           <div id="conv"></div>`;
         document.getElementById("back").onclick = () => {
@@ -1274,6 +1398,7 @@ async function renderConversation(id, force){
         // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
         bindSendBox(id, d);
         curPanel = {type: "conv", key: id};
+        bindMetadata(mergeMetadata(d));
         bindModel(id, d.selected_model);
         loadModelOptions(id, d.cwd);
         connectSessionSse(id);
@@ -1283,6 +1408,7 @@ async function renderConversation(id, force){
       if(!isNew && (box?.dataset.draftKey !== id
          || Number(box.dataset.draftVersion) !== messageDrafts.get(id)?.version)) bindMessageDraft(id);
       applySessionDetail(d);
+      loadQueue(id);
       renderInteractions(d.interactions || []);
       updateHostedControls(d);
       if(isNew){
@@ -1298,9 +1424,10 @@ async function renderConversation(id, force){
     // 同面板刷新：只更新数据区域，不重建输入区
     const dRes = await fetch("/sessions/" + encodeURIComponent(id));
     const d = await dRes.json();
-    if(view.session !== id) return;
+    if(!current()) return;
     if(!dRes.ok || d.error) return;
     applySessionDetail(d);
+    loadQueue(id);
     renderInteractions(d.interactions || []);
     updateHostedControls(d);
     updateSendSt(id);
@@ -1308,13 +1435,13 @@ async function renderConversation(id, force){
     const mRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages` +
       `?from=${convState.cursor}&limit=500`);
     const m = await mRes.json();
-    if(!mRes.ok || m.error || view.session !== id) return;
+    if(!mRes.ok || m.error || !current()) return;
     if(convState.id !== id || m.size < convState.size || m.total < convState.total){
       // 文件被截断/替换：重新取最近一页
       requestEnd = turnEndHighWater.get(id) || 0;
       const freshRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages?limit=100`);
       const fresh = await freshRes.json();
-      if(!freshRes.ok || fresh.error || view.session !== id) return;
+      if(!freshRes.ok || fresh.error || !current()) return;
       convState = {id, msgs: (fresh.messages || []).slice(),
                    total: fresh.total || 0, cursor: fresh.end || 0,
                    start: fresh.start || 0, size: fresh.size || 0,
@@ -1339,7 +1466,115 @@ async function renderConversation(id, force){
     }
     confirmDisplayedMessages(id, requestEnd);
   }catch(e){ /* 下次刷新重试 */ }
-  finally{ if(convLoading === id) convLoading = null; }
+  finally{ if(convLoading === request) convLoading = null; }
+}
+
+/* ---------- 独立发送队列：服务端快照是事实，GET 与取消各自防乱序 ---------- */
+const queueStates = new Map();
+let routeGeneration = 0, submissionToken = 0;
+function queueState(sid){
+  if(!queueStates.has(sid)) queueStates.set(sid, {generation: 0, snapshot: null, error: "", notice: "", cancelling: new Set()});
+  return queueStates.get(sid);
+}
+function queueMatch(sid){ return view.session === sid && !view.new && panelMatch(sid); }
+function queueJobHtml(job, kind, sid){
+  const state = queueState(sid), status = {running: "执行中", queued: "等待中", done: "已完成", failed: "失败", cancelled: "已取消"}[job.status] || job.status || "";
+  const position = kind === "queued" ? (job.position == null ? "待派发" : "FIFO #" + job.position) : status;
+  return `<div class="queue-job" data-job-id="${esc(job.id)}"><div><b>${esc(position)}</b> · ${esc(status)}
+    ${kind === "queued" && job.cancellable ? `<button class="back" data-cancel-job="${esc(job.id)}" data-sid="${esc(sid)}" ${state.cancelling.has(job.id) ? "disabled" : ""}>取消此项</button>` : ""}</div>
+    <div class="queue-text">${esc(job.text || "")}</div><div class="mut">请求模型：${esc(job.requested_model || "默认")} · 提交时间：${job.created_at ? esc(new Date(job.created_at * 1000).toLocaleString()) : "未知"}</div>
+    ${job.error ? `<div class="terror">${esc(job.error)}</div>` : ""}</div>`;
+}
+function renderQueue(sid){
+  if(!queueMatch(sid) || sid.includes("::")) return;
+  const el = document.getElementById("queue");
+  if(!el) return;
+  const state = queueState(sid), data = state.snapshot;
+  el.innerHTML = `<h4>发送队列</h4><div class="mut">仅保留本次服务进程的有限历史，重启不恢复。</div>` +
+    (state.error ? `<div class="terror" role="status">${esc(state.error)}</div>` : "") +
+    (state.notice ? `<div role="status">${esc(state.notice)}</div>` : "") +
+    (!data ? '<div class="mut">队列尚未加载</div>' :
+      `<h5>执行中 (${data.running.length})</h5>${data.running.map(j => queueJobHtml(j, "running", sid)).join("")}
+       <h5>等待发送 (${data.queued.length})</h5>${data.queued.map(j => queueJobHtml(j, "queued", sid)).join("")}
+       ${!data.running.length && !data.queued.length ? '<div class="mut">暂无执行或等待项</div>' : ""}
+       <details class="fold"${detailsAttrs("queue:" + sid + ":recent")}><summary>最近结束 (${data.recent.length})</summary>${data.recent.map(j => queueJobHtml(j, "recent", sid)).join("")}</details>`);
+}
+async function loadQueue(sid){
+  if(sid.includes("::")) return;
+  const state = queueState(sid), generation = ++state.generation, route = routeGeneration;
+  const current = () => generation === state.generation && route === routeGeneration && queueMatch(sid);
+  try{
+    const r = await fetchT("/sessions/" + encodeURIComponent(sid) + "/jobs");
+    const data = await r.json();
+    if(!current()) return;
+    if(!r.ok || data.error) throw Error(data.error || "HTTP " + r.status);
+    if(data.session !== sid || ![data.running, data.queued, data.recent].every(Array.isArray)) throw Error("队列响应无效");
+    state.snapshot = data; state.error = "";
+    for(const job of [...data.running, ...data.queued, ...data.recent]) reconcileJob(sid, job);
+  }catch(e){ if(current()) state.error = "队列查询失败（保留上次快照）：" + e.message; }
+  if(current()) renderQueue(sid);
+}
+async function cancelQueueJob(sid, jobId){
+  if(sid.includes("::")) return;
+  const state = queueState(sid);
+  if(state.cancelling.has(jobId)) return;
+  const route = routeGeneration;
+  state.cancelling.add(jobId); state.generation++; state.notice = ""; renderQueue(sid);
+  try{
+    const r = await fetchT("/sessions/" + encodeURIComponent(sid) + "/jobs/" + encodeURIComponent(jobId) + "/cancel", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    const data = await r.json();
+    if(!r.ok || data.error) throw Error(r.status === 409 ? "已开始执行，未取消" : data.error || "HTTP " + r.status);
+    state.notice = "已取消";
+    reconcileJob(sid, {...data, id: jobId, status: "cancelled"});
+  }catch(e){ state.notice = "取消失败：" + e.message; }
+  finally{
+    state.cancelling.delete(jobId); state.generation++;
+    if(route === routeGeneration && queueMatch(sid)){ renderQueue(sid); await loadQueue(sid); }
+  }
+}
+function reconcileJob(sid, job, expectedToken){
+  const terminal = ["done", "failed", "cancelled"].includes(job.status);
+  if(!terminal && !["running", "queued"].includes(job.status)) return;
+  if(job.status === "failed" || job.status === "cancelled") discardEchoPredecessor(sid, job.id);
+  const latest = sendJobs[sid];
+  if(!latest || latest.jobId !== job.id || expectedToken != null && latest.token !== expectedToken) return;
+  // 同一个任务终态不可逆，旧快照/旧单 job 回包不能复活或改写它。
+  if(["done", "failed", "cancelled"].includes(latest.status)) return;
+  const token = latest.token;
+  Object.assign(latest, {status: job.status, result: job.result, error: job.error});
+  if(terminal){
+    if(job.status === "failed") markEchoFailed(sid, token);
+    else settleEcho(sid, token);
+    latest.token = submissionToken = Math.max(submissionToken, Number(token) || 0) + 1;
+  }
+  updateSendSt(sid);
+}
+function discardEchoPredecessor(sid, jobId){
+  for(let echo = pendingEcho[sid]; echo?.previous; ){
+    if(echo.previous.jobId === jobId) echo.previous = echo.previous.previous;
+    else echo = echo.previous;
+  }
+}
+function ownsSubmission(key, token){ return sendJobs[key]?.token === token; }
+function moveSubmission(source, target, token){
+  if(!ownsSubmission(source, token)) return false;
+  const job = sendJobs[source], echo = pendingEcho[source];
+  delete sendJobs[source];
+  if(echo?.token === token) delete pendingEcho[source];
+  // 无论目标是否可接管，自己拥有的源槽都已释放。
+  if(sendJobs[target] && !ownsSubmission(target, token)) return false;
+  sendJobs[target] = job;
+  if(echo?.token === token && (!pendingEcho[target] || pendingEcho[target].token === token)) pendingEcho[target] = echo;
+  return true;
+}
+function submissionEcho(key, text, token, jobId){
+  // after 是提交前的消息末尾；分页前插时同步 shift，不匹配历史同文。
+  const after = convState.id === key ? Math.max(convState.total || 0, convState.cursor || 0) : 0;
+  const previous = pendingEcho[key];
+  return {text, token, jobId, after, submittedAt: Date.now() / 1000,
+    previous: previous && !previous.failed && previous.text.trim() === text.trim()
+      && echoVisible(convState.id === key ? convState.msgs : [], previous) ? previous : null};
 }
 
 /* ---------- 远程发消息 / 托管 ---------- */
@@ -1362,44 +1597,55 @@ function sendJobText(id){
   if(j.status === "queued") return cmd ? `${cmd} 排队中…` : "排队中…";
   if(j.status === "running") return cmd ? `正在执行${cmd}…` : "Claude 正在处理…";
   if(j.status === "done") return "已完成，回复见下方对话";
-  if(j.status === "cancelled") return "已中断";
+  if(j.status === "cancelled") return "已取消";
+  if(j.status === "unknown") return j.error || "状态查询未知，任务可能仍在执行";
   if(j.status === "failed") return "失败: " + (j.error || "未知错误");
   return "";
 }
 function echoVisible(messages, echo){
-  // 转录里出现同文本消息后回显退场；只查最近 20 条，避免长对话全量比对
   if(!echo || !echo.text || !messages) return false;
-  const t = echo.text.trim();
-  for(let i = messages.length - 1; i >= 0 && i >= messages.length - 20; i--){
-    const m = messages[i];
-    for(const p of m.parts || []){
-      // 斜杠命令在转录里是 system 角色的 command part（后端已拆分 command/args）
-      if(p.type === "command" && (p.command + (p.args ? " " + p.args : "")) === t) return false;
-      // 普通文本回显只对 user 消息对账
-      if(m.role === "user" && p.type === "text" && (p.text || "").trim() === t) return false;
+  if(echo.failed) return true; // 失败回显是错误反馈，不由普通转录对账消费。
+  // 同文连续提交需要不同的新消息确认；前一条未对账时，不能借它的转录清除后一条。
+  const waiting = [];
+  for(let e = echo; e; e = e.previous) if(!e.failed && e.text.trim() === echo.text.trim()) waiting.unshift(e);
+  let next = Math.max(0, messages.length - Math.max(20, waiting.length));
+  for(const e of waiting){
+    const first = e.after == null ? 0 : Math.max(0, e.after - (convState.start || 0));
+    let found = false;
+    for(let i = Math.max(next, first); i < messages.length; i++){
+      const m = messages[i];
+      if(e.submittedAt && m.ts && m.ts < e.submittedAt) continue;
+      const matches = (m.parts || []).some(p =>
+        p.type === "command" && (p.command + (p.args ? " " + p.args : "")) === e.text.trim()
+        || m.role === "user" && p.type === "text" && (p.text || "").trim() === e.text.trim());
+      if(matches){ found = true; next = i + 1; break; }
     }
+    if(!found) return true;
   }
-  return true;
+  return false;
 }
 function echoHtml(echo){
   return `<div class="msg user pending${echo.failed ? " failed" : ""}">` +
     `<div class="mhead">用户 · ${echo.failed ? "发送失败" : "发送中…"}</div>` +
     `<div class="ubody">${esc(echo.text)}</div></div>`;
 }
-function markEchoFailed(key, text){
-  // 文本守卫：回显已被后续发送覆盖时不标（旧任务的失败不污染最新一条）；
+function markEchoFailed(key, token){
+  // token 守卫：即使文本相同，旧任务也不能修改后续发送的回显；
   // 标红后立刻重渲染，不等下一次定时刷新
   const e = pendingEcho[key];
-  if(e && e.text === text && !e.failed){
+  if(e && e.token === token && !e.failed){
     e.failed = true;
-    renderConvList();
+    if(queueMatch(key) && convState.id === key) renderConvList();
   }
 }
-function settleEcho(key, text){
+function settleEcho(key, token){
   // job 到达非 failed 终态时消息必已落盘：未对账的回显直接清除兜底
   // （超长命令被后端截断、对账永不命中的场景），避免永久停在“发送中…”
   const e = pendingEcho[key];
-  if(e && e.text === text && !e.failed) delete pendingEcho[key];
+  if(e && e.token === token && !e.failed){
+    delete pendingEcho[key];
+    if(queueMatch(key) && convState.id === key) renderConvList();
+  }
 }
 function panelMatch(id){
   // 当前显示的面板是否属于该任务 key：后台轮询循环在用户切走后仍会存活，
@@ -1457,31 +1703,40 @@ function bindNewBox(p){
     const approval = document.getElementById("approvalsel")?.value || "auto";
     const selectedModel = modelSnapshot(key);
     if(selectedModel === undefined) return;
-    sendJobs[key] = {status: "sending", requested_model: selectedModel, text};
+    const token = ++submissionToken;
+    sendJobs[key] = {token, status: "sending", requested_model: selectedModel, text};
+    const echo = submissionEcho(key, text, token, null);   // 时间与窗口属于提交，不属于稍后的 sid 发现。
+    let accepted = false;
+    const owns = () => ownsSubmission(sid || key, token);
     updateSendSt(key);
-    let sid = null;
-    const enterSession = () => {   // 拿到新 session id 后切换到对话视图
-      modelDrafts[sid] = {...modelDraft(key), value: selectedModel};
-      modelProfileOptions[sid] = modelProfileOptions[key] || [];
-      sendJobs[sid] = sendJobs[key] || sendJobs[sid];   // 任务状态改挂到新会话 id 名下
-      delete sendJobs[key];
-      pendingEcho[sid] = {text};   // 新会话转录尚未就绪，先在对话顶部本地回显
-      if(view.new && view.project === p.cwd){
+    let sid = null, navigationRoute = routeGeneration;
+    const enterSession = target => {   // 首次发现及 CLI init 校正均走同一所有权迁移。
+      const source = sid || key;
+      if(!moveSubmission(source, target, token)) return false;
+      if(!modelDrafts[target]) modelDrafts[target] = {...modelDraft(source), value: selectedModel};
+      if(!modelProfileOptions[target]) modelProfileOptions[target] = modelProfileOptions[source] || [];
+      if(!pendingEcho[target]) pendingEcho[target] = echo;
+      const follow = navigationRoute === routeGeneration && (sid ? view.session === sid
+        : view.new && view.project === p.cwd);
+      sid = target;
+      if(follow){
         saveComposerDraft();
-        const remaining = messageDrafts.get(key)?.text || "";
+        const remaining = messageDrafts.get(source)?.text || "";
         // 只有确实自动导航时迁移；目标已有草稿优先，源草稿保留以免丢失。
         if(remaining && !messageDrafts.get(sid)?.text){
           saveMessageDraft(sid, remaining);
-          const cleared = saveMessageDraft(key, "");
+          const cleared = saveMessageDraft(source, "");
           const box = document.getElementById("msgbox");
-          if(box?.dataset.draftKey === key){
+          if(box?.dataset.draftKey === source){
             box.value = "";
             box.dataset.draftVersion = String(cleared.version);
           }
         }
         // 新建页是一次性入口，用 replace 换成会话地址，返回时直接回到项目列表
         navigate({project: p.cwd, session: sid, new: false}, {replace: true});
+        navigationRoute = routeGeneration;
       }
+      return true;
     };
     try{
       const r = await fetchT(useHost ? "/hosted" : "/new", {
@@ -1492,16 +1747,21 @@ function bindNewBox(p){
           : {cwd: p.cwd, text, model: selectedModel}),
       }, 30000);
       const j = await r.json();
+      if(!owns()) return;
       if(r.status !== 202){
-        sendJobs[key] = {status: "failed", error: j.error || ("HTTP " + r.status)};
+        sendJobs[key] = {token, text, status: "failed", error: j.error || ("HTTP " + r.status)};
         updateSendSt(key); return;
       }
+      accepted = true;
+      sendJobs[key] = {token, text, jobId: j.job_id, status: j.status || "queued"};
+      echo.jobId = j.job_id;
       clearSubmittedDraft(submitted);
       const deadline = Date.now() + SEND_POLL_TIMEOUT_MS;
       for(;;){
+        if(!owns()) break;
         if(Date.now() >= deadline){
-          sendJobs[sid || key] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
-          if(sid) markEchoFailed(sid, text);   // sid 未知时无对话区可显示，跳过
+          sendJobs[sid || key] = {...sendJobs[sid || key], status: "unknown", error: "状态查询超时，任务可能仍在执行"};
+          // 查询超时不代表服务端任务失败。
           updateSendSt(sid || key);
           break;
         }
@@ -1512,37 +1772,40 @@ function bindNewBox(p){
           useHost && !sid ? fetchT("/hosted", {}, 15000) : Promise.resolve(null),
         ]);
         const jr = await jrRes.json();
+        if(!owns()) break;
+        if(!jrRes.ok || jr.error && !jr.status) throw Error(jr.error || "HTTP " + jrRes.status);
+        const authoritativeSid = jr.session && jr.session !== j.hosted_id ? jr.session : jr.result_session_id;
+        if(authoritativeSid && authoritativeSid !== sid){
+          if(!enterSession(authoritativeSid)) break;
+        }
         if(!sid){
           if(useHost){
+            if(!hsRes.ok) throw Error("HTTP " + hsRes.status);
             const h = (await hsRes.json()).find(x => x.hosted_id === j.hosted_id);
+            if(!owns()) break;
             if(h && h.session_id){
-              sid = h.session_id;
-              enterSession();
+              if(!enterSession(h.session_id)) break;
             }else if(h && h.status === "exited"){
-              sendJobs[key] = {jobId: j.job_id, status: "failed",
+              sendJobs[key] = {token, text, jobId: j.job_id, status: "failed",
                                error: "claude 进程已退出: " + (h.stderr_tail || []).slice(-3).join(" | ")};
               updateSendSt(key);
               break;
             }
           }else if(jr.result_session_id){
             // 非托管模式下新会话 id 只在首轮跑完的结果里才有
-            sid = jr.result_session_id;
-            enterSession();
+            if(!enterSession(jr.result_session_id)) break;
           }
         }
-        sendJobs[sid || key] = {jobId: j.job_id, status: jr.status, result: jr.result, error: jr.error,
-                                text: (sendJobs[sid || key] || {}).text};
-        updateSendSt(sid || key);
+        if(!owns()) break;
+        reconcileJob(sid || key, {...jr, id: j.job_id}, token);
         if(jr.status === "running" || jr.status === "queued") continue;
-        // 服务端执行失败的回合没有转录落盘，回显不能停在"发送中…"；
-        // 文本守卫防止旧任务失败污染已被后续发送覆盖的最新回显
-        if(jr.status === "failed" && sid) markEchoFailed(sid, text);
-        else if(sid) settleEcho(sid, text);
         break;
       }
     }catch(e){
-      sendJobs[sid || key] = {status: "failed", error: String(e)};
-      if(sid) markEchoFailed(sid, text);   // sid 未知时无对话区可显示，跳过
+      if(!owns()) return;
+      sendJobs[sid || key] = {...sendJobs[sid || key], status: accepted ? "unknown" : "failed",
+        error: accepted ? "状态查询失败，任务可能仍在执行：" + e.message : String(e)};
+      // 查询失败保留回显，不宣称服务端执行失败。
       updateSendSt(sid || key);
     }
   };
@@ -1608,7 +1871,10 @@ function bindSendBox(id, d){
     // 已托管的会话 /sessions/<id>/message 会自动路由到常驻进程，无需再 POST /hosted
     const useHost = document.getElementById("hostcb").checked
       && !(d.hosted || sessions.find(s => s.id === id)?.hosted);
-    sendJobs[id] = {status: "sending", requested_model: selectedModel, text};
+    const token = ++submissionToken;
+    const echo = submissionEcho(id, text, token, null);
+    sendJobs[id] = {token, status: "sending", requested_model: selectedModel, text};
+    let accepted = false;
     updateSendSt(id);
     try{
       const r = await fetchT(useHost ? "/hosted" : "/sessions/" + encodeURIComponent(id) + "/message", {
@@ -1616,16 +1882,15 @@ function bindSendBox(id, d){
         body: JSON.stringify(useHost ? {resume_id: id, text, force, model: selectedModel} : {text, force, model: selectedModel}),
       }, 30000);
       const j = await r.json();
+      if(!ownsSubmission(id, token)) return;
       if(r.status !== 202){
-        sendJobs[id] = {status: "failed", error: j.error || ("HTTP " + r.status)};
-        markEchoFailed(id, text);
+        sendJobs[id] = {token, text, status: "failed", error: j.error || ("HTTP " + r.status)};
         updateSendSt(id); return;
       }
+      accepted = true;
       clearSubmittedDraft(submitted);
-      // 202 后立刻解除“发送中”锁定：托管会话可以继续排队，不必等整轮结束。
-      sendJobs[id] = {jobId: j.job_id, status: j.status || "queued",
-                      text: (sendJobs[id] || {}).text};
-      pendingEcho[id] = {text};   // 本地回显：转录落盘前先在对话顶部显示
+      sendJobs[id] = {token, jobId: j.job_id, status: j.status || "queued", text};
+      pendingEcho[id] = {...echo, jobId: j.job_id};
       renderConvList();
       updateSendSt(id);
       // 本次刚启动托管时重建一次面板，让“托管中/退出托管”控件立即出现；
@@ -1634,31 +1899,25 @@ function bindSendBox(id, d){
       load();
       const deadline = Date.now() + SEND_POLL_TIMEOUT_MS;
       for(;;){
+        if(!ownsSubmission(id, token)) break;
         if(Date.now() >= deadline){
-          sendJobs[id] = {status: "failed", error: "等待任务状态超时，任务可能仍在执行"};
-          markEchoFailed(id, text);
-          updateSendSt(id);
-          break;
+          sendJobs[id] = {...sendJobs[id], status: "unknown", error: "状态查询超时，任务可能仍在执行"};
+          updateSendSt(id); break;
         }
         await new Promise(f => setTimeout(f, 1500));
-        const jr = await (await fetchT("/jobs/" + encodeURIComponent(j.job_id), {}, 15000)).json();
-        // 多个消息排队时只更新自己的状态，避免旧任务的轮询覆盖新任务
-        if(!sendJobs[id] || sendJobs[id].jobId === j.job_id)
-          sendJobs[id] = {jobId: j.job_id, status: jr.status,
-                          result: jr.result, error: jr.error,
-                          text: (sendJobs[id] || {}).text};
-        updateSendSt(id);
+        const poll = await fetchT("/jobs/" + encodeURIComponent(j.job_id), {}, 15000);
+        const jr = await poll.json();
+        if(!ownsSubmission(id, token)) break;
+        if(!poll.ok || jr.error && !jr.status) throw Error(jr.error || "HTTP " + poll.status);
+        reconcileJob(id, {...jr, id: j.job_id}, token);
         if(jr.status === "running" || jr.status === "queued") continue;
-        // 服务端执行失败的回合没有转录落盘，回显不能停在"发送中…"；
-        // 文本守卫防止旧任务失败污染已被后续发送覆盖的最新回显
-        if(jr.status === "failed") markEchoFailed(id, text);
-        else settleEcho(id, text);
         break;
       }
       load();   // 软刷新最终状态，不重建输入区
     }catch(e){
-      sendJobs[id] = {status: "failed", error: String(e)};
-      markEchoFailed(id, text);
+      if(!ownsSubmission(id, token)) return;
+      sendJobs[id] = {...sendJobs[id], status: accepted ? "unknown" : "failed",
+        error: accepted ? "状态查询失败，任务可能仍在执行：" + e.message : String(e)};
       updateSendSt(id);
     }
   };
@@ -1693,6 +1952,7 @@ function navigate(next, opts){
   next = next || {project: null, session: null, new: false};
   const leaving = view.session !== (next.session || null);
   view = next;
+  routeGeneration++;
   if(leaving) clearSessionView();
   syncUrl(view, !!(opts && opts.replace));
   renderMain();
@@ -1707,7 +1967,7 @@ function renderPendingBadge(){
   const total = sessions.reduce((sum, s) => sum + (s.pending_interactions || 0), 0);
   const el = document.getElementById("pendingbadge");
   if(!el) return;
-  el.style.display = total ? "inline-block" : "none";
+  el.style.display = "inline-block";
   el.textContent = "待审批 " + total;
 }
 function renderHostedBadge(){
@@ -1724,6 +1984,7 @@ function renderMain(){
   document.getElementById("total").textContent = `(${sessions.length})`;
   renderPendingBadge();
   renderHostedBadge();
+  if(view.pending){ renderPendingList(); return; }
   if(view.session){
     syncUrl(view, true);   // 旧格式编码地址自动规整成可读路径
     renderConversation(view.session, false);
@@ -1774,11 +2035,8 @@ function toggleDrawer(open){
   asideEl.classList.toggle("open", open);
   maskEl.classList.toggle("show", open);
 }
-document.getElementById("pendingbadge").onclick = () => {
-  const target = sessions.find(s => s.pending_interactions > 0);
-  if(!target) return;
-  navigate({project: target.project, session: target.id, new: false});
-};
+function openPending(){ navigate({pending: true, project: null, session: null, new: false}); }
+document.getElementById("pendingbadge").onclick = openPending;
 document.getElementById("hostedbadge").onclick = () => {
   const target = sessions.find(s => s.hosted);
   if(!target) return;
@@ -1787,6 +2045,7 @@ document.getElementById("hostedbadge").onclick = () => {
 document.getElementById("menu").onclick = () => toggleDrawer(!asideEl.classList.contains("open"));
 maskEl.onclick = () => toggleDrawer(false);
 document.getElementById("projs").addEventListener("click", e => {
+  if(e.target.closest("#pendingnav")){ toggleDrawer(false); openPending(); return; }
   const nb = e.target.closest(".newbtn");
   if(nb){
     toggleDrawer(false);
@@ -1799,6 +2058,10 @@ document.getElementById("projs").addEventListener("click", e => {
   navigate({project: item.dataset.cwd, session: null, new: false});
 });
 document.getElementById("main").addEventListener("click", e => {
+  const cancel = e.target.closest && e.target.closest("[data-cancel-job]");
+  if(cancel){ e.preventDefault?.(); cancelQueueJob(cancel.dataset.sid, cancel.dataset.cancelJob); return; }
+  const management = e.target.closest && e.target.closest("[data-meta]");
+  if(management){ e.preventDefault?.(); e.stopPropagation?.(); metadataAction(management.dataset.sid, management.dataset.meta); return; }
   const act = e.target.closest && e.target.closest("#interactions button[data-act]");
   if(act){
     const card = act.closest(".inter-card");
@@ -1812,7 +2075,8 @@ document.getElementById("main").addEventListener("click", e => {
   }
   const card = e.target.closest(".scard");
   if(!card) return;
-  navigate({project: view.project, session: card.dataset.id, new: false});
+  const target = sessions.find(s => s.id === card.dataset.id);
+  navigate({project: target?.project || target?.cwd || view.project, session: card.dataset.id, new: false});
 });
 
 // toggle 不冒泡，用捕获阶段记录用户手动展开/折叠的 <details>

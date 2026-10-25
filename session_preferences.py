@@ -1,4 +1,4 @@
-"""看板独立的会话模型偏好，不改 Claude 的配置或转录。"""
+"""看板独立的会话偏好与整理元数据，不改 Claude 的配置或转录。"""
 import json
 import os
 import tempfile
@@ -46,6 +46,101 @@ def model_args(args, model):
             result.append(arg)
         i += 1
     return result + ["--model=" + validate_model(model)]
+
+
+def validate_metadata_patch(patch):
+    """校验整理字段的局部更新，返回独立的规范化副本。"""
+    if (not isinstance(patch, dict) or not patch
+            or set(patch) - {"alias", "pinned", "archived"}):
+        raise ValueError("会话元数据必须为仅含 alias / pinned / archived 的非空对象")
+    normalized = dict(patch)
+    if "alias" in normalized:
+        alias = normalized["alias"]
+        if alias is not None:
+            # 先拒绝控制字符，避免换行、制表符被 strip 静默清除。
+            if (not isinstance(alias, str)
+                    or any(unicodedata.category(c).startswith("C") for c in alias)):
+                raise ValueError("别名必须为不含控制字符的字符串，或 null")
+            alias = alias.strip()
+            if len(alias) > 120:
+                raise ValueError("别名最多 120 字符")
+            normalized["alias"] = alias or None
+    for field in ("pinned", "archived"):
+        if field in normalized and type(normalized[field]) is not bool:
+            raise ValueError("pinned / archived 必须为布尔值")
+    return normalized
+
+
+class SessionMetadata:
+    """按会话保存别名、置顶与归档，版本与字段一起原子持久化。"""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.sessions = {}
+        self.error = None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict) or type(data.get("version")) is not int
+                    or data["version"] != 1 or not isinstance(data.get("sessions"), dict)):
+                raise ValueError("格式或版本不支持")
+            loaded = {}
+            for sid, record in data["sessions"].items():
+                if (not isinstance(sid, str) or not isinstance(record, dict)
+                        or set(record) != {"alias", "pinned", "archived", "revision"}
+                        or type(record["revision"]) is not int or record["revision"] < 0):
+                    raise ValueError("会话元数据记录无效")
+                fields = validate_metadata_patch({key: record[key]
+                                                  for key in ("alias", "pinned", "archived")})
+                loaded[sid] = dict(fields, revision=record["revision"])
+            # 整个文件校验通过才加载，坏记录不能造成部分读取后覆盖原文件。
+            self.sessions = loaded
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            self.error = "会话元数据文件无法读取或格式损坏，请先修复或移走该文件"
+
+    def _snapshot(self, sid):
+        record = self.sessions.get(sid, {})
+        return {"alias": record.get("alias"), "pinned": record.get("pinned", False),
+                "archived": record.get("archived", False),
+                "metadata_revision": record.get("revision", 0)}
+
+    def get(self, sid):
+        with self.lock:
+            return self._snapshot(sid)
+
+    def update(self, sid, patch):
+        normalized = validate_metadata_patch(patch)
+        with self.lock:
+            if self.error:
+                raise ValueError(self.error)
+            current = self._snapshot(sid)
+            record = {key: current[key] for key in ("alias", "pinned", "archived")}
+            record.update(normalized)
+            record["revision"] = current["metadata_revision"] + 1
+            updated = dict(self.sessions)
+            updated[sid] = record
+            temp = None
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                fd, temp = tempfile.mkstemp(prefix="metadata-", suffix=".tmp", dir=self.path.parent)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "sessions": updated}, stream, ensure_ascii=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp, self.path)
+            except OSError as exc:
+                raise ValueError("会话元数据保存失败，请检查目录权限或磁盘空间") from exc
+            finally:
+                if temp:
+                    try:
+                        os.unlink(temp)
+                    except OSError:
+                        pass
+            # 写入成功后才发布新状态；全部恢复默认也保留递增版本。
+            self.sessions = updated
+            return self._snapshot(sid)
 
 
 class ModelPreferences:

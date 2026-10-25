@@ -153,6 +153,158 @@ class ExecutionTests(unittest.TestCase):
         _, response = host.send("default", None)
         self.assertEqual(self.wait_done(response["job_id"])["result"], "haiku:default")
 
+    def test_queue_cancel_is_atomic_and_preserves_fifo_models(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        def run(cmd, **kwargs):
+            calls.append((kwargs['input'], cmd[-1]))
+            if kwargs['input'] == 'first':
+                entered.set()
+                self.assertTrue(release.wait(5))
+            if kwargs['input'] == 'third':
+                finished.set()
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({'result': 'ok'}), '')
+        with patch.object(monitor.subprocess, 'run', side_effect=run):
+            _, first = self.mon.send_message('existing', 'first', model='opus')
+            self.assertTrue(entered.wait(2))
+            _, middle = self.mon.send_message('existing', 'middle', model='sonnet')
+            _, third = self.mon.send_message('existing', 'third', model='haiku')
+            code, snapshot = self.mon.session_jobs('existing')
+            self.assertEqual(code, 200)
+            self.assertEqual([j['position'] for j in snapshot['queued']], [1, 2])
+            self.assertEqual(self.mon.cancel_job('other', middle['job_id'])[0], 404)
+            self.assertEqual(self.mon.cancel_job('existing', first['job_id'])[0], 409)
+            self.assertEqual(self.mon.cancel_job('existing', middle['job_id'])[0], 200)
+            self.assertEqual(self.mon.cancel_job('existing', middle['job_id'])[0], 200)
+            self.assertEqual(self.mon.session_jobs('existing')[1]['queued'][0]['position'], 1)
+            release.set()
+            self.assertTrue(finished.wait(2))
+            self.wait_done(third['job_id'])
+        self.assertEqual(calls, [('first', '--model=opus'), ('third', '--model=haiku')])
+
+    def test_registered_job_is_visible_but_not_cancellable_and_history_is_bounded(self):
+        active = self.mon._new_job('existing', 'unpublished')
+        self.assertEqual(self.mon.cancel_job('existing', active['id'])[0], 409)
+        item = self.mon.session_jobs('existing')[1]['queued'][0]
+        self.assertFalse(item['cancellable'])
+        self.assertIsNone(item['position'])
+        for i in range(105):
+            job = self.mon._new_job('existing', str(i))
+            with self.mon.lock:
+                self.mon._terminal_job_locked(job, 'done')
+                self.mon._terminal_job_locked(job, 'failed')
+        self.assertIn(active['id'], self.mon.jobs)
+        self.assertEqual(len(self.mon.jobs), 101)
+        self.assertEqual(len(self.mon.session_jobs('existing')[1]['recent']), 20)
+        copy = self.mon.job_snapshot(active['id'])
+        copy['status'] = 'corrupted'
+        self.assertEqual(active['status'], 'queued')
+        self.assertNotIn('_owner', copy)
+
+    def test_host_cancel_does_not_finish_current_turn_or_clear_stream(self):
+        host = monitor.Hosted(self.mon, str(self.root), 'existing')
+        host.status = 'running'
+        _, first = host.send('first', 'opus')
+        _, middle = host.send('middle', 'sonnet')
+        _, third = host.send('third', 'haiku')
+        with host.ready:
+            _, current, _ = host.pending.popleft()
+            host.current = current
+            current['status'] = 'running'
+            host.stream_job, host.stream_text = current, 'partial'
+        with patch.object(host, '_write') as write:
+            self.assertEqual(self.mon.cancel_job('existing', middle['job_id'])[0], 200)
+            write.assert_not_called()
+        self.assertIs(host.current, current)
+        self.assertEqual(host.stream_text, 'partial')
+        self.assertEqual(host.turns, 0)
+        self.assertEqual([j['id'] for j in self.mon.session_jobs('existing')[1]['queued']], [third['job_id']])
+        host._on_init('corrected')
+        self.assertEqual(self.mon.session_jobs('corrected')[0], 200)
+        self.assertEqual(self.mon.jobs[middle['job_id']]['session'], 'corrected')
+
+    def test_host_claim_wins_during_model_switch_and_cancel_wins_before_claim(self):
+        host = monitor.Hosted(self.mon, str(self.root), 'existing', selected_model='opus')
+        host.status = 'running'
+        entered, release, written = threading.Event(), threading.Event(), threading.Event()
+        def control(subtype, **kwargs):
+            if subtype == 'set_model':
+                entered.set()
+                self.assertTrue(release.wait(5))
+        def write(obj):
+            written.set()
+            with host.ready:
+                host.stopping = True
+                host.ready.notify_all()
+        _, cancelled = host.send('cancel before claim', 'haiku')
+        self.assertEqual(self.mon.cancel_job('existing', cancelled['job_id'])[0], 200)
+        _, claimed = host.send('claimed', 'sonnet')
+        with patch.object(host, '_control', side_effect=control), patch.object(host, '_write', side_effect=write):
+            sender = threading.Thread(target=host._send_loop)
+            sender.start()
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(self.mon.cancel_job('existing', claimed['job_id'])[0], 409)
+            snapshot = self.mon.session_jobs('existing')[1]
+            self.assertEqual(snapshot['running'][0]['id'], claimed['job_id'])
+            release.set()
+            self.assertTrue(written.wait(2))
+            sender.join(2)
+            self.assertFalse(sender.is_alive())
+        self.assertEqual(self.mon.jobs[cancelled['job_id']]['status'], 'cancelled')
+        host._finish_job(self.mon.jobs[claimed['job_id']], 'completed')
+
+    def test_oneshot_claim_wins_and_cancel_releases_queue_capacity(self):
+        first_entered, release_first, second_entered, release_second = (threading.Event() for _ in range(4))
+        def run(cmd, **kwargs):
+            if kwargs['input'] == 'first':
+                first_entered.set()
+                self.assertTrue(release_first.wait(5))
+            elif kwargs['input'] == 'second':
+                second_entered.set()
+                self.assertTrue(release_second.wait(5))
+            return subprocess.CompletedProcess(cmd, 0, '{"result":"ok"}', '')
+        with patch.object(monitor.subprocess, 'run', side_effect=run), patch.object(monitor, 'REMOTE_QUEUE_LIMIT', 1):
+            self.mon.send_message('existing', 'first')
+            self.assertTrue(first_entered.wait(2))
+            _, cancelled = self.mon.send_message('existing', 'cancel')
+            self.assertEqual(self.mon.send_message('existing', 'overflow')[0], 429)
+            self.assertEqual(self.mon.cancel_job('existing', cancelled['job_id'])[0], 200)
+            _, second = self.mon.send_message('existing', 'second')
+            release_first.set()
+            self.assertTrue(second_entered.wait(2))
+            self.assertEqual(self.mon.cancel_job('existing', second['job_id'])[0], 409)
+            release_second.set()
+            self.wait_done(second['job_id'])
+
+    def test_host_stop_keeps_cancelled_and_old_host_owner_history(self):
+        from unittest.mock import Mock
+        old = monitor.Hosted(self.mon, str(self.root), 'existing')
+        old.status = 'running'
+        old.proc = Mock()
+        _, cancelled = old.send('cancel', 'opus')
+        self.assertEqual(self.mon.cancel_job('existing', cancelled['job_id'])[0], 200)
+        _, queued = old.send('stop', 'haiku')
+        old.stop(kill=True)
+        self.assertEqual(self.mon.jobs[cancelled['job_id']]['status'], 'cancelled')
+        self.assertEqual(self.mon.jobs[queued['job_id']]['status'], 'failed')
+        replacement = monitor.Hosted(self.mon, str(self.root), 'existing')
+        replacement.status = 'running'
+        self.mon.hosted_by_sid['existing'] = replacement
+        _, response = replacement.send('new owner', 'sonnet')
+        self.assertEqual(self.mon.cancel_job('existing', response['job_id'])[0], 200)
+        history = self.mon.session_jobs('existing')[1]['recent']
+        self.assertEqual({j['id'] for j in history}, {cancelled['job_id'], queued['job_id'], response['job_id']})
+        self.assertEqual(len(self.mon.terminal_jobs), 3)
+
+    def test_new_oneshot_result_binds_session_atomically(self):
+        completed = subprocess.CompletedProcess([], 0, '{"session_id":"new-id","result":"ok"}', '')
+        with patch.object(monitor.subprocess, 'run', return_value=completed):
+            _, response = self.mon.new_session(str(self.root), 'new')
+            self.wait_done(response['job_id'])
+        snapshot = self.mon.session_jobs('new-id')[1]
+        self.assertEqual(snapshot['recent'][0]['id'], response['job_id'])
+        self.assertEqual(self.mon.job_snapshot(response['job_id'])['session'], 'new-id')
+
     def test_invalid_model_does_not_create_job(self):
         code, _ = self.mon.send_message("existing", "hi", model=[])
         self.assertEqual(code, 400)
