@@ -15,6 +15,7 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
   POST /interactions/<id>/respond 审批 {"behavior":"allow|deny","scope":"once|always"}
   POST /sessions/<id>/interrupt   中断托管会话当前回合并清空排队消息
   POST /sessions/<id>/approval    设置审批模式 {"approval":"ask|auto|full"}
+  POST /sessions/<id>/effort      设置托管思考档位 {"effort":"low|medium|high|default"}
   GET /static/<file>          前端静态资源（marked / DOMPurify）
   GET /events                 SSE 实时事件流（?session=<id> 可过滤；首帧为 snapshot，
                               流式文本为 transient turn_delta）
@@ -91,9 +92,11 @@ from urllib.parse import urlparse, parse_qs
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from scan_cache import ScanCache
-from session_preferences import (APPROVAL_MODES, ApprovalPreferences, ModelPreferences,
+from session_preferences import (APPROVAL_MODES, ApprovalPreferences, EFFORT_LEVELS,
+                                 EffortPreferences, ModelPreferences,
                                  SessionMetadata, validate_metadata_patch,
-                                 UNSET, default_model, model_args, validate_model)
+                                 UNSET, default_model, effort_args, model_args,
+                                 validate_effort, validate_model)
 from cc_switch import CCSwitch, SwitchError
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
@@ -404,6 +407,7 @@ class Monitor:
         self.hosted_by_sid = {}    # session id -> Hosted
         self.preferences = ModelPreferences(CLAUDE_DIR / "claude-sessions" / "preferences.json")
         self.approvals = ApprovalPreferences(CLAUDE_DIR / "claude-sessions" / "approvals.json")
+        self.efforts = EffortPreferences(CLAUDE_DIR / "claude-sessions" / "efforts.json")
         self.metadata = SessionMetadata(CLAUDE_DIR / "claude-sessions" / "session-metadata.json")
         self.cc_switch = CCSwitch(CLAUDE_DIR)
         # 子代理转录默认不扫描；需要时通过 --scan-subagents 或 include_subagents=1 加载
@@ -773,7 +777,8 @@ class Monitor:
         if sess:
             self.emit(sess, "queue_changed", {"session": sid})
 
-    def host_session(self, cwd, resume_id, text, force=False, model=UNSET, approval=None):
+    def host_session(self, cwd, resume_id, text, force=False, model=UNSET,
+                     approval=None, effort=UNSET):
         # 子代理默认懒加载；补加载以保留“只读、拒绝托管”的 400 语义
         if resume_id:
             self.ensure_subagent(resume_id)
@@ -783,9 +788,11 @@ class Monitor:
         if not isinstance(target, str) or not target or not os.path.isdir(target):
             return 400, {"error": f"cwd unavailable: {target}"}
         with self.cc_switch.operation(target):
-            return self._host_session_locked(cwd, resume_id, text, force, model, approval)
+            return self._host_session_locked(cwd, resume_id, text, force, model,
+                                             approval, effort)
 
-    def _host_session_locked(self, cwd, resume_id, text, force=False, model=UNSET, approval=None):
+    def _host_session_locked(self, cwd, resume_id, text, force=False, model=UNSET,
+                             approval=None, effort=UNSET):
         """启动并托管常驻进程；resume_id 为空则新建会话。"""
         if approval is not None and approval not in APPROVAL_MODES:
             return 400, {"error": "approval 必须是 ask / auto / full"}
@@ -794,6 +801,13 @@ class Monitor:
                                      else None if model is UNSET else model)
         except ValueError as e:
             return 400, {"error": str(e)}
+        if effort is not UNSET:
+            try:
+                selected_effort = validate_effort(effort)
+            except ValueError as e:
+                return 400, {"error": str(e)}
+        else:
+            selected_effort = self.efforts.get(resume_id) if resume_id else None
         with self.lock:
             sess = self.by_sid(resume_id) if resume_id else None
             if resume_id and not sess:
@@ -816,8 +830,14 @@ class Monitor:
                 self.preferences.set(resume_id, selected)
             except ValueError as e:
                 return 500, {"error": str(e)}
+        if effort is not UNSET and resume_id:
+            try:
+                self.efforts.set(resume_id, selected_effort)
+            except ValueError as e:
+                return 500, {"error": str(e)}
         h = Hosted(self, cwd, resume_id, selected,
-                   approval=approval or (self.approvals.get(resume_id) if resume_id else "auto"))
+                   approval=approval or (self.approvals.get(resume_id) if resume_id else "auto"),
+                   effort=selected_effort)
         try:
             code, resp = h.start(text)
         except FileNotFoundError:
@@ -874,6 +894,29 @@ class Monitor:
         except ValueError as e:
             return 500, {"error": str(e)}
         return 200, {"approval": mode}
+
+    def set_effort(self, sid, level):
+        """保存思考档位；托管中先在线切换，失败不回滚保存（重托管后生效）。"""
+        try:
+            normalized = validate_effort(level)
+        except ValueError as e:
+            return 400, {"error": str(e)}
+        with self.lock:
+            h = self.hosted_by_sid.get(sid)
+        warning = None
+        if h and h.alive():
+            try:
+                h.set_effort(normalized)
+            except (RuntimeError, TimeoutError, ValueError) as e:
+                warning = f"在线切换失败（已保存，重托管后生效）: {e}"
+        try:
+            self.efforts.set(sid, normalized)
+        except ValueError as e:
+            return 500, {"error": str(e)}
+        resp = {"effort": normalized or "default"}
+        if warning:
+            resp["warning"] = warning
+        return 200, resp
 
     def respond_interaction(self, iid, body):
         if not isinstance(body, dict):
@@ -1463,11 +1506,15 @@ class Hosted:
     所以原有的监听逻辑无需改动。
     """
 
-    def __init__(self, mon, cwd, resume_id=None, selected_model=None, approval=None):
+    def __init__(self, mon, cwd, resume_id=None, selected_model=None, approval=None,
+                 effort=None):
         self.mon, self.cwd, self.resume_id = mon, cwd, resume_id
         self.hid = "h-" + secrets.token_hex(4)
         self.session_id = resume_id
         self.selected_model = selected_model
+        self.effort = effort if effort in EFFORT_LEVELS else None
+        self.process_effort = None    # 常驻进程当前档位（spawn 或在线切换后）
+        self.commands = []            # system/init 广播的指令目录（去 / 前缀、排序）
         self.approval = approval or (mon.approvals.get(resume_id) if resume_id else "auto")
         self.added_auto_permission = False   # 服务是否实际追加了 --permission-mode auto
         self.process_model = selected_model if selected_model is not None else default_model(mon.claude_args)
@@ -1549,10 +1596,11 @@ class Hosted:
                         spawn_args[idx] = "--settings=" + merged_json
             else:
                 print("[hosted] --settings 指向文件，跳过 AskUserQuestion hook 注册", flush=True)
-        cmd += model_args(spawn_args, self.selected_model)
+        cmd += effort_args(model_args(spawn_args, self.selected_model), self.effort)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, cwd=self.cwd)
         self.status = "running"
+        self.process_effort = self.effort
         threading.Thread(target=self._read_out, daemon=True).start()
         self.stderr_thread = threading.Thread(target=self._read_err, daemon=True)
         self.stderr_thread.start()
@@ -1709,7 +1757,7 @@ class Hosted:
                     inter.skip_response = True
                     inter.resolve("deny", reason="请求已被 Claude 取消", state="cancelled")
             elif typ == "system" and obj.get("subtype") == "init":
-                self._on_init(obj.get("session_id"))
+                self._on_init(obj.get("session_id"), obj)
             elif typ == "system" and obj.get("subtype") == "api_retry":
                 retry = {"attempt": obj.get("attempt"),
                          "max_retries": obj.get("max_retries"),
@@ -1779,10 +1827,19 @@ class Hosted:
             except (OSError, ValueError):
                 pass
 
-    def _on_init(self, sid):
+    def _on_init(self, sid, init_obj=None):
         if not sid:
             return
+        names, seen = [], set()
+        for item in (init_obj or {}).get("slash_commands") or []:
+            if not isinstance(item, str):
+                continue
+            name = item.strip().lstrip("/")
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
         with self.ready:
+            self.commands = sorted(names)
             old = self.session_id
             self.session_id = sid
             if old and old != sid and not self.resume_id:
@@ -1792,7 +1849,9 @@ class Hosted:
                 if self.resume_id:
                     self.mon.hosted_by_sid[self.resume_id] = self
                 if old and old != sid:
-                    if self.mon.hosted_by_sid.get(old) is self:
+                    # resume 会话即使 init 换了 sid（如 CLI 分配新 id）也保留原 id 的路由，
+                    # 只清理新会话预生成 id 的映射
+                    if old != self.resume_id and self.mon.hosted_by_sid.get(old) is self:
                         self.mon.hosted_by_sid.pop(old, None)
                     for inter in self.mon.interactions.values():
                         if inter.hosted_id == self.hid:
@@ -1803,6 +1862,11 @@ class Hosted:
         if self.selected_model is not None:
             try:
                 self.mon.preferences.bind(sid, self.selected_model)
+            except ValueError:
+                pass
+        if self.effort is not None:
+            try:
+                self.mon.efforts.bind(sid, self.effort)
             except ValueError:
                 pass
 
@@ -1989,6 +2053,15 @@ class Hosted:
             self._control("set_permission_mode", mode="default")
             self.added_auto_permission = False
         self.approval = mode
+
+    def set_effort(self, level):
+        """在线切换思考档位；None 回落模型默认。控制失败抛错，偏好由调用方处理。"""
+        if level is not None and level not in EFFORT_LEVELS:
+            raise ValueError("invalid effort level")
+        if self.alive():
+            self._control("apply_flag_settings", settings={"effortLevel": level})
+            self.process_effort = level
+        self.effort = level
 
     def interrupt(self):
         if not self.alive():
@@ -2566,9 +2639,11 @@ def make_handler(mon, refresh_interval):
                 mon.with_metadata(d)
                 d["selected_model"] = mon.preferences.get(sid)
                 d["approval"] = mon.approvals.get(sid)
+                d["effort"] = mon.efforts.get(sid)
                 d["interactions"] = mon.pending_interactions(sid)
                 d["subagent_session_ids"] = mon.subagent_ids(s)
                 h = mon.hosted_by_sid.get(sid)
+                d["commands"] = list(h.commands) if h and h.alive() else []
                 d["hosted"] = bool(h and h.alive())
                 d["hosted_id"] = h.hid if h else None
                 d["hosted_busy"] = bool(h and h.alive()
@@ -2725,7 +2800,8 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": "body must contain \"text\" (first message)"}, 400)
                 code, resp = mon.host_session(body.get("cwd"), body.get("resume_id"),
                                               text, bool(body.get("force")),
-                                              body.get("model", UNSET), body.get("approval"))
+                                              body.get("model", UNSET), body.get("approval"),
+                                              body.get("effort", UNSET))
                 return self._json(resp, code)
             if u.path.startswith("/interactions/") and u.path.endswith("/respond"):
                 if not self._safe_json_write():
@@ -2797,6 +2873,13 @@ def make_handler(mon, refresh_interval):
                 body = self._read_body()
                 mode = body.get("approval") if isinstance(body, dict) else None
                 code, resp = mon.set_approval(parts[1], mode)
+                return self._json(resp, code)
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "effort":
+                if not self._safe_json_write():
+                    return
+                body = self._read_body()
+                level = body.get("effort") if isinstance(body, dict) else None
+                code, resp = mon.set_effort(parts[1], level)
                 return self._json(resp, code)
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "message":
                 body = self._read_body()

@@ -69,7 +69,8 @@ for line in sys.stdin:
             uuid, pending_permission_uuid = pending_permission_uuid, None
             complete(uuid, "decision:" + str(decision))
     elif typ == "user":
-        emit({"type": "system", "subtype": "init", "session_id": "fake-session"})
+        emit({"type": "system", "subtype": "init", "session_id": "fake-session",
+              "slash_commands": ["/compact", "model", "/review", "/model"]})
         text = obj["message"]["content"]
         uuid = obj.get("uuid")
         # 真实 CLI 会先发 queued，再发 started

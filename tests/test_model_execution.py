@@ -310,6 +310,87 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertEqual(self.mon.jobs, {})
 
+    def start_host_capturing(self, **kwargs):
+        captured = []
+        original = subprocess.Popen
+        fake = str(Path(__file__).with_name("fake_claude.py"))
+        def popen(cmd, **popen_kwargs):
+            captured.append(cmd)
+            return original([sys.executable, fake] + cmd[1:], **popen_kwargs)
+        with patch.object(monitor.subprocess, "Popen", side_effect=popen):
+            code, response = self.mon.host_session(str(self.root), kwargs.pop("resume_id", None),
+                                                   "hi", **kwargs)
+        self.assertEqual(code, 202)
+        host = self.mon.hosted[response["hosted_id"]]
+        self.hosts.append(host)
+        return host, response["job_id"], captured
+
+    def test_hosted_effort_spawn_argument(self):
+        host, job_id, captured = self.start_host_capturing(resume_id="existing", effort="high")
+        self.assertIn("--effort=high", captured[0])
+        self.assertEqual(self.mon.efforts.get("existing"), "high")
+        self.assertEqual(host.effort, "high")
+        self.wait_done(job_id)
+
+    def test_hosted_effort_default_uses_service_args(self):
+        _, job_id, captured = self.start_host_capturing(resume_id="existing")
+        self.assertFalse(any(a.startswith("--effort") for a in captured[0]))
+        self.wait_done(job_id)
+
+    def test_hosted_effort_invalid_rejected(self):
+        code, response = self.mon.host_session(str(self.root), "existing", "hi",
+                                               effort="ultra")
+        self.assertEqual(code, 400)
+        self.assertIn("effort", response["error"])
+        self.assertIsNone(self.mon.efforts.get("existing"))
+
+    def test_hosted_effort_binds_new_session(self):
+        _, job_id, _ = self.start_host_capturing(effort="low")
+        self.wait_done(job_id)
+        # fake_claude 的 init 携带 fake-session；首轮选择应绑定到该 sid
+        self.assertEqual(self.mon.efforts.get("fake-session"), "low")
+
+    def test_set_effort_switches_live_host_and_persists(self):
+        host, _, _ = self.start_host_capturing(resume_id="existing")
+        code, resp = self.mon.set_effort("existing", "high")
+        self.assertEqual(code, 200)
+        self.assertEqual(resp, {"effort": "high"})
+        self.assertEqual(host.process_effort, "high")
+        self.assertEqual(self.mon.efforts.get("existing"), "high")
+        # default 清除偏好并回落模型默认
+        code, resp = self.mon.set_effort("existing", "default")
+        self.assertEqual(code, 200)
+        self.assertEqual(resp, {"effort": "default"})
+        self.assertIsNone(host.process_effort)
+        self.assertIsNone(self.mon.efforts.get("existing"))
+
+    def test_set_effort_invalid_value(self):
+        code, resp = self.mon.set_effort("existing", "ultra")
+        self.assertEqual(code, 400)
+        self.assertIn("effort", resp["error"])
+
+    def test_set_effort_without_host_only_persists(self):
+        code, resp = self.mon.set_effort("existing", "medium")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.mon.efforts.get("existing"), "medium")
+
+    def test_set_effort_control_failure_keeps_preference(self):
+        host, _, _ = self.start_host_capturing(resume_id="existing")
+        with patch.object(host, "_control",
+                          side_effect=RuntimeError("控制请求失败: apply_flag_settings")):
+            code, resp = self.mon.set_effort("existing", "low")
+        self.assertEqual(code, 200)
+        self.assertTrue(resp["warning"])
+        self.assertEqual(self.mon.efforts.get("existing"), "low")
+
+    def test_hosted_commands_from_init(self):
+        host, job_id = self.start_host()
+        self.wait_done(job_id)
+        deadline = time.time() + 2
+        while not host.commands and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(host.commands, ["compact", "model", "review"])
+
 
 if __name__ == "__main__":
     unittest.main()

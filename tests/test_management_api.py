@@ -457,6 +457,26 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(error.exception.code, 403)
         self.assertEqual(inter.state, "pending")
 
+    def test_effort_endpoint_persists_and_validates(self):
+        headers = {'Content-Type': 'application/json'}
+        result = json.load(self.request('/sessions/sid-1/effort',
+                                        {'effort': 'high'}, headers))
+        self.assertEqual(result, {'effort': 'high'})
+        self.assertEqual(self.mon.efforts.get('sid-1'), 'high')
+        detail = json.load(self.request('/sessions/sid-1'))
+        self.assertEqual(detail['effort'], 'high')
+        self.assertEqual(detail['commands'], [])
+        try:
+            self.request('/sessions/sid-1/effort', {'effort': 'ultra'}, headers)
+            self.fail('应返回 400')
+        except HTTPError as e:
+            self.assertEqual(e.code, 400)
+        # default 清除
+        result = json.load(self.request('/sessions/sid-1/effort',
+                                        {'effort': 'default'}, headers))
+        self.assertEqual(result, {'effort': 'default'})
+        self.assertIsNone(self.mon.efforts.get('sid-1'))
+
 
 class SSEDisconnectTests(unittest.TestCase):
     def test_client_abort_does_not_escape_handler(self):
