@@ -624,6 +624,22 @@ test('对话分页状态渲染与加载更早按钮', () => {
   b.run('convState.hasMore=false; renderConvList();');
   assert.doesNotMatch(b.node('conv').innerHTML,/loadearlier/);
 });
+test('跨块分页吸收已合并的工具结果与备注', () => {
+  const b=boot();
+  const merged=b.run(`mergeEarlierMessages(
+    [{role:'assistant',parts:[{type:'tool',tool_use_id:'t1',name:'Bash',
+      result:{type:'tool_result',tool_use_id:'t1',text:'ok'},notes:['note']}]},
+     {role:'user',parts:[{type:'text',text:'older'}]}],
+    [{role:'tool',parts:[{type:'tool_result',tool_use_id:'t1',text:'ok'},
+      {type:'tool_note',tool_use_id:'t1',text:'note'},{type:'text',text:'keep'}]}])`);
+  assert.equal(merged.length,3);
+  // 新加载块的孤儿结果/备注被吸收，仅保留普通文本
+  assert.equal(merged[2].parts.length,1);
+  assert.equal(merged[2].parts[0].text,'keep');
+  // 已合并的工具卡不重复追加结果与备注
+  assert.equal(merged[0].parts[0].result.text,'ok');
+  assert.equal(JSON.stringify(merged[0].parts[0].notes),'["note"]');
+});
 test('计划与选择卡片渲染及答案收集', () => {
   const b=boot();
   const plan=b.run('interactionHtml({id:"p1",kind:"plan",state:"pending",' +

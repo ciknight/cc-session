@@ -85,7 +85,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -115,6 +115,9 @@ SCAN_TAIL_SAMPLE_BYTES = 4096
 
 # 非托管会话的一次性消息排队上限；超出后返回 429
 REMOTE_QUEUE_LIMIT = 32
+
+# 对话解析缓存最多保留的转录文件数（LRU）；最久未用的缓存连同解析锁一起淘汰
+MSG_CACHE_SESSION_LIMIT = 8
 
 _jinja = Environment(
     loader=FileSystemLoader(str(TEMPLATE_DIR)),
@@ -393,7 +396,9 @@ class Monitor:
         self.lock = threading.Lock()
         self.subscribers = []      # list of queue.Queue
         self.first_scan_done = False
-        self.msg_cache = {}        # sid -> {off, buf, msgs, body} 对话接口的增量缓存
+        self.msg_cache = {}        # str(path) -> {base, off, buf, msgs, tools} 对话增量缓存
+        self.msg_lru = OrderedDict()   # 最近使用的缓存键；末尾为最新，头部优先淘汰
+        self.msg_active = Counter()    # 缓存键 -> 正在处理的请求数；活动中的缓存不淘汰
         # 远程发消息 / 托管相关
         self.claude_bin = "claude"
         self.claude_args = []
@@ -2390,6 +2395,34 @@ def _parse_message_chunk(data, tools):
     return msgs, tail
 
 
+def _absorb_orphan_tool_parts(msgs, tools):
+    """把消息里未匹配 tool_use 的独立 tool_result / tool_note 并入工具条目。
+
+    向前分页加载旧块后，原先因 tool_use 落在窗口外而独立展示的结果
+    可以归位到对应工具卡片；被吸收后变空的消息整体移除。
+    返回 (过滤后的消息列表, 吸收的 part 数)。
+    """
+    absorbed = 0
+    for msg in msgs:
+        keep = []
+        for part in msg.get("parts", []):
+            target = tools.get(part.get("tool_use_id")) if isinstance(part, dict) else None
+            if part.get("type") == "tool_result" and target is not None:
+                if target.get("result") is None:
+                    target["result"] = part
+                absorbed += 1
+            elif part.get("type") == "tool_note" and target is not None:
+                note = part.get("text", "")
+                notes = target.setdefault("notes", [])
+                if note not in notes:
+                    notes.append(note)
+                absorbed += 1
+            else:
+                keep.append(part)
+        msg["parts"] = keep
+    return [msg for msg in msgs if msg["parts"]], absorbed
+
+
 def parse_msg_line(ln, clip_len=8000):
     """把一行转录解析为一条消息；无内容返回 None。
 
@@ -2575,59 +2608,88 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": "file gone"}, 404)
                 # 增量解析：只解析上次读过后新增的部分（自动刷新每 2-3 秒来一次，
                 # 转录可达几十 MB，整文件重读既慢又占 CPU）
+                cache_key = str(s.path)
                 with mon.msg_locks_guard:
-                    msg_lock = mon.msg_locks.setdefault(sid, threading.Lock())
-                with msg_lock:
-                    st = mon.msg_cache.get(sid)
-                    if st is None or size < st.get("off", 0) or size < st.get("base", 0):
-                        # 首次（或文件被截断/替换）：大文件只解析尾部窗口
-                        base = 0
-                        if size > MSG_TAIL_BYTES:
+                    msg_lock = mon.msg_locks.setdefault(cache_key, threading.Lock())
+                    mon.msg_active[cache_key] += 1
+                try:
+                    with msg_lock:
+                        st = mon.msg_cache.get(cache_key)
+                        if st is None or size < st.get("off", 0) or size < st.get("base", 0):
+                            # 首次（或文件被截断/替换）：大文件只解析尾部窗口
+                            base = 0
+                            if size > MSG_TAIL_BYTES:
+                                with open(s.path, "rb") as f:
+                                    base = _align_line_start(f, size - MSG_TAIL_BYTES, size)
+                            st = mon.msg_cache[cache_key] = {"base": base, "off": base, "buf": b"",
+                                                             "msgs": [], "tools": {}}
+                        if size != st["off"]:
                             with open(s.path, "rb") as f:
-                                base = _align_line_start(f, size - MSG_TAIL_BYTES, size)
-                        st = mon.msg_cache[sid] = {"base": base, "off": base, "buf": b"",
-                                                   "msgs": [], "tools": {}}
-                    if size != st["off"]:
-                        with open(s.path, "rb") as f:
-                            f.seek(st["off"])
-                            data = st["buf"] + f.read()
-                        msgs, st["buf"] = _parse_message_chunk(data, st["tools"])
-                        st["msgs"].extend(msgs)
-                        st["off"] = size
-                    shift = 0
-                    if before is not None and before <= 0 and st["base"] > 0:
-                        # 向前翻页：加载上一块并前插，返回该块的最后 limit 条
-                        with open(s.path, "rb") as f:
-                            for _ in range(32):
-                                new_base = _align_line_start(
-                                    f, max(0, st["base"] - MSG_CHUNK_BYTES), st["base"])
-                                if new_base >= st["base"]:
-                                    break
-                                f.seek(new_base)
-                                data = f.read(st["base"] - new_base)
-                                chunk_tools = {}
-                                chunk_msgs, _ = _parse_message_chunk(data, chunk_tools)
-                                st["msgs"] = chunk_msgs + st["msgs"]
-                                st["tools"].update(chunk_tools)
-                                shift += len(chunk_msgs)
-                                st["base"] = new_base
-                                if chunk_msgs or new_base == 0:
-                                    break
-                        before = shift
-                    total = len(st["msgs"])
-                    if before is not None:
-                        start, end = max(0, before - limit), min(before, total)
-                    elif frm is not None:
-                        start, end = min(frm, total), min(frm + limit, total)
-                    else:
-                        start, end = max(0, total - limit), total
-                    payload = {"id": sid, "size": size, "total": total,
-                               "start": start, "end": end,
-                               "has_more": start > 0 or st["base"] > 0,
-                               "shift": shift,
-                               "messages": st["msgs"][start:end]}
-                return self._raw(json.dumps(payload, ensure_ascii=False,
-                                            separators=(",", ":")).encode())
+                                f.seek(st["off"])
+                                raw = f.read()
+                            data = st["buf"] + raw
+                            msgs, st["buf"] = _parse_message_chunk(data, st["tools"])
+                            st["msgs"].extend(msgs)
+                            st["off"] += len(raw)
+                            size = st["off"]
+                        shift = 0
+                        if before is not None and before <= 0 and st["base"] > 0:
+                            # 向前翻页：加载上一块并前插；旧窗口里找不到 tool_use 的
+                            # 独立结果/备注并入新加载的工具条目，避免重复展示
+                            total_before = len(st["msgs"])
+                            prepended = 0
+                            with open(s.path, "rb") as f:
+                                for _ in range(32):
+                                    new_base = _align_line_start(
+                                        f, max(0, st["base"] - MSG_CHUNK_BYTES), st["base"])
+                                    if new_base >= st["base"]:
+                                        break
+                                    f.seek(new_base)
+                                    data = f.read(st["base"] - new_base)
+                                    chunk_tools = {}
+                                    chunk_msgs, _ = _parse_message_chunk(data, chunk_tools)
+                                    if chunk_tools:
+                                        st["msgs"], _ = _absorb_orphan_tool_parts(
+                                            st["msgs"], chunk_tools)
+                                    st["msgs"] = chunk_msgs + st["msgs"]
+                                    st["tools"].update(chunk_tools)
+                                    prepended += len(chunk_msgs)
+                                    st["base"] = new_base
+                                    if chunk_msgs or new_base == 0:
+                                        break
+                            before = prepended
+                            # 吸收会删掉旧窗口的消息：净位移才是调用方游标的移动量
+                            shift = len(st["msgs"]) - total_before
+                        total = len(st["msgs"])
+                        if before is not None:
+                            start, end = max(0, before - limit), min(before, total)
+                        elif frm is not None:
+                            start, end = min(frm, total), min(frm + limit, total)
+                        else:
+                            start, end = max(0, total - limit), total
+                        payload = {"id": sid, "size": size, "total": total,
+                                   "start": start, "end": end,
+                                   "has_more": start > 0 or st["base"] > 0,
+                                   "shift": shift,
+                                   "messages": st["msgs"][start:end]}
+                    return self._raw(json.dumps(payload, ensure_ascii=False,
+                                                separators=(",", ":")).encode())
+                finally:
+                    with mon.msg_locks_guard:
+                        if mon.msg_active[cache_key] <= 1:
+                            del mon.msg_active[cache_key]
+                        else:
+                            mon.msg_active[cache_key] -= 1
+                        mon.msg_lru[cache_key] = None
+                        mon.msg_lru.move_to_end(cache_key)
+                        # 淘汰最久未用且无活动请求的缓存；全部都在活动中时允许暂时超限
+                        while len(mon.msg_cache) > MSG_CACHE_SESSION_LIMIT and mon.msg_lru:
+                            oldest = next(iter(mon.msg_lru))
+                            if oldest in mon.msg_active:
+                                break
+                            mon.msg_lru.pop(oldest)
+                            mon.msg_cache.pop(oldest, None)
+                            mon.msg_locks.pop(oldest, None)
             if u.path.startswith("/sessions/"):
                 sid = u.path.split("/", 2)[2]
                 mon.ensure_subagent(sid)

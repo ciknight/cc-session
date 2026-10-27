@@ -1192,6 +1192,34 @@ function toolPartHtml(p){
   return `<details class="tool-details"${key ? detailsAttrs(key) : ""}><summary>🔧 ${esc(p.name)}: ${esc(p.input)}</summary>` +
     (notes ? `<div class="mut">${esc(notes)}</div>` : "") + toolResultHtml(p) + `</details>`;
 }
+// 服务端把旧窗口的独立工具结果并入旧块的工具卡后，本地已加载列表里
+// 同名孤儿结果已被吸收：合并时去掉这些 part，避免同一结果展示两次
+function mergeEarlierMessages(older, newer){
+  const tools = new Map();
+  for(const m of older){
+    for(const p of (m.parts || []))
+      if(p.type === "tool" && p.tool_use_id) tools.set(p.tool_use_id, p);
+  }
+  let absorbed = false;
+  if(tools.size) for(const m of newer){
+    const keep = [];
+    for(const p of (m.parts || [])){
+      const t = tools.get(p.tool_use_id);
+      if(p.type === "tool_result" && t){
+        if(!t.result) t.result = p;
+        absorbed = true;
+      } else if(p.type === "tool_note" && t){
+        t.notes = t.notes || [];
+        if(!t.notes.includes(p.text)) t.notes.push(p.text);
+        absorbed = true;
+      } else keep.push(p);
+    }
+    m.parts = keep;
+  }
+  // 只有吸收发生时才丢弃被清空的消息；未涉及合并的消息原样保留
+  if(!absorbed) return older.concat(newer);
+  return older.concat(newer.filter(m => (m.parts || []).length));
+}
 function convHtml(messages){
   // 连续同角色合并为一组渲染
   const groups = [];
@@ -1433,7 +1461,7 @@ async function loadEarlier(){
     const page = await r.json();
     if(!r.ok || page.error || view.session !== id || convState !== state
        || route !== routeGeneration || generation !== convRequestGeneration) return;
-    convState.msgs = (page.messages || []).concat(convState.msgs);
+    convState.msgs = mergeEarlierMessages(page.messages || [], convState.msgs);
     convState.start = page.start;
     convState.hasMore = !!page.has_more;
     convState.total = page.total;

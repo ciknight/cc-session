@@ -327,6 +327,92 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(messages[0]["parts"][0]["text"], "m0")
         self.assertEqual(messages[-1]["parts"][0]["text"], "m249")
 
+    @staticmethod
+    def _message_texts(payload):
+        return [part.get("text") for message in payload["messages"]
+                for part in message.get("parts", []) if part.get("type") == "text"]
+
+    @staticmethod
+    def _message_line(text):
+        return json.dumps({"type": "user", "message": {"content": text}}) + "\n"
+
+    def test_messages_cache_is_isolated_by_transcript_path_for_same_sid(self):
+        a = self.root / "a" / "same.jsonl"
+        b = self.root / "b" / "same.jsonl"
+        a.parent.mkdir()
+        b.parent.mkdir()
+        a.write_text(self._message_line("A-old") + self._message_line("A-new"), encoding="utf-8")
+        b.write_text(self._message_line("B-old"), encoding="utf-8")
+        sa = monitor.Session("same", a)
+        sb = monitor.Session("same", b)
+        sa.last_event_ts, sb.last_event_ts = 1, 2
+        self.mon.sessions[str(a)], self.mon.sessions[str(b)] = sa, sb
+        first = json.load(self.request("/sessions/same/messages"))
+        sa.last_event_ts = 3
+        second = json.load(self.request("/sessions/same/messages"))
+        self.assertEqual(self._message_texts(first), ["B-old"])
+        self.assertEqual(self._message_texts(second), ["A-old", "A-new"])
+
+    def test_messages_offset_tracks_bytes_read_when_file_grows_after_stat(self):
+        path = self.project / "grow.jsonl"
+        path.write_text(self._message_line("one"), encoding="utf-8")
+        extra = self._message_line("two")
+
+        class GrowingPath:
+            def __init__(self, target):
+                self.target = target
+                self.armed = True
+
+            def __fspath__(self):
+                return str(self.target)
+
+            def stat(self):
+                size = self.target.stat().st_size
+                if self.armed:
+                    self.armed = False
+                    with self.target.open("a", encoding="utf-8") as stream:
+                        stream.write(extra)
+                return SimpleNamespace(st_size=size)
+
+        sess = monitor.Session("grow", GrowingPath(path))
+        self.mon.sessions[str(path)] = sess
+        first = json.load(self.request("/sessions/grow/messages"))
+        second = json.load(self.request("/sessions/grow/messages"))
+        self.assertEqual(self._message_texts(first), ["one", "two"])
+        self.assertEqual(self._message_texts(second), ["one", "two"])
+
+    def test_messages_older_chunk_absorbs_orphan_tool_result(self):
+        tool = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pwd"}}]}}) + "\n"
+        result = json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "/work"}]}}) + "\n"
+        path = self.project / "sid-1.jsonl"
+        path.write_text(tool + result, encoding="utf-8")
+        self.sess.path = path
+        with patch.object(monitor, "MSG_TAIL_BYTES", len(result.encode())), \
+                patch.object(monitor, "MSG_CHUNK_BYTES", len(tool.encode())):
+            first = json.load(self.request("/sessions/sid-1/messages"))
+            self.assertEqual(first["messages"][0]["parts"][0]["type"], "tool_result")
+            older = json.load(self.request("/sessions/sid-1/messages?before=0&limit=100"))
+        self.assertEqual(older["total"], 1)
+        self.assertEqual(older["shift"], 0)
+        self.assertEqual(len(older["messages"]), 1)
+        part = older["messages"][0]["parts"][0]
+        self.assertEqual(part["type"], "tool")
+        self.assertEqual(part["result"]["text"], "/work")
+
+    def test_messages_cache_evicts_least_recently_used_file(self):
+        for index in range(9):
+            path = self.project / f"s{index}.jsonl"
+            path.write_text(self._message_line(f"m{index}"), encoding="utf-8")
+            sess = monitor.Session(f"s{index}", path)
+            self.mon.sessions[str(path)] = sess
+            response = json.load(self.request(f"/sessions/s{index}/messages"))
+            self.assertEqual(response["total"], 1)
+        self.assertEqual(len(self.mon.msg_cache), 8)
+        self.assertNotIn(str(self.project / "s0.jsonl"), self.mon.msg_cache)
+        self.assertIn(str(self.project / "s8.jsonl"), self.mon.msg_cache)
+
     def test_messages_paging_rejects_bad_params(self):
         with self.assertRaises(HTTPError) as error:
             self.request("/sessions/sid-1/messages?before=1&from=2")
