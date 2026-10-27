@@ -1500,6 +1500,10 @@ function setConvComposerHidden(hidden){
 }
 function convScrollStopped(){
   if(convHideTimer){ clearTimeout(convHideTimer); convHideTimer = null; }
+  const conv = document.getElementById("conv");
+  // 回弹前 conv 仍是扩展高度：贴底时先滚到底，最新消息才不会被返回的发送框挡住；
+  // 正在翻历史（离底远）则保持原位不打扰
+  if(conv && conv.scrollHeight - conv.scrollTop - conv.clientHeight < 80) conv.scrollTop = conv.scrollHeight;
   setConvComposerHidden(false);
 }
 function wireConvAutoHide(convEl){
@@ -1509,7 +1513,7 @@ function wireConvAutoHide(convEl){
     setConvComposerHidden(true);
     if(convHideTimer) clearTimeout(convHideTimer);
     // 惯性滚动期间 scroll 持续触发、定时器不断重置，回弹自然等到停下
-    convHideTimer = setTimeout(() => { convHideTimer = null; setConvComposerHidden(false); }, 400);
+    convHideTimer = setTimeout(() => { convHideTimer = null; convScrollStopped(); }, 400);
   }, {passive:true});
   convEl.addEventListener("scrollend", convScrollStopped);
 }

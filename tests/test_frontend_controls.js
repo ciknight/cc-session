@@ -2102,3 +2102,20 @@ test('移动端会话页滚动隐藏发送框，停止后回弹；桌面端不�
   conv.dispatchEvent({type:'scroll'});
   assert.equal(comp.classList.contains('conv-hide'), false, '桌面端滚动不隐藏');
 });
+
+test('回弹时贴底先滚到底，阅读历史不打扰', () => {
+  let narrow = true;
+  const mq = {get matches(){return narrow;}, addEventListener(){}, removeEventListener(){}};
+  const b = boot(() => response({}), {matchMedia: () => mq});
+  b.context.setTimeout = fn => { fn(); return 1; };
+  b.run('wireConvAutoHide(document.getElementById("conv"))');
+  const conv = b.node('conv');
+  // 贴底（按隐藏时扩展后的高度判断）：回弹前先滚到底，最新消息不被发送框挡住
+  Object.assign(conv, {scrollHeight: 1000, scrollTop: 150, clientHeight: 900});
+  conv.dispatchEvent({type:'scroll'});
+  assert.equal(conv.scrollTop, 1000, '贴底时回弹应先滚到底');
+  // 翻看历史（离底远）：回弹不打扰当前阅读位置
+  Object.assign(conv, {scrollHeight: 1000, scrollTop: 0, clientHeight: 900});
+  conv.dispatchEvent({type:'scroll'});
+  assert.equal(conv.scrollTop, 0, '阅读历史时回弹不应改变滚动位置');
+});
