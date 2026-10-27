@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -202,7 +203,7 @@ class ManagementAPITests(unittest.TestCase):
         self.assertIn(b"Bad request version", data)
 
     def test_spa_route_serves_index_html(self):
-        for path in ("/", "/p/demo%5Cproject", "/pending"):
+        for path in ("/", "/p/demo%5Cproject", "/pending", "/hosted"):
             response = self.request(path)
             self.assertEqual(response.headers.get_content_type(), "text/html")
             self.assertIn("Claude Sessions", response.read().decode("utf-8"))
@@ -710,9 +711,9 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(result["interactions"][0]["tool_name"], "Bash")
         self.assertEqual(result["interactions"][0]["preview"]["kind"], "text")
 
-    def test_default_approval_is_auto_but_saved_mode_wins(self):
+    def test_default_approval_is_full_but_saved_mode_wins(self):
         detail = json.load(self.request("/sessions/sid-1"))
-        self.assertEqual(detail["approval"], "auto")
+        self.assertEqual(detail["approval"], "full")
         self.mon.approvals.set("sid-1", "ask")
         detail = json.load(self.request("/sessions/sid-1"))
         self.assertEqual(detail["approval"], "ask")
@@ -794,6 +795,45 @@ class ManagementAPITests(unittest.TestCase):
                                         {'effort': 'default'}, headers))
         self.assertEqual(result, {'effort': 'default'})
         self.assertIsNone(self.mon.efforts.get('sid-1'))
+
+
+    def test_commands_endpoint_scans_user_and_project_dirs(self):
+        user_commands = monitor.CLAUDE_DIR / "commands"
+        user_commands.mkdir(parents=True)
+        (user_commands / "global.md").write_text("# /global", encoding="utf-8")
+        (user_commands / "notes.txt").write_text("not a command", encoding="utf-8")
+        project_commands = self.project / ".claude" / "commands"
+        (project_commands / "sub").mkdir(parents=True)
+        (project_commands / "sub" / "dep.md").write_text("# /dep", encoding="utf-8")
+        with self.assertRaises(HTTPError) as ctx:
+            self.request('/commands?cwd=' + urllib.parse.quote(str(self.root / "unknown")))
+        self.assertEqual(ctx.exception.code, 400)
+        result = json.load(self.request('/commands?cwd=' + urllib.parse.quote(str(self.project))))
+        self.assertEqual(result, {'commands': ['global', 'sub/dep']})
+
+    def test_system_endpoint_returns_snapshot(self):
+        fake = SimpleNamespace(
+            cpu_percent=lambda interval=None, percpu=False: [11.0, 22.0] if percpu else 16.5,
+            virtual_memory=lambda: SimpleNamespace(total=8 * 2**30, used=4 * 2**30,
+                                                   available=4 * 2**30, percent=50.0),
+            swap_memory=lambda: SimpleNamespace(total=2 * 2**30, used=2**30, percent=50.0),
+            boot_time=lambda: time.time() - 3600,
+        )
+        with patch.object(monitor, "psutil", fake):
+            result = json.load(self.request('/system'))
+        self.assertEqual(result['cpu_percent'], 16.5)
+        self.assertEqual(result['cpu_cores'], [11.0, 22.0])
+        self.assertEqual(result['mem_total'], 8 * 2**30)
+        self.assertEqual(result['mem_percent'], 50.0)
+        self.assertEqual(result['swap_total'], 2 * 2**30)
+        self.assertGreaterEqual(result['uptime'], 3599)
+        self.assertTrue(result['hostname'])
+
+    def test_system_endpoint_unavailable_without_psutil(self):
+        with patch.object(monitor, "psutil", None):
+            with self.assertRaises(HTTPError) as ctx:
+                self.request('/system')
+            self.assertEqual(ctx.exception.code, 503)
 
 
 class SSEDisconnectTests(unittest.TestCase):

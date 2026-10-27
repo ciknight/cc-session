@@ -79,6 +79,7 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -98,6 +99,11 @@ from session_preferences import (APPROVAL_MODES, ApprovalPreferences, EFFORT_LEV
                                  UNSET, default_model, effort_args, model_args,
                                  validate_effort, validate_model)
 from cc_switch import CCSwitch, SwitchError
+
+try:
+    import psutil   # 系统面板采样用；未安装时 GET /system 返回 503
+except ImportError:
+    psutil = None
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -189,6 +195,62 @@ def path_is_within(path, root):
         return os.path.commonpath([os.path.normcase(str(path)), os.path.normcase(str(root))]) == os.path.normcase(str(root))
     except ValueError:
         return False
+
+
+class SystemInfoUnavailable(Exception):
+    """系统状态采集不可用（psutil 缺失等）。"""
+
+
+def system_snapshot():
+    """采集一次系统状态。cpu_percent 阻塞约 0.3 秒采样，
+    ThreadingHTTPServer 每请求独立线程，不影响其他请求。"""
+    if psutil is None:
+        raise SystemInfoUnavailable("psutil 未安装")
+    cores = psutil.cpu_percent(interval=0.3, percpu=True)
+    vm = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    return {
+        "hostname": socket.gethostname(),
+        "uptime": max(0, int(time.time() - psutil.boot_time())),
+        "cpu_percent": round(sum(cores) / len(cores), 1) if cores else 0.0,
+        "cpu_cores": [round(c, 1) for c in cores],
+        "mem_total": vm.total, "mem_used": vm.total - vm.available,
+        "mem_available": vm.available, "mem_percent": vm.percent,
+        "swap_total": swap.total, "swap_used": swap.used,
+        "swap_percent": swap.percent,
+    }
+
+
+def scan_slash_commands(claude_dir, cwd):
+    """扫描文件系统上的自定义 slash 命令，返回去 / 前缀的名字列表。
+
+    只覆盖用户级 <claude_dir>/commands 与项目级 <cwd>/.claude/commands 下的 *.md
+    （子目录映射为 name/sub）；内置命令要等首个托管进程 system/init 广播才有，
+    新建会话页在进程启动前用这份目录做输入提示。
+    """
+    names, seen = [], set()
+    bases = []
+    try:
+        bases.append(Path(claude_dir).expanduser() / "commands")
+        bases.append(Path(cwd).expanduser() / ".claude" / "commands")
+    except (TypeError, RuntimeError, OSError):
+        return []
+    for base in bases:
+        try:
+            if not base.is_dir():
+                continue
+            files = sorted(base.rglob("*.md"))
+        except OSError:
+            continue
+        for path in files:
+            rel = path.relative_to(base)
+            if any(part.startswith(".") for part in rel.parts[:-1]):
+                continue
+            name = rel.as_posix()[:-len(".md")]
+            if name and not name.startswith(".") and name not in seen:
+                seen.add(name)
+                names.append(name)
+    return sorted(names)
 
 
 class Session:
@@ -854,7 +916,7 @@ class Monitor:
             except ValueError as e:
                 return 500, {"error": str(e)}
         h = Hosted(self, cwd, resume_id, selected,
-                   approval=approval or (self.approvals.get(resume_id) if resume_id else "auto"),
+                   approval=approval or (self.approvals.get(resume_id) if resume_id else "full"),
                    effort=selected_effort)
         try:
             code, resp = h.start(text)
@@ -1585,7 +1647,7 @@ class Hosted:
         self.effort = effort if effort in EFFORT_LEVELS else None
         self.process_effort = None    # 常驻进程当前档位（spawn 或在线切换后）
         self.commands = []            # system/init 广播的指令目录（去 / 前缀、排序）
-        self.approval = approval or (mon.approvals.get(resume_id) if resume_id else "auto")
+        self.approval = approval or (mon.approvals.get(resume_id) if resume_id else "full")
         self.added_auto_permission = False   # 服务是否实际追加了 --permission-mode auto
         self.process_model = selected_model if selected_model is not None else default_model(mon.claude_args)
         self.proc = None
@@ -2627,10 +2689,15 @@ def make_handler(mon, refresh_interval):
             u = urlparse(self.path)
             if u.path == "/healthz":
                 return self._json({"ok": True, "sessions": len(mon.sessions)})
+            if u.path == "/system":
+                try:
+                    return self._json(system_snapshot())
+                except SystemInfoUnavailable as e:
+                    return self._json({"error": f"系统信息不可用：{e}"}, 503)
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
                 return self._json({"interactions": mon.pending_interactions(sid)})
-            if u.path in ("/", "/pending") or u.path.startswith("/p/"):
+            if u.path in ("/", "/pending", "/hosted") or u.path.startswith("/p/"):
                 # /p/<项目>[/s/<会话>|/new] 都由前端路由裁决，服务端统一回模板
                 return self._index()
             if u.path == "/sessions":
@@ -2794,6 +2861,12 @@ def make_handler(mon, refresh_interval):
                 return self._json(d)
             if u.path.startswith("/static/"):
                 return self._static(u.path[len("/static/"):])
+            if u.path == "/commands":
+                # 新建会话页的 slash 提示：进程未启动前先扫命令目录
+                cwd = parse_qs(u.query).get("cwd", [""])[0]
+                if not mon.known_project_cwd(cwd):
+                    return self._json({"error": "目标目录不属于已监控项目"}, 400)
+                return self._json({"commands": scan_slash_commands(CLAUDE_DIR, cwd)})
             if u.path == "/cc-switch":
                 cwd = parse_qs(u.query).get("cwd", [""])[0]
                 if not mon.known_project_cwd(cwd):
