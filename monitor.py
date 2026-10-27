@@ -863,7 +863,9 @@ class Monitor:
     # ---------- 权限审批 ----------
     def hook_command(self):
         args = [sys.executable, str(Path(__file__).resolve()), "hook",
-                "--port", str(self.http_port), "--token", self.hook_token]
+                "--port", str(self.http_port), "--token", self.hook_token,
+                # 0 传给客户端表示无限等待，与服务端审批语义一致
+                "--timeout", str(self.permission_timeout)]
         if os.name == "nt":
             # Claude Code 在 Windows 上经 Git Bash 执行 hook，反斜杠路径会被 bash
             # 当转义吃掉（F:\code\... → F:code... → exit 127），必须换成正斜杠
@@ -2510,6 +2512,8 @@ def hook_client(argv):
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--token", required=True)
     ap.add_argument("--event", default="PreToolUse")
+    ap.add_argument("--timeout", type=int, default=None,
+                    help="等待服务端审批结果的秒数；0 或缺省表示无限等待")
     args = ap.parse_args(argv)
     # 二进制读写，避免 Windows 管道按本地代码页转换中文
     payload = sys.stdin.buffer.read()
@@ -2521,7 +2525,8 @@ def hook_client(argv):
                      "X-Monitor-Token": args.token})
         # 绕过 http_proxy，避免把本地请求和令牌发给代理
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=3600) as resp:
+        timeout = args.timeout if args.timeout and args.timeout > 0 else None
+        with opener.open(req, timeout=timeout) as resp:
             sys.stdout.buffer.write(resp.read())
     except Exception:
         # 服务不可达时 fail-open，让 CLI 回落到自身行为
@@ -2813,17 +2818,19 @@ def make_handler(mon, refresh_interval):
                 else:
                     emit_pending = False
             if emit_pending:
-                sess = mon.by_sid(sid)
+                with mon.lock:
+                    sess = mon.by_sid(sid)
                 if sess:
                     mon.emit(sess, "interaction_pending", inter.public())
-            timeout = mon.permission_timeout if mon.permission_timeout > 0 else 3600
+            # 0 表示无限等待，与 stdio 审批路径（_await_interaction）语义一致
+            timeout = mon.permission_timeout if mon.permission_timeout > 0 else None
             inter.event.wait(timeout)
             if inter.state == "pending":
                 inter.resolve("deny", reason="审批超时，已自动跳过", state="timed_out")
             with mon.lock:
                 mon.interactions.pop(inter.id, None)
                 mon.hook_interactions.pop(key, None)
-            sess = mon.by_sid(sid)
+                sess = mon.by_sid(sid)
             if sess:
                 mon.emit(sess, "interaction_resolved", inter.public())
             if inter.behavior == "allow" and inter.answers:
@@ -2991,6 +2998,9 @@ def make_handler(mon, refresh_interval):
             self.wfile.write(body)
 
         def _snapshot(self, only):
+            # seq 先于数据采集分配：采集期间发出的事件 seq 都更大，
+            # 客户端按 seq 去重时不会丢掉这些增量
+            seq = mon.next_seq()
             if only:
                 with mon.lock:
                     s = mon.by_sid(only)
@@ -3025,7 +3035,7 @@ def make_handler(mon, refresh_interval):
                     item["hosted"] = bool(h and h.alive())
                     item["hosted_id"] = h.hid if h else None
                 data = {"sessions": sessions, "interactions": mon.pending_interactions()}
-            return {"ts": now_ts(), "seq": mon.next_seq(), "session": only,
+            return {"ts": now_ts(), "seq": seq, "session": only,
                     "type": "snapshot", "data": data}
 
         def _sse(self, only):

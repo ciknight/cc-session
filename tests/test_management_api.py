@@ -1,7 +1,9 @@
+import io
 import json
 import queue
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -471,6 +473,69 @@ class ManagementAPITests(unittest.TestCase):
             capture_output=True, text=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout), {})
+
+    def test_hook_wait_uses_unlimited_timeout_when_permission_timeout_zero(self):
+        # --permission-timeout 0 的语义是无限等待：hook 路径不能截断成 3600 秒
+        for permission_timeout, expected in ((0, None), (300, 300)):
+            with self.subTest(permission_timeout=permission_timeout):
+                self.mon.permission_timeout = permission_timeout
+                self.mon.hook_token = "tok"
+                self.mon.first_scan_done = True
+                waits = []
+                real_init = monitor.Interaction.__init__
+
+                def init_spy(inter, *args, **kwargs):
+                    real_init(inter, *args, **kwargs)
+
+                    def wait_spy(timeout=None):
+                        waits.append(timeout)
+                        return True
+
+                    inter.event.wait = wait_spy
+
+                payload = {"session_id": "sid-1", "tool_use_id": "t1",
+                           "tool_name": "AskUserQuestion",
+                           "tool_input": {"questions": [
+                               {"question": "Q1", "options": [{"label": "A"}]}]}}
+                with patch.object(monitor.Interaction, "__init__", init_spy):
+                    result = json.load(self.request(
+                        "/hook/PreToolUse", payload,
+                        {"Content-Type": "application/json", "X-Monitor-Token": "tok"}))
+                self.assertEqual(waits, [expected])
+                self.assertEqual(
+                    result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_hook_client_maps_zero_timeout_to_unlimited(self):
+        captured = {}
+
+        class FakeResp:
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_open(req, timeout=None):
+            captured["timeout"] = timeout
+            return FakeResp()
+
+        fake_opener = SimpleNamespace(open=fake_open)
+        with patch.object(sys, "stdin",
+                          SimpleNamespace(buffer=io.BytesIO(b"{}"))), \
+                patch.object(monitor.urllib.request, "build_opener",
+                             return_value=fake_opener):
+            monitor.hook_client(["--port", "1234", "--token", "tok",
+                                 "--timeout", "0"])
+        self.assertIsNone(captured["timeout"])
+
+    def test_hook_command_carries_permission_timeout(self):
+        self.mon.http_port = 1234
+        self.mon.hook_token = "tok"
+        self.mon.permission_timeout = 0
+        self.assertIn("--timeout 0", self.mon.hook_command())
 
     def test_hook_requires_token(self):
         self.mon.hook_token = "tok"
