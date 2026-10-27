@@ -199,6 +199,19 @@ main:has(>#conv) .composer{flex:none;margin:10px 18px 12px}
   background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:8px 12px;
   box-shadow:0 8px 24px rgba(0,0,0,.16);text-align:left}
 #queuepop[hidden]{display:none}
+/* 系统面板浮层：同 #queuepop 挂 body 顶层固定定位，锚定 header 的系统按钮 */
+#syspop{position:fixed;z-index:200;width:min(90vw,340px);background:var(--bg);border:1px solid var(--bd);
+  border-radius:8px;padding:10px 14px;box-shadow:0 8px 24px rgba(0,0,0,.16);text-align:left}
+#syspop[hidden]{display:none}
+.sysrow{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--mut);margin-top:8px}
+.sysbar{height:6px;background:var(--card2);border-radius:3px;overflow:hidden;margin-top:3px}
+.sysbar>i{display:block;height:100%;background:var(--acc)}
+.sysbar.warn>i{background:#d97706}
+.sysbar.hot>i{background:#dc2626}
+.syscores{display:grid;grid-template-columns:repeat(auto-fill,minmax(60px,1fr));gap:4px 10px;margin-top:6px}
+.core{font-size:10px;color:var(--mut)}
+.core .sysbar{height:4px;margin-top:2px}
+.sysacts{display:flex;gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid var(--bd)}
 /* 移动端：抽屉式侧栏 */
 #menu{display:none}
 #mask{display:none}
@@ -250,6 +263,7 @@ main:has(>#conv) .composer{flex:none;margin:10px 18px 12px}
   <button id="pendingbadge" class="back"
           title="有权限请求等待审批，点击跳转">待审批 0</button>
   <span id="err"></span>
+  <button id="sysbtn" class="back" style="margin-left:auto" title="系统状态与电源操作">🖥 系统</button>
 </header>
 <div id="app">
   <aside id="projs"></aside>
@@ -257,6 +271,7 @@ main:has(>#conv) .composer{flex:none;margin:10px 18px 12px}
 </div>
 <div id="mask"></div>
 <div id="queuepop" hidden></div>
+<div id="syspop" hidden></div>
 
 <script>
 const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
@@ -2431,6 +2446,116 @@ document.getElementById("main").addEventListener("click", e => {
   document.addEventListener("scroll", reposition, true);
   if(typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", reposition);
 })();
+
+/* ---------- 系统面板：header 右侧按钮 + body 顶层浮层（模式同 #queuepop） ---------- */
+const sysPop = {timer: null, loading: false, note: ""};
+let sysData = null;
+function fmtGB(n){ return ((n || 0) / 2 ** 30).toFixed(1) + " GB"; }
+function fmtUptime(sec){
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  return d ? `${d} 天 ${h} 小时` : h ? `${h} 小时 ${m} 分` : `${m} 分钟`;
+}
+function barClass(p){ return p >= 85 ? "hot" : p >= 60 ? "warn" : ""; }
+function sysPopHtml(data){
+  if(!data) return '<div class="mut">加载中…</div>';
+  if(data.error) return `<div class="terror">${esc(data.error)}</div>`;
+  const cpu = data.cpu_percent || 0;
+  const cores = (data.cpu_cores || []).map((p, i) =>
+    `<div class="core"><span>核${i + 1} ${Math.round(p)}%</span><div class="sysbar ${barClass(p)}"><i style="width:${Math.min(100, p)}%"></i></div></div>`).join("");
+  const mem = data.mem_percent || 0;
+  return `<div class="sysrow"><span>CPU</span><b style="color:var(--fg);font-size:16px">${cpu.toFixed(1)}%</b></div>
+    <div class="sysbar ${barClass(cpu)}"><i style="width:${Math.min(100, cpu)}%"></i></div>
+    ${cores ? `<div class="syscores">${cores}</div>` : ""}
+    <div class="sysrow"><span>内存</span><span>${fmtGB(data.mem_used)} / ${fmtGB(data.mem_total)}（${Math.round(mem)}%）</span></div>
+    <div class="sysbar ${barClass(mem)}"><i style="width:${Math.min(100, mem)}%"></i></div>
+    ${data.swap_total ? `<div class="sysrow"><span>交换</span><span>${fmtGB(data.swap_used)} / ${fmtGB(data.swap_total)}（${Math.round(data.swap_percent || 0)}%）</span></div>
+    <div class="sysbar"><i style="width:${Math.min(100, data.swap_percent || 0)}%"></i></div>` : ""}
+    <div class="sysrow" style="margin-top:10px"><span>已运行 ${fmtUptime(data.uptime || 0)} · ${esc(data.hostname || "")}</span></div>
+    ${sysPop.note ? `<div role="status" style="margin-top:6px">${esc(sysPop.note)}</div>` : ""}
+    <div class="sysacts"><button class="ibtn danger" data-power="restart">重启</button>
+      <button class="ibtn danger" data-power="sleep">睡眠</button></div>`;
+}
+function positionSysPop(){
+  const pop = document.getElementById("syspop"), btn = document.getElementById("sysbtn");
+  if(!pop || pop.hidden || !btn) return;
+  const rect = btn.getBoundingClientRect && btn.getBoundingClientRect();
+  const root = document.documentElement;
+  const vw = root ? root.clientWidth : 0, vh = root ? root.clientHeight : 0;
+  if(!rect || !vw || !vh) return;   // 无布局环境（单测假 DOM）时只展示不定位
+  const w = pop.offsetWidth || 0, h = pop.offsetHeight || 0;
+  let left = Math.min(Math.max(8, rect.right - w), vw - w - 8);
+  let top = rect.bottom + 6;   // 优先浮在按钮下方，放不下再向上
+  if(top + h > vh - 8) top = Math.max(8, rect.top - h - 6);
+  pop.style.left = Math.round(left) + "px";
+  pop.style.top = Math.round(top) + "px";
+}
+function renderSysPop(){
+  const pop = document.getElementById("syspop");
+  if(!pop || !sysPop.timer) return;
+  pop.innerHTML = sysPopHtml(sysData);
+  pop.hidden = false;
+  positionSysPop();
+}
+async function loadSystem(){
+  if(sysPop.loading || !sysPop.timer) return;   // 上一请求未结束不叠加
+  sysPop.loading = true;
+  try{
+    const r = await fetchT("/system");
+    let j = null;
+    try{ j = await r.json(); }catch(e){}
+    sysData = r.ok ? j : {error: (j && j.error) || `HTTP ${r.status}`};
+  }catch(e){ sysData = {error: "查询失败：" + (e && e.message || e)}; }
+  sysPop.loading = false;
+  renderSysPop();
+}
+function toggleSysPop(open){
+  const pop = document.getElementById("syspop");
+  if(!pop || open === (sysPop.timer != null)) return;
+  if(open){
+    sysData = null; sysPop.note = "";
+    renderSysPop();
+    loadSystem();
+    sysPop.timer = setInterval(loadSystem, 3000);   // 展开期间 3 秒自动刷新
+  }else{
+    clearInterval(sysPop.timer); sysPop.timer = null;
+    pop.hidden = true; pop.innerHTML = "";
+  }
+}
+async function sendPower(action){
+  const text = action === "restart"
+    ? "确定要重启这台电脑？正在执行的会话任务会被中断。"
+    : "确定要使这台电脑进入睡眠？";
+  if(!window.confirm(text)) return;
+  try{
+    const r = await fetchT("/system/power", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({action})});
+    let j = null;
+    try{ j = await r.json(); }catch(e){}
+    sysPop.note = r.ok && j && j.ok
+      ? (action === "restart" ? "已发送重启指令，服务即将中断…" : "已发送睡眠指令…")
+      : (j && j.error) || "执行失败";
+  }catch(e){ sysPop.note = "执行失败：" + (e && e.message || e); }
+  renderSysPop();
+}
+document.getElementById("sysbtn").addEventListener("click", e => {
+  e.stopPropagation();
+  toggleSysPop(sysPop.timer == null);
+});
+document.getElementById("syspop").addEventListener("click", e => {
+  const btn = e.target.closest && e.target.closest("[data-power]");
+  if(btn){ e.preventDefault(); sendPower(btn.dataset.power); }
+});
+document.addEventListener("click", e => {
+  if(!sysPop.timer) return;
+  const pop = document.getElementById("syspop");
+  if(pop && pop.contains && pop.contains(e.target)) return;
+  if(e.target.closest && e.target.closest("#sysbtn")) return;
+  toggleSysPop(false);
+});
+document.addEventListener("keydown", e => { if(e.key === "Escape" && sysPop.timer) toggleSysPop(false); });
+document.addEventListener("scroll", () => { if(sysPop.timer) positionSysPop(); }, true);
+if(typeof window !== "undefined" && window.addEventListener)
+  window.addEventListener("resize", () => { if(sysPop.timer) positionSysPop(); });
 
 // toggle 不冒泡，用捕获阶段记录用户手动展开/折叠的 <details>
 if(document.addEventListener){
