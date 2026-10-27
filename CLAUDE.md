@@ -16,7 +16,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
 ```
 
 - 依赖管理用 [uv](https://docs.astral.sh/uv/)：`uv add <pkg>` 添加依赖，改完 `pyproject.toml` 后 `uv lock`。
-- 无测试框架、无 lint 配置；唯一依赖是 Jinja2，其余为标准库。
+- 无测试框架、无 lint 配置；直接依赖 Jinja2 与 psutil（系统面板采样），其余为标准库。
 - 单元测试：`PYTHONPATH=. uv run python -m unittest discover -s tests -p 'test_*.py' -v`；
   前端测试：`node --test tests/test_frontend_controls.js`。
 - 真实 CLI 权限冒烟（会调用模型）：`CLAUDE_SESSIONS_SMOKE=1 uv run python tests/smoke_permission_live.py`；
@@ -104,7 +104,11 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
   档位持久化在 `~/.claude/claude-sessions/efforts.json`，重托管 spawn 带 `--effort`（有档位时
   覆盖用户 `--claude-args` 里的同名参数）；在线切换失败不回滚保存，重托管后生效。
   托管进程 `system/init` 的 `slash_commands` 去前缀去重存入 Hosted，detail 返回 `commands`；
-  发送框 `/` 单 token 输入时浮出提示面板（↑↓/Tab 补全、Esc 关闭），Enter 直发不校验。
+  发送框 `/` 单 token 输入时浮出提示面板（↑↓/Tab/Enter 补全、Esc 关闭），面板展开时
+  Enter 只把选中项补全进输入框、不触发发送，收起后 Enter 才发送。新建会话页没有托管
+  进程，提示目录来自 `GET /commands?cwd=`（`scan_slash_commands` 扫描用户级
+  `<claude_dir>/commands` 与项目级 `<cwd>/.claude/commands` 的 `*.md`，子目录映射
+  `name/sub`；内置命令要等进程 init 广播，不在扫描范围内），前端按 cwd 缓存。
 - **工作时发送**：托管会话在 `working` 时消息进入 `Hosted.pending` 队列；非托管一次性消息
   进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动派发下一条（每会话上限 32）。
   网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“工作状态下也发送”与
@@ -138,7 +142,9 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 - **URL 路由**：看板视图与地址栏同步，`/p/<项目路径>` 是项目列表，
   `/p/<项目路径>/s/<会话ID>` 是对话，`/p/<项目路径>/new` 是新建；项目路径保留目录层级
   （反斜杠归一为 `/`，冒号保留，仅转义空格等特殊字符），旧的整体编码链接仍可解析。
-  `/pending` 为全局待处理会话列表，只导航到原审批详情、不复制表单。`GET /pending`、
+  `/pending` 为全局待处理会话列表，只导航到原审批详情、不复制表单；
+  `/hosted` 为托管会话列表（header「托管 N」徽章入口，点击卡片进对话）。
+  `GET /pending`、`GET /hosted`、
   `GET /p/...` 与 `/` 一样回退渲染同一 SPA 模板。导航统一走 `navigate`（`pushState`），
   首页自动选中项目时用 `replaceState` 避免多余历史记录；`popstate` 重新解析地址并恢复视图。
 
@@ -155,7 +161,10 @@ cwd 与「对话 N/M」计数并入概览折叠 `overviewHtml`——summary 一�
 发送区固定底部。进入会话滚到底部；增量刷新贴底时自动跟底、翻看历史时不打扰；加载更早
 按高度补偿保持视野。置顶/归档/别名不在会话页显示，只在外层列表卡片操作（别名暂无前端入口，
 后端 API 保留）。发送队列摘要内联为模型选择行右侧的 chip（`#queue`）：无执行/等待且无错误/通知时隐藏，
-仅 chip 文字可 hover/聚焦/点击，浮层锚定 chip 浮出详情（取消按钮、最近结束折叠；点击兼容触屏）。
+仅 chip 文字可 hover/聚焦/点击，详情浮层是 body 顶层的 `#queuepop`（`position:fixed` 按
+chip 矩形定位并夹紧视口，滚动/ resize 重定位）：不随 `main` 的 overflow 裁剪、也不被侧栏
+遮挡；悬停/聚焦临时浏览（peek）、点击固定（pinned），外点或 Esc 收起，取消按钮、最近结束
+折叠在浮层内（点击兼容触屏）。
 窄屏（≤768px）发送区次要控件（审批/思考/发送选项/托管）收进 ⚙ 浮层——`composer-extra`
 桌面 `display:contents` 原样展开、控件 DOM 不移动，textarea 压两行，头部隐藏 cwd。发送区提供中断按钮、审批
 模式选择与思考档位（effort）下拉（托管中 onchange 即切，未托管保存待下次托管生效；新建页未勾选
