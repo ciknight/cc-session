@@ -2513,9 +2513,10 @@ function toggleSysPop(open){
   if(!pop || open === (sysPop.timer != null)) return;
   if(open){
     sysData = null; sysPop.note = "";
+    sysPop.timer = setInterval(loadSystem, 3000);   // 展开期间 3 秒自动刷新
+    // setInterval 不会立即触发；先设 timer（renderSysPop/loadSystem 以它为展开标志）再手动首渲并发请求
     renderSysPop();
     loadSystem();
-    sysPop.timer = setInterval(loadSystem, 3000);   // 展开期间 3 秒自动刷新
   }else{
     clearInterval(sysPop.timer); sysPop.timer = null;
     pop.hidden = true; pop.innerHTML = "";
