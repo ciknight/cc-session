@@ -2458,7 +2458,9 @@ function fmtUptime(sec){
 function barClass(p){ return p >= 85 ? "hot" : p >= 60 ? "warn" : ""; }
 function sysPopHtml(data){
   if(!data) return '<div class="mut">加载中…</div>';
-  if(data.error) return `<div class="terror">${esc(data.error)}</div>`;
+  // 错误分支也保留操作提示：如重启指令发出后轮询失败，note 不能被错误行顶掉
+  if(data.error) return `${sysPop.note ? `<div role="status" style="margin-top:6px">${esc(sysPop.note)}</div>` : ""}
+    <div class="terror">${esc(data.error)}</div>`;
   const cpu = data.cpu_percent || 0;
   const cores = (data.cpu_cores || []).map((p, i) =>
     `<div class="core"><span>核${i + 1} ${Math.round(p)}%</span><div class="sysbar ${barClass(p)}"><i style="width:${Math.min(100, p)}%"></i></div></div>`).join("");
@@ -2503,7 +2505,7 @@ async function loadSystem(){
     const r = await fetchT("/system");
     let j = null;
     try{ j = await r.json(); }catch(e){}
-    sysData = r.ok ? j : {error: (j && j.error) || `HTTP ${r.status}`};
+    sysData = r.ok ? (j || {error: "响应格式异常"}) : {error: (j && j.error) || `HTTP ${r.status}`};
   }catch(e){ sysData = {error: "查询失败：" + (e && e.message || e)}; }
   sysPop.loading = false;
   renderSysPop();
@@ -2538,8 +2540,9 @@ async function sendPower(action){
   }catch(e){ sysPop.note = "执行失败：" + (e && e.message || e); }
   renderSysPop();
 }
+// 不 stopPropagation：syspop 自己的 document 级关闭 handler 已豁免 #sysbtn，
+// 放行冒泡可让队列浮层等其他 document 级浮层借这次点击正常收起
 document.getElementById("sysbtn").addEventListener("click", e => {
-  e.stopPropagation();
   toggleSysPop(sysPop.timer == null);
 });
 document.getElementById("syspop").addEventListener("click", e => {
