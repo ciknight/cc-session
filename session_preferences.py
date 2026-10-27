@@ -34,20 +34,25 @@ def default_model(args):
     return model
 
 
-def model_args(args, model):
-    if model is None:
-        return list(args)
+def _replace_arg(args, name, value):
+    """剥掉 args 里已有的 --name / --name=value 后追加覆盖值；不修改原列表。"""
     result = []
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg == "--model":
+        if arg == name:
             i += 2
             continue
-        if not arg.startswith("--model="):
+        if not arg.startswith(name + "="):
             result.append(arg)
         i += 1
-    return result + ["--model=" + validate_model(model)]
+    return result + [name + "=" + value]
+
+
+def model_args(args, model):
+    if model is None:
+        return list(args)
+    return _replace_arg(args, "--model", validate_model(model))
 
 
 def validate_effort(level):
@@ -63,17 +68,104 @@ def effort_args(args, effort):
     """有档位时剥掉用户自带的 --effort 再追加，模式与 model_args 一致。"""
     if effort is None:
         return list(args)
-    result = []
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--effort":
-            i += 2
-            continue
-        if not arg.startswith("--effort="):
-            result.append(arg)
-        i += 1
-    return result + ["--effort=" + validate_effort(effort)]
+    return _replace_arg(args, "--effort", validate_effort(effort))
+
+
+def _atomic_json_dump(path, payload, prefix, suffix=".tmp"):
+    """原子写 JSON：同目录临时文件 + fsync + replace。
+
+    主流程失败时清理临时文件；清理本身失败不能掩盖原始异常。
+    """
+    temp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temp = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+class _MapPreferences:
+    """sid -> 单值偏好的共用实现：加载校验、原子保存与 bind/touched 语义。
+
+    子类声明 field/prefix/suffix 与错误文案，并提供 _record_valid（加载时
+    单条记录校验）和 _validate（set/bind 时的值校验）。
+    """
+
+    field = ""
+    prefix = ""
+    suffix = ".tmp"
+    load_error = ""
+    save_error = ""
+    record_error = ""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.values = {}
+        self.touched = set()
+        self.error = None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict) or data.get("version") != 1
+                    or not isinstance(data.get(self.field), dict)):
+                raise ValueError("格式或版本不支持")
+            for sid, value in data[self.field].items():
+                if not isinstance(sid, str) or not self._record_valid(value):
+                    raise ValueError(self.record_error)
+            self.values = data[self.field]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            self.error = self.load_error
+
+    @staticmethod
+    def _record_valid(value):
+        raise NotImplementedError
+
+    @staticmethod
+    def _validate(value):
+        raise NotImplementedError
+
+    def get(self, sid):
+        with self.lock:
+            return self.values.get(sid)
+
+    def set(self, sid, value):
+        value = self._validate(value)
+        with self.lock:
+            self._save(sid, value)
+            self.touched.add(sid)
+        return value
+
+    def bind(self, sid, value):
+        """新会话拿到 sid 后关联首轮选择，不覆盖随后手动保存的选择。"""
+        with self.lock:
+            if sid not in self.values and sid not in self.touched and value is not None:
+                self._save(sid, self._validate(value))
+
+    def _save(self, sid, value):
+        if self.error:
+            raise ValueError(self.error)
+        updated = dict(self.values)
+        if value is None:
+            updated.pop(sid, None)
+        else:
+            updated[sid] = value
+        try:
+            _atomic_json_dump(self.path, {"version": 1, self.field: updated},
+                              self.prefix, self.suffix)
+        except OSError as exc:
+            raise ValueError(self.save_error) from exc
+        self.values = updated
 
 
 def validate_metadata_patch(patch):
@@ -149,204 +241,72 @@ class SessionMetadata:
             record["revision"] = current["metadata_revision"] + 1
             updated = dict(self.sessions)
             updated[sid] = record
-            temp = None
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                fd, temp = tempfile.mkstemp(prefix="metadata-", suffix=".tmp", dir=self.path.parent)
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    json.dump({"version": 1, "sessions": updated}, stream, ensure_ascii=False)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temp, self.path)
+                _atomic_json_dump(self.path, {"version": 1, "sessions": updated},
+                                  "metadata-")
             except OSError as exc:
                 raise ValueError("会话元数据保存失败，请检查目录权限或磁盘空间") from exc
-            finally:
-                if temp:
-                    try:
-                        os.unlink(temp)
-                    except OSError:
-                        pass
             # 写入成功后才发布新状态；全部恢复默认也保留递增版本。
             self.sessions = updated
             return self._snapshot(sid)
 
 
-class ModelPreferences:
-    def __init__(self, path):
-        self.path = Path(path)
-        self.lock = threading.Lock()
-        self.models = {}
-        self.touched = set()
-        self.error = None
+class ModelPreferences(_MapPreferences):
+    field = "models"
+    prefix = "preferences-"
+    load_error = "模型偏好文件无法读取或格式损坏，请先修复或移走该文件"
+    save_error = "模型偏好保存失败，请检查目录权限或磁盘空间"
+    record_error = "会话模型记录无效"
+
+    @staticmethod
+    def _record_valid(value):
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if (not isinstance(data, dict) or data.get("version") != 1
-                    or not isinstance(data.get("models"), dict)):
-                raise ValueError("格式或版本不支持")
-            for sid, model in data["models"].items():
-                if not isinstance(sid, str) or validate_model(model) is None:
-                    raise ValueError("会话模型记录无效")
-            self.models = data["models"]
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            self.error = "模型偏好文件无法读取或格式损坏，请先修复或移走该文件"
+            return validate_model(value) is not None
+        except ValueError:
+            return False
 
-    def get(self, sid):
-        with self.lock:
-            return self.models.get(sid)
-
-    def set(self, sid, model):
-        model = validate_model(model)
-        with self.lock:
-            self._save(sid, model)
-            self.touched.add(sid)
-        return model
-
-    def bind(self, sid, model):
-        """新会话拿到 sid 后关联首轮选择，不覆盖随后手动保存的选择。"""
-        with self.lock:
-            if sid not in self.models and sid not in self.touched and model is not None:
-                self._save(sid, validate_model(model))
-
-    def _save(self, sid, model):
-        if self.error:
-            raise ValueError(self.error)
-        updated = dict(self.models)
-        if model is None:
-            updated.pop(sid, None)
-        else:
-            updated[sid] = model
-        temp = None
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd, temp = tempfile.mkstemp(prefix="preferences-", suffix=".tmp", dir=self.path.parent)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 1, "models": updated}, stream, ensure_ascii=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp, self.path)
-        except OSError as exc:
-            raise ValueError("模型偏好保存失败，请检查目录权限或磁盘空间") from exc
-        finally:
-            if temp and os.path.exists(temp):
-                os.unlink(temp)
-        self.models = updated
+    _validate = staticmethod(validate_model)
 
 
-class EffortPreferences:
+class EffortPreferences(_MapPreferences):
     """看板独立的托管思考档位；spawn 带 --effort，使重托管后保持。"""
 
-    def __init__(self, path):
-        self.path = Path(path)
-        self.lock = threading.Lock()
-        self.efforts = {}
-        self.touched = set()
-        self.error = None
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if (not isinstance(data, dict) or data.get("version") != 1
-                    or not isinstance(data.get("efforts"), dict)):
-                raise ValueError("格式或版本不支持")
-            for sid, level in data["efforts"].items():
-                if not isinstance(sid, str) or level not in EFFORT_LEVELS:
-                    raise ValueError("思考档位记录无效")
-            self.efforts = data["efforts"]
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            self.error = "思考档位文件无法读取或格式损坏，请先修复或移走该文件"
+    field = "efforts"
+    prefix = "efforts-"
+    load_error = "思考档位文件无法读取或格式损坏，请先修复或移走该文件"
+    save_error = "思考档位保存失败，请检查目录权限或磁盘空间"
+    record_error = "思考档位记录无效"
 
-    def get(self, sid):
-        with self.lock:
-            return self.efforts.get(sid)
+    @staticmethod
+    def _record_valid(value):
+        return value in EFFORT_LEVELS
 
-    def set(self, sid, level):
+    @staticmethod
+    def _validate(level):
         if level is not None and level not in EFFORT_LEVELS:
             raise ValueError("思考档位必须是 low / medium / high，或 null")
-        with self.lock:
-            self._save(sid, level)
-            self.touched.add(sid)
         return level
 
-    def bind(self, sid, level):
-        """新会话拿到 sid 后关联首轮选择，不覆盖随后手动保存的选择。"""
-        with self.lock:
-            if sid not in self.efforts and sid not in self.touched and level is not None:
-                self._save(sid, level)
 
-    def _save(self, sid, level):
-        if self.error:
-            raise ValueError(self.error)
-        updated = dict(self.efforts)
-        if level is None:
-            updated.pop(sid, None)
-        else:
-            updated[sid] = level
-        temp = None
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd, temp = tempfile.mkstemp(prefix="efforts-", suffix=".tmp", dir=self.path.parent)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 1, "efforts": updated}, stream, ensure_ascii=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp, self.path)
-        except OSError as exc:
-            raise ValueError("思考档位保存失败，请检查目录权限或磁盘空间") from exc
-        finally:
-            if temp and os.path.exists(temp):
-                os.unlink(temp)
-        self.efforts = updated
-
-
-class ApprovalPreferences:
+class ApprovalPreferences(_MapPreferences):
     """看板独立的托管审批模式，不修改 Claude 配置或转录。"""
 
-    def __init__(self, path):
-        self.path = Path(path)
-        self.lock = threading.Lock()
-        self.modes = {}
-        self.error = None
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if (not isinstance(data, dict) or data.get("version") != 1
-                    or not isinstance(data.get("approvals"), dict)):
-                raise ValueError("格式或版本不支持")
-            for sid, mode in data["approvals"].items():
-                if not isinstance(sid, str) or mode not in APPROVAL_MODES:
-                    raise ValueError("审批模式记录无效")
-            self.modes = data["approvals"]
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            self.error = "审批模式文件无法读取或格式损坏，请先修复或移走该文件"
+    field = "approvals"
+    prefix = "approvals-"
+    load_error = "审批模式文件无法读取或格式损坏，请先修复或移走该文件"
+    save_error = "审批模式保存失败，请检查目录权限或磁盘空间"
+    record_error = "审批模式记录无效"
+
+    @staticmethod
+    def _record_valid(value):
+        return value in APPROVAL_MODES
+
+    @staticmethod
+    def _validate(mode):
+        if mode not in APPROVAL_MODES:
+            raise ValueError("审批模式必须是 ask / auto / full")
+        return mode
 
     def get(self, sid, default="auto"):
         with self.lock:
-            return self.modes.get(sid, default)
-
-    def set(self, sid, mode):
-        if mode not in APPROVAL_MODES:
-            raise ValueError("审批模式必须是 ask / auto / full")
-        with self.lock:
-            if self.error:
-                raise ValueError(self.error)
-            updated = dict(self.modes)
-            updated[sid] = mode
-            temp = None
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                fd, temp = tempfile.mkstemp(prefix="approvals-", suffix=".tmp", dir=self.path.parent)
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    json.dump({"version": 1, "approvals": updated}, stream, ensure_ascii=False)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temp, self.path)
-            except OSError as exc:
-                raise ValueError("审批模式保存失败，请检查目录权限或磁盘空间") from exc
-            finally:
-                if temp and os.path.exists(temp):
-                    os.unlink(temp)
-            self.modes = updated
-            return mode
+            return self.values.get(sid, default)

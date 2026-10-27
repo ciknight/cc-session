@@ -46,6 +46,19 @@ class PreferenceTests(unittest.TestCase):
                     store.set("a", "sonnet")
             self.assertEqual(store.get("a"), "opus")
 
+    def test_cleanup_failure_does_not_mask_save_error(self):
+        # 主写入失败后临时文件清理也失败时，对外仍应是保存失败的
+        # ValueError 文案，而不是清理动作的 OSError
+        with tempfile.TemporaryDirectory() as tmp:
+            store = prefs.ModelPreferences(Path(tmp) / "preferences.json")
+            store.set("a", "opus")
+            with patch("session_preferences.os.replace", side_effect=OSError("disk")), \
+                    patch("session_preferences.os.unlink", side_effect=OSError("locked")):
+                with self.assertRaises(ValueError) as ctx:
+                    store.set("a", "sonnet")
+            self.assertIn("模型偏好保存失败", str(ctx.exception))
+            self.assertEqual(store.get("a"), "opus")
+
     def test_corrupt_file_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "preferences.json"

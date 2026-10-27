@@ -32,9 +32,12 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 ### 数据流
 
 1. **轮询线程**（`Monitor.run` → `scan_once`）：按 `--interval` 秒扫描 `CLAUDE_DIR/projects/*/*.jsonl`，
-   每个 `Session` 维护文件 offset 增量读取，半行留在 buffer 下次拼接。
+   每个 `Session` 维护文件 offset 增量读取，半行留在 buffer 下次拼接。同一路径由
+   每文件扫描锁串行化，stat/读文件/缓存校验在 `mon.lock` 外执行，只有注册、
+   截断判定与 offset 提交持全局锁，慢盘不阻塞 HTTP 与审批。
 2. **行解析**（`handle_line`）：逐行 JSON 解析，更新 `Session` 的 cwd/git 分支/模型/token 用量/
-   工具统计/任务清单/状态等。事件经 `emit` 分发给 SSE 订阅者和可选 webhook；
+   工具统计/任务清单/状态等。事件经 `emit` 分发给 SSE 订阅者和可选 webhook
+   （webhook 走单 worker 有界队列，容量 1000，满时丢弃新事件并限频记日志）；
    **首次扫描只回放不推送**（`first_scan_done` 标志）。
    Agent 工具调用的子代理条目带 tid/state（running/done/error），tool_result 回传时翻转
    状态并发 `subagent_done`；**后台异步 Agent 例外**：`toolUseResult.isAsync` 的回传只是
@@ -68,9 +71,13 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 - **任务清单双来源**：从转录里的 `TaskCreate`/`TaskUpdate` 工具调用推断，但
   `~/.claude/tasks/<sid>/*.json` 目录存在时以它为准（`_merge_task_dirs`）。
 - **对话消息按需增量提取**（`parse_msg_line`）：不随轮询解析，只在请求
-  `/sessions/<id>/messages` 时解析；`Monitor.msg_cache` 记录每个文件的读取 offset、
-  已解析消息和 tool_use 索引，后续请求只解析新增部分。超过 2 MiB 的转录首次只解析
-  尾部窗口，`before` 翻页时按 1 MiB 块向前加载并前插；每个会话有独立解析锁。
+  `/sessions/<id>/messages` 时解析；`Monitor.msg_cache` 以转录文件路径为键（同 SID
+  多文件互不干扰），记录每个文件的读取 offset、已解析消息和 tool_use 索引，
+  后续请求只解析新增部分（offset 按实际读取字节推进，stat 与 read 之间追加不重复解析）。
+  超过 2 MiB 的转录首次只解析尾部窗口，`before` 翻页时按 1 MiB 块向前加载并前插，
+  旧窗口里因 tool_use 在窗口外而独立展示的结果/备注此时并入对应工具条目；
+  缓存最多保留 8 个最近使用的文件（LRU，活动请求不淘汰，超限允许暂时），
+  每个文件有独立解析锁。
   跳过 sidechain（子代理对话）。工具结果合并行级 `toolUseResult`（diff/stdout/图片），
   `isMeta` 分 boilerplate / sourceToolUseID / origin 注入三种语义。
 - **子代理会话**：`projects/<proj>/<parent>/subagents/agent-*.jsonl` 默认**不扫描**（懒加载），
@@ -83,7 +90,8 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 - **worktree 归并**（`project_root`）：`<proj>/.claude/worktrees/<name>` 视为属于 `<proj>`，
   看板按项目分组依赖此逻辑。
 - **状态机**：`working`（有活动且助手未完成回复）/ `idle`（`system/turn_duration`；
-  该会话从未出现该标记时才回退到 `stop_reason=end_turn`）/ `stale`（超过 `--stale`
+  该会话从未出现该标记时才回退到 `stop_reason=end_turn`；turn_duration 清扫时
+  `active_agents` 收敛到仍运行的异步 Agent）/ `stale`（超过 `--stale`
   秒无内容事件，在 `summary()` 输出时动态计算）。
 - **双时钟**：`last_input_ts` 只由真实用户输入推进（排除 tool_result、isMeta、
   origin/promptSource 注入、中断标记），`last_event_ts` 是最后一条带时间戳的转录事件；
@@ -138,6 +146,8 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 
 `templates/index.html` 是自包含 SPA：左侧项目列表、右侧会话卡片/对话视图，
 对话用 marked + DOMPurify 渲染 markdown（用户气泡 / 助手 markdown / 可折叠工具结果与 diff），
+消息按连续角色分组渲染：`renderConvList` 按组内容签名复用未变化的 DOM 节点，
+markdown/DOMPurify 只处理新增或变化的组（无 DOM 原语的环境退回整段 HTML）。
 自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
 对话视图是聊天窗口布局（`main:has(>#conv)` 纵向 flex）：固定头部单行（返回与标题同行，
 cwd 与「对话 N/M」计数并入概览折叠 `overviewHtml`——summary 一行摘要、展开完整统计），待审批
