@@ -9,12 +9,14 @@ const html = fs.readFileSync(path.join(__dirname, '../templates/index.html'), 'u
 const source = html.match(/<script>([\s\S]*?)<\/script>/)[1].replace(/\r\n/g, '\n')
   .replace(/\{\{ refresh_interval \| round\(3\) \}\}/, '3')
   .replace(/\nload\(\);\nresetTimer\(\);/, '\n');
-function boot(fetch = async () => { throw Error('unexpected fetch'); }) {
+function boot(fetch = async () => { throw Error('unexpected fetch'); }, windowExtra = {}) {
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {value:'', checked:false, textContent:'', innerHTML:'', disabled:false,
       dataset:{}, style:{}, options:[], querySelectorAll(){return [];}, appendChild(option){this.options.push(option);}, replaceChildren(){this.options=[];},
-      classList:{add(){}, remove(){}, toggle(){}, contains(){return false;}}, listeners:{},
+      classList:(classes => ({add(...names){names.forEach(n=>classes.add(n));}, remove(...names){names.forEach(n=>classes.delete(n));},
+        toggle(name, force){(force===undefined ? !classes.has(name) : force) ? classes.add(name) : classes.delete(name);},
+        contains(name){return classes.has(name);}}))(new Set()), listeners:{},
       addEventListener(type, listener){(this.listeners[type] ||= []).push(listener);},
       dispatchEvent(event){this['on'+event.type]?.(event); for(const listener of this.listeners[event.type] || []) listener(event);},
       click(){this.clickCount=(this.clickCount || 0)+1; if(this.onclick) this.onclick();}});
@@ -36,7 +38,7 @@ function boot(fetch = async () => { throw Error('unexpected fetch'); }) {
       getElementById:node,
       createElement:tag=>({tagName:tag.toUpperCase(), value:'', textContent:'', dataset:{}}),
       addEventListener(type, listener){(documentListeners[type] ||= []).push(listener);},
-    }, window:{confirm:()=>true, location, history},
+    }, window:{confirm:()=>true, location, history, ...windowExtra},
     localStorage:{getItem(){return null;}}, fetch, AbortController, setTimeout, clearTimeout,
     setInterval(){}, clearInterval(){}, console});
   vm.runInContext(source, context);
@@ -2077,4 +2079,26 @@ test('新建会话：slash 提示来自服务端扫描的项目命令目录', as
     preventDefault(){}});
   assert.equal(box.value,'/deploy ');
   assert.equal(b.node('sendbtn').clickCount || 0,0);
+});
+
+test('移动端会话页滚动隐藏发送框，停止后回弹；桌面端不隐藏', () => {
+  let narrow = true;
+  const mq = {get matches(){return narrow;}, addEventListener(){}, removeEventListener(){}};
+  const b = boot(() => response({}), {matchMedia: () => mq});
+  const timers = [];
+  b.context.setTimeout = (fn, ms) => { timers.push(fn); return timers.length; };
+  b.run('wireConvAutoHide(document.getElementById("conv"))');
+  const conv = b.node('conv'), comp = b.node('convcomposer');
+  conv.dispatchEvent({type:'scroll'});
+  assert.equal(comp.classList.contains('conv-hide'), true, '移动端滚动时发送框隐藏');
+  assert.ok(timers.length >= 1, '滚动应安排回弹定时器');
+  timers[timers.length - 1]();
+  assert.equal(comp.classList.contains('conv-hide'), false, '滚动停止后回弹');
+  conv.dispatchEvent({type:'scroll'});
+  assert.equal(comp.classList.contains('conv-hide'), true);
+  conv.dispatchEvent({type:'scrollend'});
+  assert.equal(comp.classList.contains('conv-hide'), false, 'scrollend 立即回弹');
+  narrow = false;
+  conv.dispatchEvent({type:'scroll'});
+  assert.equal(comp.classList.contains('conv-hide'), false, '桌面端滚动不隐藏');
 });
