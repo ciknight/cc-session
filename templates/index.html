@@ -1220,32 +1220,36 @@ function mergeEarlierMessages(older, newer){
   if(!absorbed) return older.concat(newer);
   return older.concat(newer.filter(m => (m.parts || []).length));
 }
-function convHtml(messages){
-  // 连续同角色合并为一组渲染
+function convGroups(messages){
+  // 连续同角色合并为一组渲染；组对象每次新建，签名按内容比较
   const groups = [];
   for(const m of messages){
     const last = groups[groups.length - 1];
     if(last && last.role === m.role) last.parts.push(...m.parts);
     else groups.push({role: m.role, ts: m.ts, parts: [...m.parts]});
   }
-  return groups.map(g => {
-    const body = g.parts.map(p => {
-      if(p.type === "text")
-        return g.role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
-             : g.role === "assistant" ? `<div class="abody">${md(p.text)}</div>`
-             : `<div class="sysbody">${esc(p.text)}</div>`;
-      if(p.type === "command")
-        return `<div class="cmd">⌘ <code>${esc(p.command)}</code>${p.args ? " " + esc(p.args) : ""}</div>`;
-      if(p.type === "command_output")
-        // 无独立 id，key 由内容派生，重渲染后展开状态可恢复
-        return `<details class="fold"${detailsAttrs("cmdout:" + p.text)}><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
-      if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
-      return "";
-    }).join("");
-    const who = {user: "用户", assistant: "助手", tool: "工具", system: "系统"}[g.role] || g.role;
-    const when = g.ts ? new Date(g.ts*1000).toLocaleString() : "";
-    return `<div class="msg ${g.role}"><div class="mhead">${who} · ${when}</div>${body}</div>`;
+  return groups;
+}
+function convGroupHtml(g){
+  const body = g.parts.map(p => {
+    if(p.type === "text")
+      return g.role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
+           : g.role === "assistant" ? `<div class="abody">${md(p.text)}</div>`
+           : `<div class="sysbody">${esc(p.text)}</div>`;
+    if(p.type === "command")
+      return `<div class="cmd">⌘ <code>${esc(p.command)}</code>${p.args ? " " + esc(p.args) : ""}</div>`;
+    if(p.type === "command_output")
+      // 无独立 id，key 由内容派生，重渲染后展开状态可恢复
+      return `<details class="fold"${detailsAttrs("cmdout:" + p.text)}><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
+    if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
+    return "";
   }).join("");
+  const who = {user: "用户", assistant: "助手", tool: "工具", system: "系统"}[g.role] || g.role;
+  const when = g.ts ? new Date(g.ts*1000).toLocaleString() : "";
+  return `<div class="msg ${g.role}"><div class="mhead">${who} · ${when}</div>${body}</div>`;
+}
+function convHtml(messages){
+  return convGroups(messages).map(convGroupHtml).join("");
 }
 
 function interactionHtml(it){
@@ -1428,6 +1432,14 @@ function scrollConvBottom(){
   const c = document.getElementById("conv");
   if(c) c.scrollTop = c.scrollHeight;
 }
+// 会话消息组的 DOM 缓存：签名未变的组复用原节点，markdown/DOMPurify 只跑新组
+let convDom = {id: null, nodes: new Map(), echo: null};
+const convLoadEarlierHtml = '<button class="load-earlier" id="loadearlier">加载更早</button>';
+function makeNodeFromHtml(html){
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  return tpl.content.firstElementChild;
+}
 function renderConvList(){
   const el = document.getElementById("conv");
   if(!el) return;
@@ -1435,9 +1447,12 @@ function renderConvList(){
   if(echo && !echoVisible(convState.msgs, echo)) delete pendingEcho[convState.id];
   const echoOut = pendingEcho[convState.id] ? echoHtml(pendingEcho[convState.id]) : "";
   // 聊天窗口顺序：旧消息在上、新消息和未落盘回显在下；加载更早的胶囊固定在顶部
-  el.innerHTML = (convState.hasMore
-      ? '<button class="load-earlier" id="loadearlier">加载更早</button>' : "")
-    + convHtml(convState.msgs) + echoOut;
+  const groups = convGroups(convState.msgs);
+  if(typeof el.insertBefore === "function" && el.querySelectorAll)
+    renderConvDom(el, groups, echoOut);
+  else
+    el.innerHTML = (convState.hasMore ? convLoadEarlierHtml : "")
+      + groups.map(convGroupHtml).join("") + echoOut;
   const btn = document.getElementById("loadearlier");
   if(btn) btn.onclick = loadEarlier;
   const count = document.getElementById("convcount");
@@ -1445,6 +1460,55 @@ function renderConvList(){
   if(!liveText){
     const live = document.getElementById("livebubble");
     if(live && live.remove) live.remove();
+  }
+}
+function renderConvDom(el, groups, echoStr){
+  if(convDom.id !== convState.id){
+    // 切换会话：旧节点全部作废，清空容器重新开始
+    convDom = {id: convState.id, nodes: new Map(), echo: null};
+    for(const child of el.querySelectorAll("*")){
+      if(child.id !== "livebubble" && child.remove) child.remove();
+    }
+  }
+  // 加载更早按钮固定为第一个子节点
+  let btn = el.firstChild && el.firstChild.id === "loadearlier" ? el.firstChild : null;
+  if(convState.hasMore && !btn){
+    btn = makeNodeFromHtml(convLoadEarlierHtml);
+    el.insertBefore(btn, el.firstChild);
+  } else if(!convState.hasMore && btn && btn.remove){
+    btn.remove();
+    btn = null;
+  }
+  // 旧回显节点整体重建（内容小、无 markdown）
+  if(convDom.echo && convDom.echo.remove){ convDom.echo.remove(); }
+  convDom.echo = null;
+  const wanted = [];
+  const seen = new Set();
+  for(const g of groups){
+    const sig = JSON.stringify([g.role, g.ts, g.parts]);
+    let node = convDom.nodes.get(sig);
+    if(!node){
+      node = makeNodeFromHtml(convGroupHtml(g));
+      convDom.nodes.set(sig, node);
+    }
+    wanted.push(node);
+    seen.add(sig);
+  }
+  if(echoStr){
+    convDom.echo = makeNodeFromHtml(echoStr);
+    wanted.push(convDom.echo);
+  }
+  // 失效组（截断重取、吸收合并后消失）退出缓存并移出 DOM
+  for(const [sig, node] of [...convDom.nodes]){
+    if(!seen.has(sig)){
+      if(node.remove) node.remove();
+      convDom.nodes.delete(sig);
+    }
+  }
+  let anchor = btn ? btn.nextSibling : el.firstChild;
+  for(const node of wanted){
+    if(node !== anchor) el.insertBefore(node, anchor);
+    anchor = node.nextSibling;
   }
 }
 async function loadEarlier(){

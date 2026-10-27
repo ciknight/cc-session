@@ -434,6 +434,129 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(event["type"], "turn_delta")
         self.assertEqual(event["seq"], 1)
 
+    def test_webhook_events_ordered_single_worker_without_transient(self):
+        # webhook 由单 worker 顺序发送：保序、不随事件数起线程、transient 不进队列
+        mon = monitor.Monitor(600, webhook="http://hook.invalid/x")
+        mon.first_scan_done = True
+        sess = monitor.Session("w1", self.project / "w1.jsonl")
+        mon.sessions[str(sess.path)] = sess
+        sent = []
+        idents = set()
+        done = threading.Event()
+
+        def fake_post(ev):
+            sent.append(ev["type"])
+            idents.add(threading.get_ident())
+            if ev["type"] == "last":
+                done.set()
+
+        with patch.object(mon, "_post", fake_post):
+            for kind in ("a", "b", "c"):
+                mon.emit(sess, kind, {})
+            mon.emit(sess, "transient_kind", {}, transient=True)
+            mon.emit(sess, "last", {})
+            self.assertTrue(done.wait(2), "webhook worker 应顺序处理完事件")
+
+        self.assertEqual(sent, ["a", "b", "c", "last"])
+        self.assertEqual(len(idents), 1, "全部事件应由同一个 worker 线程发送")
+
+    def test_webhook_queue_full_drops_event_without_raising(self):
+        mon = monitor.Monitor(600, webhook="http://hook.invalid/x")
+        mon.first_scan_done = True
+        sess = monitor.Session("w1", self.project / "w1.jsonl")
+        mon.sessions[str(sess.path)] = sess
+
+        class FullQueue:
+            def put_nowait(self, item):
+                raise queue.Full
+
+        with patch.object(mon, "webhook_queue", FullQueue()):
+            mon.emit(sess, "kind", {})   # 队列满只丢弃，不抛给 emit 调用方
+
+    def test_json_responses_use_compact_separators(self):
+        body = urlopen(self.base + "/healthz").read().decode("utf-8")
+        self.assertNotIn("\n", body)
+        self.assertEqual(json.loads(body), {"ok": True, "sessions": 1})
+
+    def test_sse_snapshot_seq_precedes_events_during_collection(self):
+        # snapshot 的 seq 必须在采集数据前分配：采集期间发出的事件 seq
+        # 都大于 snapshot seq，客户端按 seq 去重不会丢掉这些增量
+        self.mon.first_scan_done = True
+        events = queue.Queue()
+        self.mon.subscribers.append(events)
+        original_map = self.mon.project_map
+        emitted = []
+
+        def map_and_emit():
+            if not emitted:
+                emitted.append(True)
+                self.mon.emit(self.sess, "user_message", {"text": "late"})
+            return original_map()
+
+        handler = monitor.make_handler(self.mon, 3)
+        writes = []
+
+        class FakeWfile:
+            def write(self, data):
+                writes.append(data)
+                if len(writes) >= 2:
+                    raise OSError("stop")   # 拿到 snapshot 帧即可断开
+
+            def flush(self):
+                pass
+
+        fake = SimpleNamespace(
+            wfile=FakeWfile(), send_response=lambda *a: None,
+            send_header=lambda *a: None, end_headers=lambda *a: None)
+        fake._snapshot = lambda only: handler._snapshot(fake, only)
+        with patch.object(self.mon, "project_map", map_and_emit):
+            try:
+                handler._sse(fake, None)
+            except OSError:
+                pass
+        frame = b"".join(writes).decode("utf-8", "replace")
+        snapshot_seq = json.loads(
+            frame[frame.index("data: ") + 6:frame.index("\n", frame.index("data: "))])["seq"]
+        event = events.get_nowait()
+        self.assertLess(snapshot_seq, event["seq"])
+
+    def test_hook_resolves_session_under_monitor_lock(self):
+        # hook 请求与扫描线程并发：by_sid 遍历 sessions 必须持 mon.lock，
+        # 否则字典尺寸变化会抛 RuntimeError
+        self.mon.hook_token = "tok"
+        self.mon.first_scan_done = True
+        lock_held = []
+        original_by_sid = self.mon.by_sid
+
+        def locked_by_sid(sid):
+            free = self.mon.lock.acquire(blocking=False)
+            if free:
+                self.mon.lock.release()
+            lock_held.append(not free)
+            return original_by_sid(sid)
+
+        real_init = monitor.Interaction.__init__
+
+        def init_spy(inter, *args, **kwargs):
+            real_init(inter, *args, **kwargs)
+
+            def wait_spy(timeout=None):
+                return True
+
+            inter.event.wait = wait_spy
+
+        payload = {"session_id": "sid-1", "tool_use_id": "t1",
+                   "tool_name": "AskUserQuestion",
+                   "tool_input": {"questions": [
+                       {"question": "Q1", "options": [{"label": "A"}]}]}}
+        with patch.object(self.mon, "by_sid", locked_by_sid), \
+                patch.object(monitor.Interaction, "__init__", init_spy):
+            json.load(self.request("/hook/PreToolUse", payload,
+                                   {"Content-Type": "application/json",
+                                    "X-Monitor-Token": "tok"}))
+        self.assertTrue(lock_held, "hook 流程应调用 by_sid")
+        self.assertTrue(all(lock_held), "by_sid 必须在 mon.lock 内调用")
+
     def test_sse_connection_starts_with_snapshot(self):
         response = urlopen(self.base + "/events", timeout=5)
         lines = []

@@ -640,6 +640,78 @@ test('跨块分页吸收已合并的工具结果与备注', () => {
   assert.equal(merged[0].parts[0].result.text,'ok');
   assert.equal(JSON.stringify(merged[0].parts[0].notes),'["note"]');
 });
+test('renderConvList 按分组复用 DOM 节点，markdown 只处理新增组', () => {
+  const b=boot();
+  const conv=b.node('conv');
+  const children=[];
+  Object.defineProperty(conv,'firstChild',{get:()=>children[0]||null});
+  conv.querySelectorAll=()=>[...children];
+  conv.insertBefore=(node,anchor)=>{
+    const i=anchor?children.indexOf(anchor):children.length;
+    children.splice(i<0?children.length:i,0,node); return node;};
+  b.context.document.createElement=()=>{
+    const node={dataset:{},removed:false,
+      remove(){this.removed=true;const i=children.indexOf(this);if(i>=0)children.splice(i,1);},
+      querySelector(){return null;},querySelectorAll(){return [];}};
+    Object.defineProperty(node,'nextSibling',{get(){return children[children.indexOf(this)+1]||null;}});
+    const tpl={};
+    Object.defineProperty(tpl,'innerHTML',{set(v){node.innerHTML=v;}});
+    Object.defineProperty(tpl,'content',{value:{firstElementChild:node}});
+    return tpl;};
+  b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; '+
+    'convState={id:"a",msgs:[' +
+    '{role:"user",ts:1,parts:[{type:"text",text:"q1"}]},' +
+    '{role:"assistant",ts:2,parts:[{type:"text",text:"a1"}]},' +
+    '{role:"user",ts:3,parts:[{type:"text",text:"q2"}]}],total:3,start:0,hasMore:false,loadingEarlier:false}; '+
+    'const __md=md; let mdCalls=0; md=t=>{mdCalls++; return __md(t);}; renderConvList();');
+  assert.equal(children.length,3);
+  const before=[...children];
+  const mdAfterFirst=b.run('mdCalls');
+  b.run('convState.msgs.push({role:"assistant",ts:4,parts:[{type:"text",text:"a2"}]}); convState.total=4; renderConvList();');
+  assert.equal(children.length,4);
+  assert.equal(children[0],before[0],'未变化组复用原节点');
+  assert.equal(children[1],before[1]);
+  assert.equal(children[2],before[2]);
+  assert.equal(b.run('mdCalls')-mdAfterFirst,1,'markdown 只处理新增的助手组');
+});
+test('renderConvList 前插历史与同角色扩张只重建边界组', () => {
+  const b=boot();
+  const conv=b.node('conv');
+  const children=[];
+  Object.defineProperty(conv,'firstChild',{get:()=>children[0]||null});
+  conv.querySelectorAll=()=>[...children];
+  conv.insertBefore=(node,anchor)=>{
+    const i=anchor?children.indexOf(anchor):children.length;
+    children.splice(i<0?children.length:i,0,node); return node;};
+  b.context.document.createElement=()=>{
+    const node={dataset:{},removed:false,
+      remove(){this.removed=true;const i=children.indexOf(this);if(i>=0)children.splice(i,1);},
+      querySelector(){return null;},querySelectorAll(){return [];}};
+    Object.defineProperty(node,'nextSibling',{get(){return children[children.indexOf(this)+1]||null;}});
+    const tpl={};
+    Object.defineProperty(tpl,'innerHTML',{set(v){node.innerHTML=v;}});
+    Object.defineProperty(tpl,'content',{value:{firstElementChild:node}});
+    return tpl;};
+  b.run('view={project:"/p",session:"a"}; curPanel={type:"conv",key:"a"}; '+
+    'convState={id:"a",msgs:[' +
+    '{role:"user",ts:1,parts:[{type:"text",text:"q1"}]},' +
+    '{role:"assistant",ts:2,parts:[{type:"text",text:"a1"}]}],total:2,start:0,hasMore:false,loadingEarlier:false}; '+
+    'renderConvList();');
+  assert.equal(children.length,2);
+  const q1=children[0], a1=children[1];
+  // 前插一个不同角色的组：新组在前，原有两个组节点原样保留
+  b.run('convState.msgs.unshift({role:"system",ts:0,parts:[{type:"text",text:"sys0"}]}); convState.total=3; renderConvList();');
+  assert.equal(children.length,3);
+  assert.equal(children[1],q1,'原用户组节点复用');
+  assert.equal(children[2],a1,'原助手组节点复用');
+  // 末尾追加同角色消息：只有助手组重建，前面的组不动
+  const sys0=children[0];
+  b.run('convState.msgs.push({role:"assistant",ts:3,parts:[{type:"text",text:"a2"}]}); convState.total=4; renderConvList();');
+  assert.equal(children.length,3);
+  assert.equal(children[0],sys0);
+  assert.equal(children[1],q1);
+  assert.notEqual(children[2],a1,'同角色扩张的边界组重建');
+});
 test('计划与选择卡片渲染及答案收集', () => {
   const b=boot();
   const plan=b.run('interactionHtml({id:"p1",kind:"plan",state:"pending",' +

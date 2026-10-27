@@ -119,6 +119,9 @@ REMOTE_QUEUE_LIMIT = 32
 # 对话解析缓存最多保留的转录文件数（LRU）；最久未用的缓存连同解析锁一起淘汰
 MSG_CACHE_SESSION_LIMIT = 8
 
+# webhook 单 worker 的有界队列容量；满时丢弃新事件并限频记录
+WEBHOOK_QUEUE_LIMIT = 1000
+
 _jinja = Environment(
     loader=FileSystemLoader(str(TEMPLATE_DIR)),
     autoescape=select_autoescape(["html"]),
@@ -384,6 +387,12 @@ class Monitor:
         self.sessions = {}           # str(path) -> Session
         self.stale_after = stale_after
         self.webhook = webhook
+        # webhook 单 worker 顺序发送：不再每个事件起线程，突发时线程数不受控
+        self.webhook_queue = queue.Queue(maxsize=WEBHOOK_QUEUE_LIMIT) if webhook else None
+        self.webhook_dropped = 0
+        self.webhook_dropped_logged = 0.0
+        if webhook:
+            threading.Thread(target=self._webhook_worker, daemon=True).start()
         self.permission_timeout = permission_timeout
         self.interactions = {}       # request_id -> Interaction
         self.hook_interactions = {}  # session+tool_use -> Interaction（AskUserQuestion 去重）
@@ -393,6 +402,10 @@ class Monitor:
         self.event_lock = threading.Lock()
         self.msg_locks = {}
         self.msg_locks_guard = threading.Lock()
+        # 每个转录路径一把扫描锁：同一文件的读取与 offset 提交串行化，
+        # 但磁盘 I/O 不再占住 mon.lock（慢盘不阻塞 HTTP 与审批）
+        self.scan_locks = {}
+        self.scan_locks_guard = threading.Lock()
         self.lock = threading.Lock()
         self.subscribers = []      # list of queue.Queue
         self.first_scan_done = False
@@ -984,7 +997,30 @@ class Monitor:
             except queue.Full:
                 pass
         if self.webhook and not transient:
-            threading.Thread(target=self._post, args=(ev,), daemon=True).start()
+            try:
+                self.webhook_queue.put_nowait(ev)
+            except queue.Full:
+                self._note_webhook_drop()
+
+    def _note_webhook_drop(self):
+        """队列满时丢弃新事件；计数限频打印，避免日志刷屏。"""
+        self.webhook_dropped += 1
+        now = now_ts()
+        if now - self.webhook_dropped_logged > 60:
+            dropped = self.webhook_dropped
+            self.webhook_dropped_logged = now
+            print(f"[webhook] 队列已满，累计丢弃 {dropped} 个事件", flush=True)
+
+    def _webhook_worker(self):
+        while True:
+            try:
+                ev = self.webhook_queue.get(timeout=1)
+            except queue.Empty:
+                # 关闭后不再无限等待新事件；已排队事件在下一轮取完
+                if self.shutdown_event.is_set():
+                    return
+                continue
+            self._post(ev)
 
     def _post(self, ev):
         try:
@@ -1302,24 +1338,36 @@ class Monitor:
         return self._new_session(sid, path, parent_id, is_subagent)
 
     def _scan_path(self, path, sid, parent_id, is_subagent):
-        """增量读取单个转录文件；缓存命中时只解析新增字节。"""
+        """增量读取单个转录文件；缓存命中时只解析新增字节。
+
+        同一路径由 scan_lock 串行化；stat、读取文件和缓存尾部校验都在
+        mon.lock 外执行，只有注册、截断判定和 offset 提交持锁。
+        """
         key = str(path)
+        with self.scan_locks_guard:
+            scan_lock = self.scan_locks.setdefault(key, threading.Lock())
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
         with self.lock:
             sess = self.sessions.get(key)
-            try:
-                size = path.stat().st_size
-            except OSError:
-                return
-            if sess is None:
-                entry = (self.scan_cache_entries or {}).get(key)
-                if entry and size < entry["offset"]:
-                    # 缓存比当前文件还长（截断，常见于清空文件）：丢弃缓存并标记落盘
-                    sess = self._new_session(sid, path, parent_id, is_subagent)
+        if sess is None:
+            entry = (self.scan_cache_entries or {}).get(key)
+            if entry and size < entry["offset"]:
+                # 缓存比当前文件还长（截断，常见于清空文件）：丢弃缓存并标记落盘
+                sess = self._new_session(sid, path, parent_id, is_subagent)
+                with self.lock:
+                    self.sessions[key] = sess
+                    self.emit(sess, "session_discovered", {"path": str(path)})
                     self.cache_dirty = True
-                else:
-                    sess = self._restore_or_new(path, sid, parent_id, is_subagent, size)
-                self.sessions[key] = sess
-                self.emit(sess, "session_discovered", {"path": str(path)})
+            else:
+                # 缓存命中校验（尾部读取）是磁盘 I/O：在锁外构造 Session
+                sess = self._restore_or_new(path, sid, parent_id, is_subagent, size)
+                with self.lock:
+                    self.sessions[key] = sess
+                    self.emit(sess, "session_discovered", {"path": str(path)})
+        with self.lock:
             if size < sess.offset:
                 # 文件被截断/重写：丢弃全部派生状态，避免二次累计
                 sess = self.sessions[key] = self._new_session(
@@ -1327,21 +1375,24 @@ class Monitor:
                 self.cache_dirty = True
             if size == sess.offset:
                 return
-            try:
-                with open(path, "rb") as f:
-                    f.seek(sess.offset)
-                    chunk = f.read()
-            except OSError:
-                # 文件在 stat 与 open 之间被删除/轮转：跳过本次，下轮重试
-                return
-            sess.offset += len(chunk)
+            offset = sess.offset
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+        except OSError:
+            # 文件在 stat 与 open 之间被删除/轮转：跳过本次，下轮重试
+            return
+        with self.lock:
+            # scan_lock 已保证同路径串行：sess 不会被并发重置，直接提交
+            data = sess.buf + chunk
+            *lines, sess.buf = data.split(b"\n")   # 最后一段可能是半行，留到下次
+            sess.offset = offset + len(chunk)
             if chunk:
                 if len(chunk) >= SCAN_TAIL_SAMPLE_BYTES:
                     sess.tail_sample = chunk[-SCAN_TAIL_SAMPLE_BYTES:]
                 else:
                     sess.tail_sample = (sess.tail_sample + chunk)[-SCAN_TAIL_SAMPLE_BYTES:]
-            data = sess.buf + chunk
-            *lines, sess.buf = data.split(b"\n")   # 最后一段可能是半行，留到下次
             self.cache_dirty = True
             for ln in lines:
                 if ln.strip():
@@ -1469,28 +1520,35 @@ class Monitor:
             print(f"[scan-cache] 保存失败: {e}", flush=True)
 
     def _merge_task_dirs(self):
-        """~/.claude/tasks/<sid>/*.json 若存在，以它为准校正任务列表。"""
+        """~/.claude/tasks/<sid>/*.json 若存在，以它为准校正任务列表。
+
+        任务文件读取在 mon.lock 外执行；提交前确认 Session 未被扫描线程
+        截断重置，被替换的条目本轮跳过。
+        """
         troot = CLAUDE_DIR / "tasks"
         if not troot.exists():
             return False
-        changed = False
         with self.lock:
-            for sess in self.sessions.values():
-                if sess.is_subagent:
+            snapshot = [(key, sess, troot / sess.id)
+                        for key, sess in self.sessions.items()
+                        if not sess.is_subagent]
+        changed = False
+        for key, sess, d in snapshot:
+            if not d.is_dir():
+                continue
+            tasks = {}
+            for fp in sorted(d.glob("*.json")):
+                try:
+                    t = json.loads(fp.read_text(encoding="utf-8"))
+                except Exception:
                     continue
-                d = troot / sess.id
-                if not d.is_dir():
+                if isinstance(t, dict) and "id" in t:
+                    tasks[str(t["id"])] = {"id": str(t["id"]), "subject": t.get("subject", ""),
+                                           "description": t.get("description", ""),
+                                           "status": t.get("status", "pending")}
+            with self.lock:
+                if self.sessions.get(key) is not sess:
                     continue
-                tasks = {}
-                for fp in sorted(d.glob("*.json")):
-                    try:
-                        t = json.loads(fp.read_text(encoding="utf-8"))
-                    except Exception:
-                        continue
-                    if isinstance(t, dict) and "id" in t:
-                        tasks[str(t["id"])] = {"id": str(t["id"]), "subject": t.get("subject", ""),
-                                               "description": t.get("description", ""),
-                                               "status": t.get("status", "pending")}
                 # 目录存在但文件被清空时也要清掉旧任务；目录不存在时保留转录推断结果
                 if tasks != sess.tasks:
                     sess.tasks = tasks
@@ -2548,7 +2606,7 @@ def make_handler(mon, refresh_interval):
                 print(f"[http] {self.command} {path} -> {code}", flush=True)
 
         def _json(self, obj, code=200):
-            body = json.dumps(obj, ensure_ascii=False, indent=2).encode()
+            body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
             self._raw(body, code)
 
         def _raw(self, body, code=200, ctype="application/json; charset=utf-8"):

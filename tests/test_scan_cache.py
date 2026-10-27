@@ -1,7 +1,10 @@
+import builtins
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import monitor
@@ -205,6 +208,109 @@ class ScanCacheTests(unittest.TestCase):
         self.assertEqual(mon.by_sid("sid-1").user_msgs, 1)
         # 扫描完成后用有效内容覆盖损坏缓存
         self.assertIsInstance(json.loads(self.cache_path.read_text(encoding="utf-8")), dict)
+
+
+class ScanLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patch = patch.object(monitor, "CLAUDE_DIR", self.root / "config")
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def assert_lock_free_during(self, mon, started):
+        acquired = threading.Event()
+
+        def grab():
+            with mon.lock:
+                acquired.set()
+
+        threading.Thread(target=grab, daemon=True).start()
+        self.assertTrue(acquired.wait(0.5), "磁盘读取阻塞时 mon.lock 应可获取")
+
+    def test_transcript_read_does_not_hold_monitor_lock(self):
+        mon = monitor.Monitor(300)
+        gate = threading.Event()
+        started = threading.Event()
+
+        class BlockingFile:
+            def seek(self, offset):
+                pass
+
+            def read(self, size=-1):
+                started.set()
+                gate.wait(5)
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        fake_path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=10))
+        sess = monitor.Session("s1", fake_path)
+        mon.sessions[str(fake_path)] = sess
+        done = threading.Event()
+        real_open = builtins.open
+
+        def fake_open(file, *args, **kwargs):
+            if file is fake_path:
+                return BlockingFile()
+            return real_open(file, *args, **kwargs)
+
+        def run_scan():
+            with patch.object(builtins, "open", fake_open):
+                mon._scan_path(fake_path, "s1", None, False)
+            done.set()
+
+        threading.Thread(target=run_scan, daemon=True).start()
+        self.assertTrue(started.wait(2))
+        self.assert_lock_free_during(mon, started)
+        gate.set()
+        self.assertTrue(done.wait(2))
+
+    def test_task_dir_read_does_not_hold_monitor_lock_and_merges(self):
+        tasks = self.root / "config" / "tasks" / "s1"
+        tasks.mkdir(parents=True)
+        (tasks / "1.json").write_text(
+            json.dumps({"id": 1, "subject": "t", "status": "pending"}),
+            encoding="utf-8")
+        mon = monitor.Monitor(300)
+        sess = monitor.Session("s1", self.root / "config" / "projects" / "s1.jsonl")
+        mon.sessions[str(sess.path)] = sess
+        gate = threading.Event()
+        started = threading.Event()
+        real_read = Path.read_text
+
+        def gated_read(self, *args, **kwargs):
+            if self.name == "1.json":
+                started.set()
+                gate.wait(5)
+                return json.dumps({"id": 1, "subject": "t", "status": "pending"})
+            return real_read(self, *args, **kwargs)
+
+        result = {}
+
+        def run_merge():
+            result["changed"] = mon._merge_task_dirs()
+            result["done"] = True
+
+        with patch.object(Path, "read_text", gated_read):
+            thread = threading.Thread(target=run_merge, daemon=True)
+            thread.start()
+            self.assertTrue(started.wait(2))
+            self.assert_lock_free_during(mon, started)
+            gate.set()
+            thread.join(5)
+
+        self.assertTrue(result.get("done"))
+        self.assertTrue(result["changed"])
+        self.assertEqual(sess.tasks, {"1": {"id": "1", "subject": "t",
+                                            "description": "", "status": "pending"}})
 
 
 if __name__ == "__main__":
