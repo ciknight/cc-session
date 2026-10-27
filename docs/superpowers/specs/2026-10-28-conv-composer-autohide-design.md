@@ -7,20 +7,26 @@
 - 会话页（`main:has(>#conv)`）发送区在 **PC 桌面端（>768px）** 永不自动隐藏。
 - **移动端（≤768px，与现有窄屏断点一致）**：`#conv` 消息区发生滚动（任意方向）时，
   发送框向下滑出隐藏；手指松开/滚动停止约 400ms 后滑回。
-- 回弹不得移动消息文字内容（纯 transform，不改布局）。
+- **隐藏时消息区要真正扩展**，为消息文字腾出更多显示空间（首版纯 transform 位移
+  只滑出不释放空间，被否决）。
 - 新建会话页（无 `#conv`）不受影响。
 
 ## 方案
 
-`.composer` 保留在 flex 布局原位（空间始终预留），隐藏只通过
-`transform: translateY(calc(100% + 14px))` 位移实现，配 0.25s CSS transition。
-布局不变 ⇒ `#conv` 高度不变 ⇒ 消息文字与贴底跟底逻辑不受影响。
+`.composer` 平时保留在 flex 布局原位；隐藏时在移动端媒体查询内切换为
+`position:absolute` 脱离文档流并 `transform: translateY(...)` 滑出：
+`#conv`（`flex:1`）即时占满释放的空间。回弹时发送框回到文档流、滑回原位，
+上方文字不动，只是底部区域重新被发送框覆盖。
 
 ### CSS（templates/index.html）
 
 ```css
-main:has(>#conv) .composer{transition:transform .25s ease}
-main:has(>#conv) .composer.conv-hide{transform:translateY(calc(100% + 14px))}
+main:has(>#conv) .composer{...;transition:transform .25s ease}
+@media(max-width:768px){
+  main:has(>#conv){position:relative}
+  main:has(>#conv) .composer.conv-hide{position:absolute;left:10px;right:10px;bottom:8px;margin:0;
+    transform:translateY(calc(100% + 12px))}
+}
 ```
 
 ### JS（templates/index.html）
