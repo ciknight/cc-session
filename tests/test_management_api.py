@@ -145,6 +145,50 @@ class ManagementAPITests(unittest.TestCase):
             self.request("/sessions/sid-1/model", {"model": []}, {"Content-Type": "application/json"})
         self.assertEqual(invalid.exception.code, 400)
 
+    def test_execution_writes_reject_cross_site_before_delegation(self):
+        cases = (("/new", "new_session"), ("/hosted", "host_session"),
+                 ("/sessions/sid-1/message", "send_message"))
+        for path, method in cases:
+            with self.subTest(path=path), patch.object(
+                    self.mon, method, return_value=(202, {})) as call:
+                with self.assertRaises(HTTPError) as error:
+                    self.request(path, {"text": "hello", "cwd": str(self.project)},
+                                 {"Content-Type": "text/plain",
+                                  "Origin": "http://evil.invalid"})
+                self.assertEqual(error.exception.code, 403)
+                call.assert_not_called()
+
+    def test_hosted_delete_rejects_cross_site_before_stopping(self):
+        hosted = SimpleNamespace(stop=lambda *a: None,
+                                 info=lambda: {"hosted_id": "h1"})
+        self.mon.hosted["h1"] = hosted
+        with patch.object(hosted, "stop") as stop:
+            req = Request(self.base + "/hosted/h1", method="DELETE",
+                          headers={"Origin": "http://evil.invalid"})
+            with self.assertRaises(HTTPError) as error:
+                urlopen(req)
+            self.assertEqual(error.exception.code, 403)
+            stop.assert_not_called()
+
+    def test_static_rejects_sibling_directory_with_same_prefix(self):
+        static = self.root / "static"
+        static.mkdir()
+        secret = self.root / "static-secret" / "secret.txt"
+        secret.parent.mkdir()
+        secret.write_text("not-public", encoding="utf-8")
+        with patch.object(monitor, "STATIC_DIR", static):
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3) as sock:
+                sock.sendall(b"GET /static/../static-secret/secret.txt HTTP/1.0\r\n\r\n")
+                chunks = []
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+        response = b"".join(chunks)
+        self.assertIn(b" 404 ", response.split(b"\r\n", 1)[0])
+        self.assertNotIn(b"not-public", response)
+
     def test_malformed_request_version_returns_400_without_crashing_logger(self):
         # 请求行版本号非法时 stdlib 只设置 command(None)，没有 path；
         # log_request 不应因此崩溃，客户端应收到 400 错误页而不是连接被掐断。

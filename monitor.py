@@ -2680,10 +2680,7 @@ def make_handler(mon, refresh_interval):
             except (ValueError, json.JSONDecodeError):
                 return None
 
-        def _safe_json_write(self):
-            if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
-                self._json({"error": "Content-Type 必须为 application/json"}, 415)
-                return False
+        def _safe_write_origin(self):
             site = self.headers.get("Sec-Fetch-Site", "").lower()
             if site == "cross-site":
                 self._json({"error": "拒绝跨站写入请求"}, 403)
@@ -2695,6 +2692,14 @@ def make_handler(mon, refresh_interval):
                 if parsed.netloc.lower() != host.lower():
                     self._json({"error": "Origin 与当前服务不匹配"}, 403)
                     return False
+            return True
+
+        def _safe_json_write(self):
+            if not self._safe_write_origin():
+                return False
+            if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+                self._json({"error": "Content-Type 必须为 application/json"}, 415)
+                return False
             return True
 
         def _handle_hook(self, event):
@@ -2759,9 +2764,9 @@ def make_handler(mon, refresh_interval):
             print(f"[http] {self.command} {self.path} 收到", flush=True)   # 请求到达即记录，响应见 log_request
             if u.path.startswith("/hook/"):
                 return self._handle_hook(u.path[len("/hook/"):])
+            if not self._safe_json_write():
+                return
             if u.path == "/cc-switch/local":
-                if not self._safe_json_write():
-                    return
                 body = self._read_body()
                 if not isinstance(body, dict):
                     return self._json({"error": "invalid JSON body"}, 400)
@@ -2804,8 +2809,6 @@ def make_handler(mon, refresh_interval):
                                               body.get("effort", UNSET))
                 return self._json(resp, code)
             if u.path.startswith("/interactions/") and u.path.endswith("/respond"):
-                if not self._safe_json_write():
-                    return
                 iid = u.path.split("/")[2]
                 code, resp = mon.respond_interaction(iid, self._read_body())
                 return self._json(resp, code)
@@ -2820,15 +2823,11 @@ def make_handler(mon, refresh_interval):
                 return self._json(resp, code)
             parts = u.path.strip("/").split("/")
             if len(parts) == 5 and parts[0] == "sessions" and parts[2] == "jobs" and parts[4] == "cancel":
-                if not self._safe_json_write():
-                    return
                 if self._read_body() != {}:
                     return self._json({"error": "body must be {}"}, 400)
                 code, payload = mon.cancel_job(parts[1], parts[3])
                 return self._json(payload, code)
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "metadata":
-                if not self._safe_json_write():
-                    return
                 try:
                     patch = validate_metadata_patch(self._read_body())
                 except ValueError as e:
@@ -2847,8 +2846,6 @@ def make_handler(mon, refresh_interval):
                 mon.emit(sess, "session_metadata_changed", {"id": parts[1], **metadata})
                 return self._json({"id": parts[1], **metadata})
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "model":
-                if not self._safe_json_write():
-                    return
                 body = self._read_body()
                 if not isinstance(body, dict) or "model" not in body:
                     return self._json({"error": "body must contain model (string or null)"}, 400)
@@ -2863,20 +2860,14 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": str(e)}, 400)
                 return self._json({"selected_model": selected})
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "interrupt":
-                if not self._safe_json_write():
-                    return
                 code, resp = mon.interrupt_session(parts[1])
                 return self._json(resp, code)
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "approval":
-                if not self._safe_json_write():
-                    return
                 body = self._read_body()
                 mode = body.get("approval") if isinstance(body, dict) else None
                 code, resp = mon.set_approval(parts[1], mode)
                 return self._json(resp, code)
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "effort":
-                if not self._safe_json_write():
-                    return
                 body = self._read_body()
                 level = body.get("effort") if isinstance(body, dict) else None
                 code, resp = mon.set_effort(parts[1], level)
@@ -2895,6 +2886,8 @@ def make_handler(mon, refresh_interval):
 
         def do_DELETE(self):
             u = urlparse(self.path)
+            if not self._safe_write_origin():
+                return
             print(f"[http] {self.command} {self.path} 收到", flush=True)
             parts = u.path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "hosted":
@@ -2907,8 +2900,9 @@ def make_handler(mon, refresh_interval):
 
         def _static(self, name):
             # 防目录穿越，只允许 static 目录下的普通文件
-            fp = (STATIC_DIR / name).resolve()
-            if not str(fp).startswith(str(STATIC_DIR.resolve())) or not fp.is_file():
+            root = STATIC_DIR.resolve()
+            fp = (root / name).resolve()
+            if not path_is_within(fp, root) or not fp.is_file():
                 return self._json({"error": "not found"}, 404)
             ctype = {".js": "application/javascript", ".css": "text/css",
                      ".html": "text/html", ".map": "application/json"}.get(fp.suffix, "application/octet-stream")
