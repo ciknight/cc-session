@@ -2509,9 +2509,10 @@ function systimerHtml(data){
 }
 function sysPopHtml(data){
   if(!data) return '<div class="mut">加载中…</div>';
-  // 错误分支也保留操作提示：如重启指令发出后轮询失败，note 不能被错误行顶掉
+  // 错误分支也保留操作提示与定时行：已设定的定时仍在跑，错误态下必须还能看到剩余时间并取消
   if(data.error) return `${sysPop.note ? `<div role="status" style="margin-top:6px">${esc(sysPop.note)}</div>` : ""}
-    <div class="terror">${esc(data.error)}</div>`;
+    <div class="terror">${esc(data.error)}</div>
+    ${systimerHtml(data)}`;
   const cpu = data.cpu_percent || 0;
   const cores = (data.cpu_cores || []).map((p, i) =>
     `<div class="core"><span>核${i + 1} ${Math.round(p)}%</span><div class="sysbar ${barClass(p)}"><i style="width:${Math.min(100, p)}%"></i></div></div>`).join("");
@@ -2559,12 +2560,15 @@ function renderSysPop(){
 async function loadSystem(){
   if(sysPop.loading || !sysPop.timer) return;   // 上一请求未结束不叠加
   sysPop.loading = true;
+  const prevRem = sysData ? sysData.sleep_timer_remaining : undefined;   // 失败时保留最后已知的定时状态
   try{
     const r = await fetchT("/system");
     let j = null;
     try{ j = await r.json(); }catch(e){}
-    sysData = r.ok ? (j || {error: "响应格式异常"}) : {error: (j && j.error) || `HTTP ${r.status}`};
-  }catch(e){ sysData = {error: "查询失败：" + (e && e.message || e)}; }
+    sysData = r.ok ? (j || {error: "响应格式异常"})
+      : {error: (j && j.error) || `HTTP ${r.status}`,
+         sleep_timer_remaining: j && j.sleep_timer_remaining != null ? j.sleep_timer_remaining : prevRem};
+  }catch(e){ sysData = {error: "查询失败：" + (e && e.message || e), sleep_timer_remaining: prevRem}; }
   sysPop.loading = false;
   renderSysPop();
 }
@@ -2607,7 +2611,7 @@ async function setSleepTimer(minutes){
     try{ j = await r.json(); }catch(e){}
     if(r.ok && j && j.ok){
       sysPop.note = minutes ? `已设定定时睡眠（约 ${minutes} 分钟后）` : "已取消定时睡眠";
-      if(sysData && !sysData.error) sysData.sleep_timer_remaining = j.remaining;
+      if(sysData) sysData.sleep_timer_remaining = j.remaining;   // 错误态也要切行，取消入口常在
     }else{
       sysPop.note = (j && j.error) || "执行失败";
     }

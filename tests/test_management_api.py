@@ -926,13 +926,16 @@ class ManagementAPITests(unittest.TestCase):
 
     def test_sleep_timer_rejects_invalid_minutes(self):
         headers = {'Content-Type': 'application/json'}
-        for bad in (-5, 1000, "30", None, True, [15], 1.5):
+        # json.dumps 会把 inf/nan 编码成 Infinity/NaN 字面量，服务端 json.loads 照单全收，
+        # 必须在 int(raw) 之前拦下（否则 OverflowError/ValueError 打崩请求线程）
+        for bad in (-5, 1000, "30", None, True, [15], 1.5, float('inf'), float('nan')):
             with self.assertRaises(HTTPError) as ctx:
                 self.request('/system/sleep-timer', {"minutes": bad}, headers)
             self.assertEqual(ctx.exception.code, 400, bad)
 
     def test_sleep_timer_fire_clears_state_and_spawns_sleep(self):
         self.mon.sleep_timer_deadline = time.time() + 60
+        self.mon.sleep_timer = threading.current_thread()   # fire 只认自己所属的 Timer 线程
         with patch.object(monitor, "spawn_power") as spawn:
             self.mon._fire_sleep_timer()
         spawn.assert_called_once_with("sleep")
@@ -941,9 +944,25 @@ class ManagementAPITests(unittest.TestCase):
 
     def test_sleep_timer_fire_swallows_spawn_failure(self):
         self.mon.sleep_timer_deadline = time.time() + 60
+        self.mon.sleep_timer = threading.current_thread()
         with patch.object(monitor, "spawn_power", side_effect=OSError("boom")):
             self.mon._fire_sleep_timer()   # 不应抛出
         self.assertIsNone(self.mon.sleep_timer_deadline)
+
+    def test_sleep_timer_stale_fire_aborts_without_clearing_replacement(self):
+        # 旧 Timer 的 cancel 来不及时 fire 仍会跑：发现自己已被新定时替换就作废，
+        # 不清新状态、不执行睡眠
+        new_timer = monitor.threading.Timer(900, lambda: None)
+        try:
+            self.mon.sleep_timer_deadline = time.time() + 900
+            self.mon.sleep_timer = new_timer
+            with patch.object(monitor, "spawn_power") as spawn:
+                self.mon._fire_sleep_timer()   # 当前线程不是 new_timer
+            spawn.assert_not_called()
+            self.assertEqual(self.mon.sleep_timer, new_timer)
+            self.assertIsNotNone(self.mon.sleep_timer_deadline)
+        finally:
+            new_timer.cancel()
 
 
 class SSEDisconnectTests(unittest.TestCase):

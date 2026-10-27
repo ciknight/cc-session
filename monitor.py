@@ -563,8 +563,12 @@ class Monitor:
             return max(0, math.ceil(self.sleep_timer_deadline - time.time()))
 
     def _fire_sleep_timer(self):
-        # 先清状态再执行：睡醒后查询不会看到残留定时；执行失败只记日志（Timer 线程无人接异常）
+        # 先清状态再执行：睡醒后查询不会看到残留定时；执行失败只记日志（Timer 线程无人接异常）。
+        # 身份校验：fire 与 set 锁窗口竞态时（旧 Timer 的 cancel 已来不及），这里自己已被
+        # 新定时替换，作废本轮——不清掉新装的状态，也不二次睡眠
         with self.sleep_timer_lock:
+            if self.sleep_timer is not threading.current_thread():
+                return
             self.sleep_timer_deadline = None
             self.sleep_timer = None
         try:
@@ -2758,9 +2762,12 @@ def make_handler(mon, refresh_interval):
                 try:
                     data = system_snapshot()
                 except SystemInfoUnavailable as e:
-                    return self._json({"error": f"系统信息不可用：{e}"}, 503)
+                    # 采集失败也带剩余秒数：已设定的定时仍在跑，前端错误态要能显示/取消
+                    return self._json({"error": f"系统信息不可用：{e}",
+                                       "sleep_timer_remaining": mon.sleep_timer_remaining()}, 503)
                 except Exception as e:
-                    return self._json({"error": f"系统状态采集失败：{e}"}, 500)
+                    return self._json({"error": f"系统状态采集失败：{e}",
+                                       "sleep_timer_remaining": mon.sleep_timer_remaining()}, 500)
                 data["sleep_timer_remaining"] = mon.sleep_timer_remaining()
                 return self._json(data)
             if u.path == "/interactions":
@@ -3066,9 +3073,11 @@ def make_handler(mon, refresh_interval):
             if u.path == "/system/sleep-timer":
                 body = self._read_body()
                 raw = body.get("minutes") if isinstance(body, dict) else None
-                # bool 是 int 子类要排除；浮点只接受整数值
-                if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
-                        or raw != int(raw) or not 0 <= int(raw) <= 720:
+                # bool 是 int 子类要排除；Infinity/NaN 是 json.loads 接受的非标准字面量，
+                # 不先 isfinite 拦下的话 int(raw) 会抛 OverflowError/ValueError 打崩请求线程
+                valid = (not isinstance(raw, bool) and isinstance(raw, (int, float))
+                         and math.isfinite(raw) and raw == int(raw) and 0 <= int(raw) <= 720)
+                if not valid:
                     return self._json({"error": "minutes 必须是 0-720 之间的整数分钟（0 为取消）"}, 400)
                 remaining = mon.set_sleep_timer(int(raw))
                 return self._json({"ok": True, "remaining": remaining})
