@@ -96,9 +96,9 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
 - **双时钟**：`last_input_ts` 只由真实用户输入推进（排除 tool_result、isMeta、
   origin/promptSource 注入、中断标记），`last_event_ts` 是最后一条带时间戳的转录事件；
   列表按 `last_input_ts` 排序、回退 `last_event_ts`。
-- **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `auto`（交给 CLI 权限模式）**，持久化在
+- **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `full`（服务自动放行）**，持久化在
   `~/.claude/claude-sessions/approvals.json`；已有明确保存的模式优先。`ask` 等待网页响应
-  （`--permission-timeout` 默认 300 秒，超时自动拒绝），`full` 由服务自动放行。
+  （`--permission-timeout` 默认 300 秒，超时自动拒绝），`auto` 交给 CLI 权限模式。
 - **思考档位（effort）**：仅托管会话；`POST /sessions/<id>/effort` 在线切换
   （control `apply_flag_settings` 的 `effortLevel`，`default` 传 null 回落模型默认），
   档位持久化在 `~/.claude/claude-sessions/efforts.json`，重托管 spawn 带 `--effort`（有档位时
@@ -168,7 +168,7 @@ chip 矩形定位并夹紧视口，滚动/ resize 重定位）：不随 `main` �
 窄屏（≤768px）发送区次要控件（审批/思考/发送选项/托管）收进 ⚙ 浮层——`composer-extra`
 桌面 `display:contents` 原样展开、控件 DOM 不移动，textarea 压两行，头部隐藏 cwd。发送区提供中断按钮、审批
 模式选择与思考档位（effort）下拉（托管中 onchange 即切，未托管保存待下次托管生效；新建页未勾选
-托管时禁用）；审批默认 `auto`，发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用
+托管时禁用）；审批默认 `full`，发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用
 同一个 `composerHtml` 输入对话框；输入框下有斜杠指令提示面板（`wireCommandHints`，目录来自
 detail 轮询的 `commands`，仅托管会话有），`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，
 自动刷新/整页刷新后恢复（`sessionStorage`）。子代理折叠区与会话卡片显示运行中数量

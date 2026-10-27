@@ -307,6 +307,6 @@ class ApprovalPreferences(_MapPreferences):
             raise ValueError("审批模式必须是 ask / auto / full")
         return mode
 
-    def get(self, sid, default="auto"):
+    def get(self, sid, default="full"):
         with self.lock:
             return self.values.get(sid, default)

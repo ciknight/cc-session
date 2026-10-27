@@ -83,7 +83,8 @@ test('现有会话 Enter 发送一次，Shift 与 IME Enter 不发送', async ()
   assert.equal(newEnter.defaultPrevented,true);
   assert.equal(fresh.node('sendbtn').clickCount,1);
 });
-test('默认审批为自动，工作状态下发送默认勾选', () => {
+test('默认审批为全部允许，工作状态下发送默认勾选', () => {
+  assert.match(html, /value="full" selected>全部允许/);
   assert.ok(html.indexOf('value="auto"') < html.indexOf('value="ask"'));
   assert.match(html, /id="forcecb" checked/);
 });
@@ -391,7 +392,7 @@ test('切入 sid 时 profile options 请求仍 pending，/new 与 /hosted 都能
     assert.equal(b.node('modelcustom').hidden,true);
     const target=useHost?'/hosted':'/new';
     const expected=useHost
-      ? {cwd:'/project',text:'hello',model:'vendor-model',approval:'auto',effort:'default'}
+      ? {cwd:'/project',text:'hello',model:'vendor-model',approval:'full',effort:'default'}
       : {cwd:'/project',text:'hello',model:'vendor-model'};
     assert.deepEqual(sent,[[target,expected]]);
     oldOptionsResolve(response({model_options:[{name:'团队 Sonnet',model:'vendor-model'}]}));
@@ -569,7 +570,7 @@ test('全局待审批计数显示且零时入口保留', () => {
   b.run('renderPendingBadge()');
   assert.equal(b.node('pendingbadge').style.display,'inline-block');
 });
-test('全局托管计数显示、隐藏与点击跳转', () => {
+test('全局托管计数显示、隐藏与点击进列表', () => {
   const b=boot();
   b.run('sessions=[{id:"a",hosted:true},{id:"b",hosted:false},{id:"c",hosted:true}]');
   b.run('renderHostedBadge()');
@@ -578,10 +579,10 @@ test('全局托管计数显示、隐藏与点击跳转', () => {
   b.run('sessions=[{id:"a",hosted:false}]');
   b.run('renderHostedBadge()');
   assert.equal(b.node('hostedbadge').style.display,'none');
-  // 有托管时点击跳到第一个托管会话
+  // 点击进入托管列表页，不直接跳会话
   b.run('sessions=[{id:"a",project:"/p",hosted:false},{id:"b",project:"/p",hosted:true}]');
   b.node('hostedbadge').click();
-  assert.deepEqual({...b.run('view')}, {project:"/p",session:"b",new:false});
+  assert.deepEqual({...b.run('view')}, {hosted:true,project:null,session:null,new:false});
 });
 test('项目侧栏按名称固定排序，首次进入仍选中最近活跃项目', () => {
   const b=boot();
@@ -1655,6 +1656,19 @@ test('待处理：精确route、跨项目归档汇总、返回与零入口', asy
  assert.match(b.node('main').innerHTML,/暂无待处理事项/); assert.match(b.node('projs').innerHTML,/pendingnav/); assert.equal(b.node('pendingbadge').style.display,'inline-block');
 });
 
+test('托管列表：精确route、按项目分组、进入会话与空态', async () => {
+ const b=boot(frontendFetch);
+ assert.equal(b.run('routePath({hosted:true})'),'/hosted'); assert.equal(b.run('parseRoute("/hosted").hosted'),true); assert.equal(b.run('parseRoute("/hosted/no")'),null);
+ b.run('sessions=[{id:"a",project:"/p",hosted:true,alias:"<常驻>",state:"working"},{id:"b",project:"/q",state:"idle"}]; navigate({hosted:true,project:null,session:null,new:false})');
+ assert.equal(b.location.pathname,'/hosted'); assert.equal(b.run('view.project'),null);
+ assert.match(b.node('main').innerHTML,/1 个会话正在托管/); assert.match(b.node('main').innerHTML,/托管中/); assert.match(b.node('main').innerHTML,/&lt;常驻&gt;/);
+ assert.doesNotMatch(b.node('main').innerHTML,/data-id="b"/,'非托管会话不出现在列表');
+ b.node('main').dispatchEvent({type:'click',target:{closest:selector=>selector==='.scard'?{dataset:{id:'a'}}:null}}); await flush();
+ assert.equal(b.run('view.project'),'/p'); assert.equal(b.run('view.session'),'a');
+ b.location.pathname='/hosted'; b.run('onPopState(); sessions=[]; renderMain()');
+ assert.match(b.node('main').innerHTML,/暂无托管会话/); assert.equal(b.node('hostedbadge').style.display,'none');
+});
+
 
 test('队列：独立容器事实快照、FIFO/待派发、取消权限、最近折叠与GET失败保留', async () => {
  let mode='ok'; const b=boot(async url=>{
@@ -1669,13 +1683,19 @@ test('队列：独立容器事实快照、FIFO/待派发、取消权限、最近
  assert.equal(b.node('queue').hidden,false,'有执行/等待时摘要 chip 可见');
  const markup=b.node('queue').innerHTML;
  assert.match(markup,/queue-summary/); assert.match(markup,/执行中 1/); assert.match(markup,/等待 2/);
- assert.match(markup,/&lt;执行&gt;/); assert.match(markup,/默认/); assert.match(markup,/待派发/); assert.match(markup,/最近结束/);
- assert.match(markup,/data-cancel-job="q"/); assert.doesNotMatch(markup,/data-cancel-job="r"|data-cancel-job="p"/);
- assert.match(markup,/data-dkey="queue:a:recent"/);
+ // 详情浮层挂在 body 顶层的 #queuepop，chip 里只有摘要
+ b.run('showQueuePop("a","pinned")');
+ const pop=b.node('queuepop').innerHTML;
+ assert.match(pop,/&lt;执行&gt;/); assert.match(pop,/默认/); assert.match(pop,/待派发/); assert.match(pop,/最近结束/);
+ assert.match(pop,/data-cancel-job="q"/); assert.doesNotMatch(pop,/data-cancel-job="r"|data-cancel-job="p"/);
+ assert.match(pop,/data-dkey="queue:a:recent"/);
+ assert.doesNotMatch(markup,/data-cancel-job/);
  mode='error'; await b.run('loadQueue("a")');
- assert.match(b.node('queue').innerHTML,/排队/); assert.match(b.node('queue').innerHTML,/offline/);
+ assert.match(b.node('queue').innerHTML,/队列查询失败/); assert.match(b.node('queuepop').innerHTML,/offline/);
+ assert.match(b.node('queuepop').innerHTML,/排队/,'GET 失败保留上次快照');
  mode='empty'; await b.run('loadQueue("a")');
  assert.equal(b.node('queue').hidden,true,'空闲且无错误/通知时摘要行隐藏');
+ assert.equal(b.node('queuepop').hidden,true,'摘要隐藏时浮层一并收起');
  assert.match(b.run('composerHtml("conv",{})'),/中断并清空队列/);
 });
 
@@ -2026,4 +2046,35 @@ test('指令提示面板键盘补全，目录为空不弹', () => {
   box.value='/x';
   box.dispatchEvent({type:'input'});
   assert.equal(panel.hidden, true);
+});
+
+test('斜杠提示展开时 Enter 只补全不发送，收起后 Enter 才发送', () => {
+  const b=boot();
+  b.run('bindComposerKeys(); wireCommandHints(document.getElementById("msgbox"), () => ["model","mcp"])');
+  const box=b.node('msgbox'), panel=b.node('cmdhints');
+  box.value='/mo'; box.dispatchEvent({type:'input'});
+  assert.equal(panel.hidden,false);
+  const enter=()=>({type:'keydown', key:'Enter', shiftKey:false, isComposing:false, keyCode:13,
+    preventDefault(){this.defaultPrevented=true;}});
+  box.dispatchEvent(enter());
+  assert.equal(box.value,'/model ','Enter 把选中项补全进输入框');
+  assert.equal(panel.hidden,true,'补全后收起面板');
+  assert.equal(b.node('sendbtn').clickCount || 0,0,'提示展开时 Enter 不触发发送');
+  box.dispatchEvent(enter());
+  assert.equal(b.node('sendbtn').clickCount,1,'面板收起后 Enter 恢复发送');
+});
+
+test('新建会话：slash 提示来自服务端扫描的项目命令目录', async () => {
+  const b=boot(async url=>{
+    if(url.startsWith('/commands?')) return response({commands:['deploy','init']});
+    return frontendFetch(url);
+  });
+  b.run('bindNewBox({cwd:"/p"})'); await flush();
+  const box=b.node('msgbox');
+  box.value='/de'; box.dispatchEvent({type:'input'});
+  assert.equal(b.node('cmdhints').hidden,false,'命中项目命令时展开提示');
+  box.dispatchEvent({type:'keydown', key:'Enter', shiftKey:false, isComposing:false, keyCode:13,
+    preventDefault(){}});
+  assert.equal(box.value,'/deploy ');
+  assert.equal(b.node('sendbtn').clickCount || 0,0);
 });
