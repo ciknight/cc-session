@@ -2109,13 +2109,29 @@ test('回弹时贴底先滚到底，阅读历史不打扰', () => {
   const b = boot(() => response({}), {matchMedia: () => mq});
   b.context.setTimeout = fn => { fn(); return 1; };
   b.run('wireConvAutoHide(document.getElementById("conv"))');
-  const conv = b.node('conv');
-  // 贴底（按隐藏时扩展后的高度判断）：回弹前先滚到底，最新消息不被发送框挡住
+  const conv = b.node('conv'), comp = b.node('convcomposer');
+  comp.offsetHeight = 170;
+  // 贴底（按隐藏时扩展后的高度判断）：回弹后顶到底，最新消息不被发送框挡住
   Object.assign(conv, {scrollHeight: 1000, scrollTop: 150, clientHeight: 900});
   conv.dispatchEvent({type:'scroll'});
-  assert.equal(conv.scrollTop, 1000, '贴底时回弹应先滚到底');
+  assert.equal(conv.scrollTop, 1000, '贴底时回弹应顶到底');
+  // 距底在将被发送框收回的区域内（~170px+余量）：同样顶到底
+  Object.assign(conv, {scrollHeight: 1050, scrollTop: 0, clientHeight: 900});
+  conv.dispatchEvent({type:'scroll'});
+  assert.equal(conv.scrollTop, 1050, '离底一个发送框高度内应顶到底');
   // 翻看历史（离底远）：回弹不打扰当前阅读位置
-  Object.assign(conv, {scrollHeight: 1000, scrollTop: 0, clientHeight: 900});
+  Object.assign(conv, {scrollHeight: 2000, scrollTop: 0, clientHeight: 900});
   conv.dispatchEvent({type:'scroll'});
   assert.equal(conv.scrollTop, 0, '阅读历史时回弹不应改变滚动位置');
+});
+
+test('回弹延时为 1500ms', () => {
+  let narrow = true;
+  const mq = {get matches(){return narrow;}, addEventListener(){}, removeEventListener(){}};
+  const b = boot(() => response({}), {matchMedia: () => mq});
+  const delays = [];
+  b.context.setTimeout = (fn, ms) => { delays.push(ms); return delays.length; };
+  b.run('wireConvAutoHide(document.getElementById("conv"))');
+  b.node('conv').dispatchEvent({type:'scroll'});
+  assert.equal(delays[0], 1500);
 });
