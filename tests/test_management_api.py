@@ -843,6 +843,43 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(result['cpu_cores'], [])
         self.assertEqual(result['uptime'], 0)
 
+    def test_power_command_platform_matrix(self):
+        with patch.object(monitor.sys, "platform", "win32"):
+            self.assertEqual(monitor.power_command("restart"), ["shutdown", "/r", "/t", "3"])
+            self.assertEqual(monitor.power_command("sleep"),
+                             ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
+        with patch.object(monitor.sys, "platform", "linux"):
+            self.assertEqual(monitor.power_command("restart"), ["systemctl", "reboot"])
+            self.assertEqual(monitor.power_command("sleep"), ["systemctl", "suspend"])
+        with self.assertRaises(ValueError):
+            monitor.power_command("halt")
+
+    def test_power_endpoint_spawns_command(self):
+        calls = []
+        commands = {"restart": ["x", "r"], "sleep": ["x", "s"]}
+        with patch.object(monitor, "power_command", lambda action: commands[action]), \
+             patch.object(monitor.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)):
+            result = json.load(self.request('/system/power', {"action": "restart"},
+                                            {"Content-Type": "application/json"}))
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls, [["x", "r"]])
+
+    def test_power_endpoint_rejects_unknown_action(self):
+        with self.assertRaises(HTTPError) as ctx:
+            self.request('/system/power', {"action": "shutdown"}, {"Content-Type": "application/json"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_power_endpoint_reports_spawn_failure(self):
+        commands = {"restart": ["x", "r"]}
+        def boom(cmd, **kw):
+            raise OSError("no such file")
+        with patch.object(monitor, "power_command", lambda action: commands[action]), \
+             patch.object(monitor.subprocess, "Popen", boom):
+            with self.assertRaises(HTTPError) as ctx:
+                self.request('/system/power', {"action": "restart"},
+                             {"Content-Type": "application/json"})
+            self.assertEqual(ctx.exception.code, 500)
+
     def test_system_endpoint_unavailable_without_psutil(self):
         with patch.object(monitor, "psutil", None):
             with self.assertRaises(HTTPError) as ctx:

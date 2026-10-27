@@ -221,6 +221,24 @@ def system_snapshot():
     }
 
 
+def power_command(action):
+    """返回平台对应的电源命令参数列表（由调用方 Popen，不等待完成）；
+    动作非法时抛 ValueError。Windows 重启带 /t 3 缓冲，让前端先收到响应。"""
+    if action == "restart":
+        if sys.platform == "win32":
+            return ["shutdown", "/r", "/t", "3"]
+        if sys.platform == "darwin":
+            return ["osascript", "-e", 'tell app "System Events" to restart']
+        return ["systemctl", "reboot"]
+    if action == "sleep":
+        if sys.platform == "win32":
+            return ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]
+        if sys.platform == "darwin":
+            return ["osascript", "-e", 'tell app "System Events" to sleep']
+        return ["systemctl", "suspend"]
+    raise ValueError("action 必须是 restart 或 sleep")
+
+
 def scan_slash_commands(claude_dir, cwd):
     """扫描文件系统上的自定义 slash 命令，返回去 / 前缀的名字列表。
 
@@ -2983,6 +3001,20 @@ def make_handler(mon, refresh_interval):
                 return self._handle_hook(u.path[len("/hook/"):])
             if not self._safe_json_write():
                 return
+            if u.path == "/system/power":
+                body = self._read_body()
+                action = body.get("action") if isinstance(body, dict) else None
+                try:
+                    cmd = power_command(action)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                try:
+                    # spawn 即返回不等待命令完成；实际重启/挂起发生在响应写出之后
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                except OSError as e:
+                    return self._json({"error": f"电源命令执行失败：{e}"}, 500)
+                return self._json({"ok": True})
             if u.path == "/cc-switch/local":
                 body = self._read_body()
                 if not isinstance(body, dict):
