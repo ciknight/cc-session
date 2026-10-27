@@ -897,6 +897,54 @@ class ManagementAPITests(unittest.TestCase):
                 self.request('/system')
             self.assertEqual(ctx.exception.code, 503)
 
+    def test_sleep_timer_set_query_and_replace(self):
+        headers = {'Content-Type': 'application/json'}
+        try:
+            result = json.load(self.request('/system/sleep-timer', {"minutes": 30}, headers))
+            self.assertTrue(result['ok'])
+            self.assertGreaterEqual(result['remaining'], 1795)
+            self.assertLessEqual(result['remaining'], 1800)
+            snapshot = json.load(self.request('/system'))
+            self.assertIsNotNone(snapshot['sleep_timer_remaining'])
+            # 重复设定替换旧定时
+            result = json.load(self.request('/system/sleep-timer', {"minutes": 15}, headers))
+            self.assertGreaterEqual(result['remaining'], 895)
+            self.assertLessEqual(result['remaining'], 900)
+        finally:
+            json.load(self.request('/system/sleep-timer', {"minutes": 0}, headers))
+
+    def test_sleep_timer_cancel_stops_timer(self):
+        headers = {'Content-Type': 'application/json'}
+        with patch.object(monitor.threading, "Timer") as timer_cls:
+            json.load(self.request('/system/sleep-timer', {"minutes": 30}, headers))
+            self.assertTrue(timer_cls.called)
+            result = json.load(self.request('/system/sleep-timer', {"minutes": 0}, headers))
+            timer_cls.return_value.cancel.assert_called()
+            self.assertIsNone(result['remaining'])
+        snapshot = json.load(self.request('/system'))
+        self.assertIsNone(snapshot['sleep_timer_remaining'])
+
+    def test_sleep_timer_rejects_invalid_minutes(self):
+        headers = {'Content-Type': 'application/json'}
+        for bad in (-5, 1000, "30", None, True, [15], 1.5):
+            with self.assertRaises(HTTPError) as ctx:
+                self.request('/system/sleep-timer', {"minutes": bad}, headers)
+            self.assertEqual(ctx.exception.code, 400, bad)
+
+    def test_sleep_timer_fire_clears_state_and_spawns_sleep(self):
+        self.mon.sleep_timer_deadline = time.time() + 60
+        with patch.object(monitor, "spawn_power") as spawn:
+            self.mon._fire_sleep_timer()
+        spawn.assert_called_once_with("sleep")
+        self.assertIsNone(self.mon.sleep_timer_deadline)
+        self.assertIsNone(self.mon.sleep_timer)
+
+    def test_sleep_timer_fire_swallows_spawn_failure(self):
+        self.mon.sleep_timer_deadline = time.time() + 60
+        with patch.object(monitor, "spawn_power", side_effect=OSError("boom")):
+            self.mon._fire_sleep_timer()   # 不应抛出
+        self.assertIsNone(self.mon.sleep_timer_deadline)
+
 
 class SSEDisconnectTests(unittest.TestCase):
     def test_client_abort_does_not_escape_handler(self):

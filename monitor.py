@@ -23,6 +23,7 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
   GET /healthz                健康检查
   GET /system                宿主机 CPU/内存利用率快照（psutil 采样，缺依赖时 503）
   POST /system/power         电源操作 {"action": "restart|sleep"}，仅前端 confirm 防误触
+  POST /system/sleep-timer   定时睡眠 {"minutes": 0-720}（0 取消，服务端计时，重启不恢复）
 
 hook 子命令（由托管进程的内联 --settings 调用，不面向用户）:
   python monitor.py hook --port <port> --token <token>
@@ -75,6 +76,7 @@ import difflib
 import hashlib
 import hmac
 import json
+import math
 import os
 import queue
 import re
@@ -239,6 +241,13 @@ def power_command(action):
             return ["osascript", "-e", 'tell app "System Events" to sleep']
         return ["systemctl", "suspend"]
     raise ValueError("action 必须是 restart 或 sleep")
+
+
+def spawn_power(action):
+    """Popen 电源命令（spawn 即返回，不等待完成）；OSError 由调用方处理。"""
+    subprocess.Popen(power_command(action), stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL,
+                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
 
 
 def scan_slash_commands(claude_dir, cwd):
@@ -520,12 +529,48 @@ class Monitor:
         self.cache_dirty = False
         self.last_cache_save = 0.0
         self.shutdown_event = threading.Event()
+        # 定时睡眠：内存态 threading.Timer，服务重启不恢复
+        self.sleep_timer_lock = threading.Lock()
+        self.sleep_timer = None
+        self.sleep_timer_deadline = None
 
     def with_metadata(self, summary):
         """仅装饰公开投影，不修改 Session/title/扫描缓存。"""
         if summary is not None:
             summary.update(self.metadata.get(summary["id"]))
         return summary
+
+    def set_sleep_timer(self, minutes):
+        """设定/替换定时睡眠（minutes 分钟后执行 sleep 动作）；0 取消。
+        返回剩余秒数，无定时时为 None。"""
+        with self.sleep_timer_lock:
+            if self.sleep_timer is not None:
+                self.sleep_timer.cancel()
+            self.sleep_timer = None
+            self.sleep_timer_deadline = None
+            if minutes:
+                self.sleep_timer_deadline = time.time() + minutes * 60
+                self.sleep_timer = threading.Timer(minutes * 60, self._fire_sleep_timer)
+                self.sleep_timer.daemon = True
+                self.sleep_timer.start()
+        return self.sleep_timer_remaining()
+
+    def sleep_timer_remaining(self):
+        """剩余秒数（向上取整），无定时时为 None。"""
+        with self.sleep_timer_lock:
+            if self.sleep_timer_deadline is None:
+                return None
+            return max(0, math.ceil(self.sleep_timer_deadline - time.time()))
+
+    def _fire_sleep_timer(self):
+        # 先清状态再执行：睡醒后查询不会看到残留定时；执行失败只记日志（Timer 线程无人接异常）
+        with self.sleep_timer_lock:
+            self.sleep_timer_deadline = None
+            self.sleep_timer = None
+        try:
+            spawn_power("sleep")
+        except (OSError, ValueError) as e:
+            print(f"[system] 定时睡眠执行失败：{e}", flush=True)
 
     def by_sid(self, sid):
         """按 session id 查找；同名取最近活跃的一个。"""
@@ -2711,11 +2756,13 @@ def make_handler(mon, refresh_interval):
                 return self._json({"ok": True, "sessions": len(mon.sessions)})
             if u.path == "/system":
                 try:
-                    return self._json(system_snapshot())
+                    data = system_snapshot()
                 except SystemInfoUnavailable as e:
                     return self._json({"error": f"系统信息不可用：{e}"}, 503)
                 except Exception as e:
                     return self._json({"error": f"系统状态采集失败：{e}"}, 500)
+                data["sleep_timer_remaining"] = mon.sleep_timer_remaining()
+                return self._json(data)
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
                 return self._json({"interactions": mon.pending_interactions(sid)})
@@ -3007,16 +3054,24 @@ def make_handler(mon, refresh_interval):
                 body = self._read_body()
                 action = body.get("action") if isinstance(body, dict) else None
                 try:
-                    cmd = power_command(action)
+                    power_command(action)   # 只为校验 action 合法性
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400)
                 try:
                     # spawn 即返回不等待命令完成；实际重启/挂起发生在响应写出之后
-                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                    spawn_power(action)
                 except OSError as e:
                     return self._json({"error": f"电源命令执行失败：{e}"}, 500)
                 return self._json({"ok": True})
+            if u.path == "/system/sleep-timer":
+                body = self._read_body()
+                raw = body.get("minutes") if isinstance(body, dict) else None
+                # bool 是 int 子类要排除；浮点只接受整数值
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                        or raw != int(raw) or not 0 <= int(raw) <= 720:
+                    return self._json({"error": "minutes 必须是 0-720 之间的整数分钟（0 为取消）"}, 400)
+                remaining = mon.set_sleep_timer(int(raw))
+                return self._json({"ok": True, "remaining": remaining})
             if u.path == "/cc-switch/local":
                 body = self._read_body()
                 if not isinstance(body, dict):

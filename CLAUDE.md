@@ -56,7 +56,9 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
    设置托管思考档位（low/medium/high/default）。
-   `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲）。
+   `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲），
+`POST /system/sleep-timer` 定时睡眠（服务端 `threading.Timer` 内存态，minutes 0-720、0 取消，
+`GET /system` 的 `sleep_timer_remaining` 随轮询返回剩余秒）。
 4. **远程发消息/托管**（`send_message` + `Hosted`）：`POST /sessions/<id>/message` 用
    `claude -p --resume` 跑一轮（异步 job，`GET /jobs/<id>` 查询）；`POST /hosted` 启动
    stream-json 双向的常驻 claude 进程，消息写 stdin、忙时排队，已托管会话的
@@ -187,4 +189,4 @@ detail 轮询的 `commands`，仅托管会话有），`<details>` 的展开状�
 或输入法。草稿、未读及搜索条件随整页刷新清空；别名/置顶/归档由独立元数据持久化。
 归档范围与原搜索/状态条件取交集后稳定按置顶分组，组内保留原顺序；详情标题软更新，不重建输入区。
 待处理页和队列摘要均不能因查看、取消或整理操作提前清除新回复提示。
-header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/睡眠经 `window.confirm` 二次确认后 POST。
+header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/睡眠经 `window.confirm` 二次确认后 POST；定时睡眠行按 `sleep_timer_remaining` 切换（未设定：预设下拉（15/30/60/120 分钟）+ 设定按钮，已设定：剩余时间 + 取消），轮询重写 innerHTML 时保留用户选中的预设值。

@@ -212,6 +212,9 @@ main:has(>#conv) .composer{flex:none;margin:10px 18px 12px;transition:transform 
 .core{font-size:10px;color:var(--mut)}
 .core .sysbar{height:4px;margin-top:2px}
 .sysacts{display:flex;gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid var(--bd)}
+.systimer{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:var(--mut)}
+.systimer select{font:inherit;font-size:12px;padding:2px 4px;background:var(--bg);color:var(--fg);
+  border:1px solid var(--bd);border-radius:6px}
 /* 移动端：抽屉式侧栏 */
 #menu{display:none}
 #mask{display:none}
@@ -2490,6 +2493,20 @@ function fmtUptime(sec){
   return d ? `${d} 天 ${h} 小时` : h ? `${h} 小时 ${m} 分` : `${m} 分钟`;
 }
 function barClass(p){ return p >= 85 ? "hot" : p >= 60 ? "warn" : ""; }
+function fmtRemain(sec){
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m >= 60 ? `${Math.floor(m / 60)} 时 ${m % 60} 分` : m ? `${m} 分 ${s} 秒` : `${s} 秒`;
+}
+// 定时睡眠行：未设定显示预设+设定按钮，已设定显示剩余时间+取消（随 3 秒轮询切换）
+function systimerHtml(data){
+  const rem = data && data.sleep_timer_remaining;
+  if(rem != null)
+    return `<div class="systimer"><span>⏱ ${fmtRemain(rem)}后睡眠</span>
+      <button class="ibtn secondary" data-sleep-cancel>取消定时</button></div>`;
+  return `<div class="systimer"><select id="sleeptimermin" aria-label="定时睡眠分钟数">
+    ${[15, 30, 60, 120].map(m => `<option value="${m}">${m} 分钟</option>`).join("")}
+    </select><button class="ibtn secondary" data-sleep-set>定时睡眠</button></div>`;
+}
 function sysPopHtml(data){
   if(!data) return '<div class="mut">加载中…</div>';
   // 错误分支也保留操作提示：如重启指令发出后轮询失败，note 不能被错误行顶掉
@@ -2508,6 +2525,7 @@ function sysPopHtml(data){
     <div class="sysbar"><i style="width:${Math.min(100, data.swap_percent || 0)}%"></i></div>` : ""}
     <div class="sysrow" style="margin-top:10px"><span>已运行 ${fmtUptime(data.uptime || 0)} · ${esc(data.hostname || "")}</span></div>
     ${sysPop.note ? `<div role="status" style="margin-top:6px">${esc(sysPop.note)}</div>` : ""}
+    ${systimerHtml(data)}
     <div class="sysacts"><button class="ibtn danger" data-power="restart">重启</button>
       <button class="ibtn danger" data-power="sleep">睡眠</button></div>`;
 }
@@ -2528,7 +2546,13 @@ function positionSysPop(){
 function renderSysPop(){
   const pop = document.getElementById("syspop");
   if(!pop || !sysPop.timer) return;
+  // 3 秒轮询会整体重写 innerHTML，先记住用户选的预设时长再恢复，避免下拉被重置
+  const prev = document.getElementById("sleeptimermin"), prevVal = prev ? prev.value : null;
   pop.innerHTML = sysPopHtml(sysData);
+  if(prevVal){
+    const sel = document.getElementById("sleeptimermin");
+    if(sel) sel.value = prevVal;
+  }
   pop.hidden = false;
   positionSysPop();
 }
@@ -2574,6 +2598,22 @@ async function sendPower(action){
   }catch(e){ sysPop.note = "执行失败：" + (e && e.message || e); }
   renderSysPop();
 }
+async function setSleepTimer(minutes){
+  // 定时可随时取消，不需要 confirm；成功后先把 remaining 写回本地数据，行立即切换、下轮轮询校正
+  try{
+    const r = await fetchT("/system/sleep-timer", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({minutes})});
+    let j = null;
+    try{ j = await r.json(); }catch(e){}
+    if(r.ok && j && j.ok){
+      sysPop.note = minutes ? `已设定定时睡眠（约 ${minutes} 分钟后）` : "已取消定时睡眠";
+      if(sysData && !sysData.error) sysData.sleep_timer_remaining = j.remaining;
+    }else{
+      sysPop.note = (j && j.error) || "执行失败";
+    }
+  }catch(e){ sysPop.note = "执行失败：" + (e && e.message || e); }
+  renderSysPop();
+}
 // 不 stopPropagation：syspop 自己的 document 级关闭 handler 已豁免 #sysbtn，
 // 放行冒泡可让队列浮层等其他 document 级浮层借这次点击正常收起
 document.getElementById("sysbtn").addEventListener("click", e => {
@@ -2581,7 +2621,15 @@ document.getElementById("sysbtn").addEventListener("click", e => {
 });
 document.getElementById("syspop").addEventListener("click", e => {
   const btn = e.target.closest && e.target.closest("[data-power]");
-  if(btn){ e.preventDefault(); sendPower(btn.dataset.power); }
+  if(btn){ e.preventDefault(); sendPower(btn.dataset.power); return; }
+  const set = e.target.closest && e.target.closest("[data-sleep-set]");
+  if(set){
+    const sel = document.getElementById("sleeptimermin");
+    setSleepTimer(parseInt(sel && sel.value, 10) || 15);
+    return;
+  }
+  const cancel = e.target.closest && e.target.closest("[data-sleep-cancel]");
+  if(cancel) setSleepTimer(0);
 });
 document.addEventListener("click", e => {
   if(!sysPop.timer) return;
