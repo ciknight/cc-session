@@ -1056,6 +1056,11 @@ class Monitor:
                                   {"tid": sub.get("tid"), "state": "done",
                                    "type": sub.get("type"),
                                    "description": sub.get("description")})
+                # active_agents 同步收敛到仍在运行的异步条目：同步残留的 tid
+                # 不清掉会让 _set_idle 永不触发、会话永久停在 working
+                sess.active_agents.intersection_update(
+                    sub.get("tid") for sub in sess.subagents
+                    if sub.get("state") == "running" and sub.get("async"))
                 sess.last_api_error = None
                 if not sess.active_agents:
                     self._set_idle(sess)
@@ -1641,8 +1646,13 @@ class Hosted:
     def _write(self, obj):
         data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
         with self.write_lock:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
+            try:
+                self.proc.stdin.write(data)
+                self.proc.stdin.flush()
+            except ValueError as e:
+                # stop 关闭 stdin 后的并发写入抛 ValueError("write to closed file")，
+                # 归入 BrokenPipe 路径，避免逃过 _send_loop 的异常处理
+                raise BrokenPipeError(str(e)) from e
 
     def _control(self, subtype, **params):
         with self.lock:
@@ -2125,7 +2135,10 @@ class Hosted:
             if kill:
                 self.proc.terminate()
             else:
-                self.proc.stdin.close()         # 关闭 stdin = 让它做完当前一轮后正常退出
+                # 关闭 stdin = 让它做完当前一轮后正常退出；与 _write 共用
+                # write_lock，避免并发写入撞上刚关闭的管道
+                with self.write_lock:
+                    self.proc.stdin.close()
                 self.proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             self.proc.terminate()
@@ -2225,17 +2238,19 @@ class Interaction:
         self.state = "pending"
         self.resolved_at = None
         self.skip_response = False   # CLI 已取消 / 进程已退出时不再回写
+        self.lock = threading.Lock()  # resolve 的检查与置位原子化
 
     def resolve(self, behavior, scope="once", reason=None, state=None):
-        if self.state != "pending":
-            return False
-        self.behavior = behavior
-        self.scope = scope
-        self.message = reason
-        self.state = state or ("allowed" if behavior == "allow" else "denied")
-        self.resolved_at = now_ts()
-        self.event.set()
-        return True
+        with self.lock:
+            if self.state != "pending":
+                return False
+            self.behavior = behavior
+            self.scope = scope
+            self.message = reason
+            self.state = state or ("allowed" if behavior == "allow" else "denied")
+            self.resolved_at = now_ts()
+            self.event.set()
+            return True
 
     def public(self):
         return {"id": self.id, "hosted_id": self.hosted_id, "session_id": self.session_id,

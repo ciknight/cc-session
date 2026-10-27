@@ -1,11 +1,15 @@
+import io
 import json
 import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import monitor
@@ -80,6 +84,69 @@ class InteractionTests(unittest.TestCase):
         host, job = self.start_host("permission please", approval="full")
         self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
         self.assertEqual(self.mon.jobs[job]["result"], "decision:allow")
+
+    def test_write_to_closed_stdin_converts_value_error(self):
+        # stop 关闭 stdin 后并发写入会抛 ValueError("write to closed file")，
+        # 不转换就会逃过 _send_loop 的 (BrokenPipeError, OSError) 处理、线程裸死
+        host = monitor.Hosted(self.mon, str(self.root), None)
+        stream = io.BytesIO()
+        stream.close()
+        host.proc = SimpleNamespace(stdin=stream)
+        with self.assertRaises(BrokenPipeError):
+            host._write({"type": "user"})
+
+    def test_stop_closes_stdin_under_write_lock(self):
+        host = monitor.Hosted(self.mon, str(self.root), None)
+        calls = []
+        host.proc = SimpleNamespace(
+            stdin=SimpleNamespace(close=lambda: calls.append("close")),
+            wait=lambda timeout=None: calls.append("wait"),
+            terminate=lambda: calls.append("terminate"),
+            poll=lambda: None)
+        host.status = "running"
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_write_lock():
+            with host.write_lock:
+                held.set()
+                release.wait(2)
+
+        holder = threading.Thread(target=hold_write_lock)
+        holder.start()
+        self.assertTrue(held.wait(1))
+        stopped = threading.Event()
+
+        def do_stop():
+            host.stop()
+            stopped.set()
+
+        threading.Thread(target=do_stop, daemon=True).start()
+        time.sleep(0.1)
+        self.assertEqual(calls, [], "close stdin 必须等待 write_lock 释放")
+        release.set()
+        holder.join(2)
+        self.assertTrue(stopped.wait(2))
+        self.assertEqual(calls, ["close", "wait"])
+
+    def test_concurrent_resolve_allows_exactly_one_winner(self):
+        # 用户响应与超时/中断并发到达时，resolve 的检查与置位必须原子：
+        # 只有一方首次成功，另一方拿到 False
+        hosted = type("H", (), {"hid": "h1", "session_id": "s"})()
+        inter = monitor.Interaction("r1", hosted, {"tool_name": "Bash"})
+        barrier = threading.Barrier(2)
+
+        def attempt(behavior):
+            barrier.wait()
+            return inter.resolve(behavior)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(attempt, "allow"), pool.submit(attempt, "deny")]
+            results = [future.result() for future in futures]
+
+        self.assertEqual(sum(1 for r in results if r), 1)
+        winners = [behavior for behavior, r in zip(("allow", "deny"), results) if r]
+        self.assertEqual(inter.state, "allowed" if winners[0] == "allow" else "denied")
 
     def test_allow_always_requires_suggestion(self):
         host, job = self.start_host("permission please")

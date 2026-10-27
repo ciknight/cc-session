@@ -170,6 +170,45 @@ class SessionStateTests(unittest.TestCase):
                             "</task-notification>"}])
         self.assertEqual(self.sess.subagents[0]["state"], "done")
 
+    def test_interrupted_agent_active_set_cleared_at_turn_duration(self):
+        # 中断的同步 Agent 不会再有 tool_result：turn_duration 清扫条目的同时
+        # 必须收敛 active_agents，否则 _set_idle 永不触发、会话永久 working
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "scan"}}], stop_reason="tool_use")
+        for _ in range(2):
+            self.mon.handle_line(self.sess, json.dumps({
+                "type": "system", "subtype": "turn_duration", "durationMs": 1234,
+                "timestamp": self.timestamp(self.now),
+            }))
+        self.assertEqual(self.sess.subagents[0]["state"], "done")
+        self.assertEqual(self.sess.active_agents, set())
+        self.assertEqual(self.sess.state, "idle")
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "idle")
+
+    def test_async_agent_survives_turn_duration_in_active_set(self):
+        # 异步子代理跨回合运行：turn_duration 后仍留在 active_agents 保持 working，
+        # 直到 task-notification 才解除；随后回合结束可正常回到 idle
+        self.line("assistant", [{"type": "tool_use", "id": "a1", "name": "Agent",
+                                 "input": {"description": "bg"}}], stop_reason="tool_use")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "a1",
+                            "content": "launched"}],
+                  toolUseResult={"isAsync": True})
+        self.mon.handle_line(self.sess, json.dumps({
+            "type": "system", "subtype": "turn_duration", "durationMs": 1234,
+            "timestamp": self.timestamp(self.now),
+        }))
+        self.assertIn("a1", self.sess.active_agents)
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "working")
+        self.line("user", [{"type": "text", "text":
+                            "<task-notification>\n<tool-use-id>a1</tool-use-id>\n"
+                            "</task-notification>"}])
+        self.assertEqual(self.sess.active_agents, set())
+        self.mon.handle_line(self.sess, json.dumps({
+            "type": "system", "subtype": "turn_duration", "durationMs": 1234,
+            "timestamp": self.timestamp(self.now),
+        }))
+        self.assertEqual(self.sess.state, "idle")
+
     def test_stale_session_downgrades_sync_running_subagent_in_output(self):
         # 父进程异常退出会留下截断转录：tool_result/turn_duration 都不会再来。
         # 输出层把会话已停滞时的非 async 运行条目降级为 stale，累计状态不动
