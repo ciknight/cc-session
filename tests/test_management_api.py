@@ -813,7 +813,7 @@ class ManagementAPITests(unittest.TestCase):
 
     def test_system_endpoint_returns_snapshot(self):
         fake = SimpleNamespace(
-            cpu_percent=lambda interval=None, percpu=False: [11.0, 22.0] if percpu else 16.5,
+            cpu_percent=lambda interval=None, percpu=False: [11.0, 22.0] if percpu else 99.0,
             virtual_memory=lambda: SimpleNamespace(total=8 * 2**30, used=4 * 2**30,
                                                    available=4 * 2**30, percent=50.0),
             swap_memory=lambda: SimpleNamespace(total=2 * 2**30, used=2**30, percent=50.0),
@@ -821,6 +821,7 @@ class ManagementAPITests(unittest.TestCase):
         )
         with patch.object(monitor, "psutil", fake):
             result = json.load(self.request('/system'))
+        # cpu_percent 必须来自 per-core 列表的均值（非 percpu 值 99.0 不应出现）
         self.assertEqual(result['cpu_percent'], 16.5)
         self.assertEqual(result['cpu_cores'], [11.0, 22.0])
         self.assertEqual(result['mem_total'], 8 * 2**30)
@@ -828,6 +829,19 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(result['swap_total'], 2 * 2**30)
         self.assertGreaterEqual(result['uptime'], 3599)
         self.assertTrue(result['hostname'])
+
+    def test_system_endpoint_handles_edge_cases(self):
+        edge = SimpleNamespace(
+            cpu_percent=lambda interval=None, percpu=False: [],
+            virtual_memory=lambda: SimpleNamespace(total=1, used=0, available=1, percent=0.0),
+            swap_memory=lambda: SimpleNamespace(total=0, used=0, percent=0.0),
+            boot_time=lambda: time.time() + 100,
+        )
+        with patch.object(monitor, "psutil", edge):
+            result = json.load(self.request('/system'))
+        self.assertEqual(result['cpu_percent'], 0.0)
+        self.assertEqual(result['cpu_cores'], [])
+        self.assertEqual(result['uptime'], 0)
 
     def test_system_endpoint_unavailable_without_psutil(self):
         with patch.object(monitor, "psutil", None):

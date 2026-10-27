@@ -202,7 +202,7 @@ class SystemInfoUnavailable(Exception):
 
 
 def system_snapshot():
-    """采集一次系统状态。cpu_percent 阻塞约 0.3 秒采样，
+    """采集一次系统状态。cpu_percent 阻塞约 0.3 秒采样（首次调用可能更慢），
     ThreadingHTTPServer 每请求独立线程，不影响其他请求。"""
     if psutil is None:
         raise SystemInfoUnavailable("psutil 未安装")
@@ -2694,6 +2694,8 @@ def make_handler(mon, refresh_interval):
                     return self._json(system_snapshot())
                 except SystemInfoUnavailable as e:
                     return self._json({"error": f"系统信息不可用：{e}"}, 503)
+                except Exception as e:
+                    return self._json({"error": f"系统状态采集失败：{e}"}, 500)
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
                 return self._json({"interactions": mon.pending_interactions(sid)})
