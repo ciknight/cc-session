@@ -880,6 +880,17 @@ class ManagementAPITests(unittest.TestCase):
                              {"Content-Type": "application/json"})
             self.assertEqual(ctx.exception.code, 500)
 
+    def test_power_endpoint_rejects_non_dict_body(self):
+        # 非法 JSON 请求体（JSON 数组）取不到 action，走 ValueError 分支返回 400
+        with self.assertRaises(HTTPError) as ctx:
+            self.request('/system/power', ["restart"], {"Content-Type": "application/json"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_power_endpoint_requires_json_content_type(self):
+        with self.assertRaises(HTTPError) as ctx:
+            self.request('/system/power', {"action": "restart"}, {})
+        self.assertEqual(ctx.exception.code, 415)
+
     def test_system_endpoint_unavailable_without_psutil(self):
         with patch.object(monitor, "psutil", None):
             with self.assertRaises(HTTPError) as ctx:

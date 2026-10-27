@@ -41,7 +41,9 @@ CPU/内存状态与利用率，浮层底部提供重启与睡眠两个电源操�
 ### `POST /system/power`
 
 - body：`{"action": "restart" | "sleep"}`，非法值返回 400。
-- **先发 HTTP 响应 `{"ok": true}`，再触发命令**，避免连接在响应前被掐断。
+- **`subprocess.Popen` 先 spawn（不等待命令完成；Windows 重启带 `/t 3` 缓冲、rundll32
+  挂起有毫秒级延迟，实际生效在响应写出之后）再写 HTTP 响应**，spawn 抛错返回 500
+  与异常信息。
 - 平台命令（`subprocess.Popen`，不等待退出，避免睡眠阻塞 worker 线程）：
   - Windows 重启：`shutdown /r /t 3`（3 秒缓冲让前端收到响应并给出提示，
     无 UI 倒计时/取消——用户已确认采用最简方案）；
@@ -49,9 +51,9 @@ CPU/内存状态与利用率，浮层底部提供重启与睡眠两个电源操�
   - Linux 重启/睡眠：`systemctl reboot` / `systemctl suspend`；
     macOS：`osascript -e 'tell app "System Events" to restart'` /
     `osascript -e 'tell app "System Events" to sleep'`。非 Windows 平台为
-    最佳努力，Popen 抛错时返回 500 与 stderr 摘要。
-- 命令构造集中在独立函数（如 `power_command(action) -> list[str] | None`），
-    便于单测覆盖平台分支。
+    最佳努力，Popen 抛错时返回 500。
+- 命令构造集中在独立函数（如 `power_command(action) -> list[str]`，非法动作抛
+    ValueError），便于单测覆盖平台分支。
 
 ## 前端（templates/index.html）
 
@@ -66,10 +68,11 @@ CPU/内存状态与利用率，浮层底部提供重启与睡眠两个电源操�
      或不可用时隐藏）。
   3. **运行时长**：一行次要文字（如「已运行 3 天 4 小时」）。
   4. 底部操作区：重启 / 睡眠 两个按钮，次要危险色（红系描边），点击弹
-     页内确认对话框（复用 `#mask` 遮罩 + 现有对话框模式，文案明确写出
-     「将重启这台电脑」「将使这台电脑进入睡眠」），确认后 POST
+     `window.confirm` 二次确认（与归档/cc-switch 现有模式一致），确认后 POST
      `/system/power`，按钮与浮层内显示执行状态（「已发送重启指令…」）。
-- 数据获取：打开浮层时立即 `GET /system`；展开期间每 3 秒自动刷新
+- 数据获取：打开浮层时立即 `GET /system`；持续 503/失败时仍按 3 秒节奏重试
+  （本地请求代价极低）；浮层为纯点击开关，无 hover peek（header 按钮不适用
+  悬停语义）。展开期间每 3 秒自动刷新
   （`setInterval`，关闭/收起浮层即清除）；请求失败展示错误行，恢复后
   继续刷新。请求挂在进行中不叠加新请求。
 - 重启后服务中断由现有 `#err` 轮询报错机制自然提示，不做特殊处理。

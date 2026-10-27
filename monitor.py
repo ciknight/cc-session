@@ -21,6 +21,8 @@ monitor.py — 监听 Claude Code 会话的任务内容和状态
                               流式文本为 transient turn_delta）
   POST /hook/PreToolUse       AskUserQuestion 的 hook 回调（仅回环 + X-Monitor-Token）
   GET /healthz                健康检查
+  GET /system                宿主机 CPU/内存利用率快照（psutil 采样，缺依赖时 503）
+  POST /system/power         电源操作 {"action": "restart|sleep"}，仅前端 confirm 防误触
 
 hook 子命令（由托管进程的内联 --settings 调用，不面向用户）:
   python monitor.py hook --port <port> --token <token>
