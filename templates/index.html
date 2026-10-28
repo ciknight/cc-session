@@ -178,14 +178,15 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 .queue-job{padding:8px 0;border-top:1px solid var(--bd)}
 .queue-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:8em;overflow:auto}
 #queuepop h5{margin:8px 0 0;font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-/* 会话视图：聊天窗口布局——头部固定、消息区滚动、发送区沉底 */
-main:has(>#conv){display:flex;flex-direction:column;overflow:hidden;padding:0}
+/* 会话视图：聊天窗口布局——头部固定、消息区滚动、发送区沉底。
+   convview 由 renderMain 在进入/离开会话视图时显式切换，不依赖 :has()（旧引擎也能布局） */
+main.convview{display:flex;flex-direction:column;overflow:hidden;padding:0}
 .conv-top{flex:none;padding:10px 18px 4px;border-bottom:1px solid var(--bd)}
 .conv-head{display:flex;align-items:center;gap:8px}
 .conv-head h2{font-size:16px;margin:8px 0 4px;flex:1;min-width:0;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 #conv{flex:1;min-height:0;overflow-y:auto;padding:6px 18px}
-main:has(>#conv) .composer{flex:none;margin:10px 18px 12px;transition:transform .25s ease}
+main.convview .composer{flex:none;margin:10px 18px 12px}
 .load-earlier{display:block;width:fit-content;max-width:100%;margin:0 auto 10px;padding:4px 18px;
   border:1px dashed var(--bd);border-radius:999px;background:var(--card);color:var(--mut);
   font:inherit;font-size:13px;cursor:pointer}
@@ -227,11 +228,7 @@ main:has(>#conv) .composer{flex:none;margin:10px 18px 12px;transition:transform 
   .conv-cwd{display:none}
   .conv-head h2{font-size:14px;margin:4px 0}
   #conv{padding:4px 10px 12px}
-  main:has(>#conv) .composer{margin:8px 10px}
-  /* 滚动隐藏：发送框脱离文档流滑出，#conv 即时占满释放的空间，多显示消息文字 */
-  main:has(>#conv){position:relative}
-  main:has(>#conv) .composer.conv-hide{position:absolute;left:10px;right:10px;bottom:8px;margin:0;
-    transform:translateY(calc(100% + 12px))}
+  main.convview .composer{margin:8px 10px}
   .composer-cog{display:inline-block}
   .composer-extra{display:none}
   .composer.open .composer-extra{display:flex;position:absolute;right:0;bottom:calc(100% + 6px);
@@ -1488,41 +1485,6 @@ function scrollConvBottom(){
   const c = document.getElementById("conv");
   if(c) c.scrollTop = c.scrollHeight;
 }
-// 移动端（≤768px）会话页发送框：滚动时滑出，停止约 400ms 或 scrollend 回弹；
-// 桌面端常驻不隐藏。隐藏走纯 transform，不改布局，消息文字不动。
-const convHideMq = typeof window !== "undefined" && window.matchMedia
-  ? window.matchMedia("(max-width:768px)") : null;
-let convHideTimer = null;
-function setConvComposerHidden(hidden){
-  const el = document.getElementById("convcomposer");
-  if(!el) return;
-  el.classList[hidden ? "add" : "remove"]("conv-hide");
-}
-function convScrollStopped(){
-  if(convHideTimer){ clearTimeout(convHideTimer); convHideTimer = null; }
-  const conv = document.getElementById("conv");
-  const comp = document.getElementById("convcomposer");
-  // 回弹会把这段高度还给发送框；离底这么近的内容回弹后必然被挡，直接顶到底
-  const cover = (comp && comp.offsetHeight || 180) + 40;
-  const nearBottom = conv && conv.scrollHeight - conv.scrollTop - conv.clientHeight < cover;
-  setConvComposerHidden(false);
-  if(nearBottom && conv) conv.scrollTop = conv.scrollHeight;   // 回弹后同步顶到底
-}
-function wireConvAutoHide(convEl){
-  if(!convEl) return;
-  convEl.addEventListener("scroll", () => {
-    if(!convHideMq || !convHideMq.matches) return;   // 桌面端不隐藏
-    setConvComposerHidden(true);
-    if(convHideTimer) clearTimeout(convHideTimer);
-    // 惯性滚动期间 scroll 持续触发、定时器不断重置，回弹自然等到停下
-    convHideTimer = setTimeout(() => { convHideTimer = null; convScrollStopped(); }, 1500);
-  }, {passive:true});
-  convEl.addEventListener("scrollend", convScrollStopped);
-}
-if(convHideMq && convHideMq.addEventListener){
-  // 视口变宽离开移动断点：立即恢复常驻并取消挂起的回弹
-  convHideMq.addEventListener("change", e => { if(!e.matches) convScrollStopped(); });
-}
 // 会话消息组的 DOM 缓存：签名未变的组复用原节点，markdown/DOMPurify 只跑新组
 let convDom = {id: null, nodes: new Map(), echo: null};
 const convLoadEarlierHtml = '<button class="load-earlier" id="loadearlier">加载更早</button>';
@@ -1643,21 +1605,37 @@ async function renderConversation(id, force){
                     && document.getElementById("conv"));
     if(isNew || force || convState.id !== id){
       const requestEnd = turnEndHighWater.get(id) || 0;
-      const [dRes, mRes] = await Promise.all([
-        fetch("/sessions/" + encodeURIComponent(id)),
-        fetch(`/sessions/${encodeURIComponent(id)}/messages?limit=100`),
-      ]);
-      const d = await dRes.json(), m = await mRes.json();
-      if(!dRes.ok || !mRes.ok || m.error) return;
+      // 直链进入时 main 还是空白：详情就绪前先给出反馈，避免"什么都不显示"
+      if(isNew && !main.innerHTML) main.innerHTML = '<div class="empty">加载中…</div>';
+      // 详情与消息同时发起、分开等待（均带超时）：消息失败不能拖垮整个会话页，下一轮刷新自动重试
+      const dReq = fetchT("/sessions/" + encodeURIComponent(id));
+      const mReq = fetchT(`/sessions/${encodeURIComponent(id)}/messages?limit=100`);
+      mReq.catch(() => {});   // 详情侧提前返回时消息请求不得变成未处理拒绝
+      const dRes = await dReq;
+      const d = await dRes.json();
       if(!current()) return;   // 已切换走
+      if(!dRes.ok){
+        if(isNew) main.innerHTML = `<div class="empty">会话详情加载失败（HTTP ${dRes.status}），稍候自动重试…</div>`;
+        return;
+      }
       if(d.error){   // 转录尚未被轮询发现（常见于刚创建的会话）
         if(isNew) main.innerHTML = '<div class="empty">会话转录尚未就绪，稍候自动刷新…</div>';
         return;
       }
-      convState = {id, msgs: (m.messages || []).slice(),
-                   total: m.total || 0, cursor: m.end || 0,
-                   start: m.start || 0, size: m.size || 0,
-                   hasMore: !!m.has_more, loadingEarlier: false};
+      let m = null, mErr = "";
+      try{
+        const mRes = await mReq;
+        m = await mRes.json();
+        if(!mRes.ok || m.error) mErr = (m && m.error) || `HTTP ${mRes.status}`;
+      }catch(e){ mErr = e.message || String(e); }   // 超时/断网：报给用户，等下一轮重试
+      if(!current()) return;
+      // 刷新拉取失败但已有渲染内容：保留现有消息，只更新头部/审批，不打扰阅读
+      const keepOld = mErr && convState.id === id && convState.msgs.length > 0;
+      if(!keepOld)
+        convState = {id: mErr ? null : id, msgs: (m && m.messages || []).slice(),
+                     total: (m && m.total) || 0, cursor: (m && m.end) || 0,
+                     start: (m && m.start) || 0, size: (m && m.size) || 0,
+                     hasMore: !!(m && m.has_more), loadingEarlier: false};
       if(isNew){
         main.innerHTML = `
           <div class="conv-top">
@@ -1680,7 +1658,6 @@ async function renderConversation(id, force){
         };
         // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
         bindSendBox(id, d);
-        wireConvAutoHide(document.getElementById("conv"));
         curPanel = {type: "conv", key: id};
         bindModel(id, d.selected_model);
         loadModelOptions(id, d.cwd);
@@ -1694,8 +1671,13 @@ async function renderConversation(id, force){
       loadQueue(id);
       renderInteractions(d.interactions || []);
       updateHostedControls(d);
+      if(keepOld) return;   // 已渲染的消息原样保留
       clearLiveBubble();
       renderConvList();
+      if(mErr){   // 消息没取到：框架已在，把失败原因摆在消息区里，而不是整页空白
+        const convEl = document.getElementById("conv");
+        if(convEl) convEl.innerHTML = `<div class="empty">消息加载失败：${esc(mErr)}，稍候自动重试…</div>`;
+      }
       if(isNew){
         updateSendSt(id);   // 恢复进行中任务的状态显示（需先设 curPanel，面板守卫才放行）
         scrollConvBottom();   // 聊天窗口：进入时停在最新消息
@@ -1705,7 +1687,7 @@ async function renderConversation(id, force){
     }
 
     // 同面板刷新：只更新数据区域，不重建输入区
-    const dRes = await fetch("/sessions/" + encodeURIComponent(id));
+    const dRes = await fetchT("/sessions/" + encodeURIComponent(id));
     const d = await dRes.json();
     if(!current()) return;
     if(!dRes.ok || d.error) return;
@@ -1715,14 +1697,14 @@ async function renderConversation(id, force){
     updateHostedControls(d);
     updateSendSt(id);
     let requestEnd = turnEndHighWater.get(id) || 0;
-    const mRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages` +
+    const mRes = await fetchT(`/sessions/${encodeURIComponent(id)}/messages` +
       `?from=${convState.cursor}&limit=500`);
     const m = await mRes.json();
     if(!mRes.ok || m.error || !current()) return;
     if(convState.id !== id || m.size < convState.size || m.total < convState.total){
       // 文件被截断/替换：重新取最近一页
       requestEnd = turnEndHighWater.get(id) || 0;
-      const freshRes = await fetch(`/sessions/${encodeURIComponent(id)}/messages?limit=100`);
+      const freshRes = await fetchT(`/sessions/${encodeURIComponent(id)}/messages?limit=100`);
       const fresh = await freshRes.json();
       if(!freshRes.ok || fresh.error || !current()) return;
       convState = {id, msgs: (fresh.messages || []).slice(),
@@ -1748,7 +1730,10 @@ async function renderConversation(id, force){
       convState.size = m.size;
     }
     confirmDisplayedMessages(id, requestEnd);
-  }catch(e){ /* 下次刷新重试 */ }
+  }catch(e){
+    // 渲染链路异常不能静默吞掉：至少留下控制台线索，页面在下一轮刷新重试
+    if(typeof console !== "undefined" && console.error) console.error("会话视图渲染失败:", e);
+  }
   finally{ if(convLoading === request) convLoading = null; }
 }
 
@@ -2342,6 +2327,10 @@ function renderHostedBadge(){
   el.textContent = "托管 " + total;
 }
 function renderMain(){
+  // 会话视图的聊天窗口布局类：显式切换，替代 main:has(>#conv)（旧引擎也可靠生效）
+  const mainEl = document.getElementById("main");
+  if(mainEl && mainEl.classList && mainEl.classList.toggle)
+    mainEl.classList.toggle("convview", !!(view.session && !view.pending && !view.hosted));
   const projects = groupByProject();
   resolveViewProject(projects);
   renderSidebar(projects);
@@ -2380,7 +2369,7 @@ async function load(){
   lastListLoad = Date.now();
   const version = sessionsVersion;
   try{
-    const r = await fetch("/sessions");
+    const r = await fetchT("/sessions");
     const next = await r.json();
     if(version !== sessionsVersion) return;   // 请求期间已有 SSE 快照，旧 HTTP 列表不能覆盖它。
     if(!r.ok) throw Error("HTTP " + r.status);

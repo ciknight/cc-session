@@ -166,6 +166,29 @@ test('运行/排队中仍可发送，只有提交中的防重复点击会禁用'
   b.run('updateSendSt("new:/project")');
   assert.equal(b.node('sendbtn').disabled, true);
 });
+test('消息接口失败时会话框架仍渲染并提示重试，恢复后自动补齐', async () => {
+  let failMessages = true;
+  const b = boot(async url => {
+    if (url === '/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',selected_model:null,
+      tokens:{},tool_uses:{},user_msgs:0,assistant_msgs:0,subagents:[],tasks:[]});
+    if (url.startsWith('/sessions/sid/messages')){
+      if (failMessages) return {ok:false,status:502,json:async()=>({error:'bad gateway'})};
+      return response({size:10,total:1,end:1,start:0,has_more:false,
+        messages:[{role:'user',ts:1,parts:[{type:'text',text:'hi'}]}]});
+    }
+    throw Error('unexpected fetch ' + url);
+  });
+  b.run('view={project:"/project",session:"sid",new:false}; renderConversation("sid",true)');
+  for(let i=0;i<30;i++) await Promise.resolve();
+  // 框架（头部/发送框）不受消息失败影响，消息区内联报错并承诺自动重试
+  assert.match(b.node('main').innerHTML, /conv-top/);
+  assert.match(b.node('conv').innerHTML, /消息加载失败/);
+  // 下一轮刷新自动重试成功后消息补齐
+  failMessages = false;
+  b.run('renderConversation("sid",false)');
+  for(let i=0;i<30;i++) await Promise.resolve();
+  assert.match(b.node('conv').innerHTML, /hi/);
+});
 test('项目会话列表保留 local 配置，对话详情不显示或绑定 local 控件', async () => {
   const list=boot();
   list.run('renderSessionList({cwd:"/project",sessions:[],out:0})');
@@ -2081,57 +2104,36 @@ test('新建会话：slash 提示来自服务端扫描的项目命令目录', as
   assert.equal(b.node('sendbtn').clickCount || 0,0);
 });
 
-test('移动端会话页滚动隐藏发送框，停止后回弹；桌面端不隐藏', () => {
-  let narrow = true;
-  const mq = {get matches(){return narrow;}, addEventListener(){}, removeEventListener(){}};
-  const b = boot(() => response({}), {matchMedia: () => mq});
-  const timers = [];
-  b.context.setTimeout = (fn, ms) => { timers.push(fn); return timers.length; };
-  b.run('wireConvAutoHide(document.getElementById("conv"))');
-  const conv = b.node('conv'), comp = b.node('convcomposer');
-  conv.dispatchEvent({type:'scroll'});
-  assert.equal(comp.classList.contains('conv-hide'), true, '移动端滚动时发送框隐藏');
-  assert.ok(timers.length >= 1, '滚动应安排回弹定时器');
-  timers[timers.length - 1]();
-  assert.equal(comp.classList.contains('conv-hide'), false, '滚动停止后回弹');
-  conv.dispatchEvent({type:'scroll'});
-  assert.equal(comp.classList.contains('conv-hide'), true);
-  conv.dispatchEvent({type:'scrollend'});
-  assert.equal(comp.classList.contains('conv-hide'), false, 'scrollend 立即回弹');
-  narrow = false;
-  conv.dispatchEvent({type:'scroll'});
-  assert.equal(comp.classList.contains('conv-hide'), false, '桌面端滚动不隐藏');
+test('发送框自动隐藏的样式与事件逻辑已移除', () => {
+  assert.doesNotMatch(html, /conv-hide|wireConvAutoHide|convHideTimer|convIsIOS/);
+  assert.match(html, /main\.convview \.composer\{flex:none;margin:10px 18px 12px\}/);
 });
 
-test('回弹时贴底先滚到底，阅读历史不打扰', () => {
-  let narrow = true;
-  const mq = {get matches(){return narrow;}, addEventListener(){}, removeEventListener(){}};
-  const b = boot(() => response({}), {matchMedia: () => mq});
-  b.context.setTimeout = fn => { fn(); return 1; };
-  b.run('wireConvAutoHide(document.getElementById("conv"))');
-  const conv = b.node('conv'), comp = b.node('convcomposer');
-  comp.offsetHeight = 170;
-  // 贴底（按隐藏时扩展后的高度判断）：回弹后顶到底，最新消息不被发送框挡住
-  Object.assign(conv, {scrollHeight: 1000, scrollTop: 150, clientHeight: 900});
-  conv.dispatchEvent({type:'scroll'});
-  assert.equal(conv.scrollTop, 1000, '贴底时回弹应顶到底');
-  // 距底在将被发送框收回的区域内（~170px+余量）：同样顶到底
-  Object.assign(conv, {scrollHeight: 1050, scrollTop: 0, clientHeight: 900});
-  conv.dispatchEvent({type:'scroll'});
-  assert.equal(conv.scrollTop, 1050, '离底一个发送框高度内应顶到底');
-  // 翻看历史（离底远）：回弹不打扰当前阅读位置
-  Object.assign(conv, {scrollHeight: 2000, scrollTop: 0, clientHeight: 900});
-  conv.dispatchEvent({type:'scroll'});
-  assert.equal(conv.scrollTop, 0, '阅读历史时回弹不应改变滚动位置');
-});
-
-test('回弹延时为 1500ms', () => {
-  let narrow = true;
-  const mq = {get matches(){return narrow;}, addEventListener(){}, removeEventListener(){}};
-  const b = boot(() => response({}), {matchMedia: () => mq});
-  const delays = [];
-  b.context.setTimeout = (fn, ms) => { delays.push(ms); return delays.length; };
-  b.run('wireConvAutoHide(document.getElementById("conv"))');
-  b.node('conv').dispatchEvent({type:'scroll'});
-  assert.equal(delays[0], 1500);
-});
+for(const [device, narrow, navigator] of [
+  ['移动端', true, {userAgent:'Android'}],
+  ['iPhone', true, {userAgent:'iPhone'}],
+  ['iPad', true, {platform:'MacIntel',maxTouchPoints:5}],
+  ['桌面端', false, {}],
+]){
+  test(`${device}会话页滚动时发送框常驻，不安排回弹或改变阅读位置`, async () => {
+    const b = boot(async url => {
+      if(url === '/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',
+        tokens:{},tool_uses:{},subagents:[],tasks:[]});
+      if(url.startsWith('/sessions/sid/messages')) return response({messages:[],total:0,end:0,size:0});
+      return response({});
+    }, {matchMedia:() => ({matches:narrow,addEventListener(){}}), navigator});
+    await b.run('view={project:"/project",session:"sid",new:false}; renderConversation("sid",true)');
+    assert.match(b.node('main').innerHTML, /conv-top/);
+    const timers = [];
+    b.context.setTimeout = (fn, ms) => { timers.push(fn); return timers.length; };
+    const conv = b.node('conv'), comp = b.node('convcomposer');
+    for(const scrollTop of [0, 150]){
+      Object.assign(conv, {scrollHeight:1000,scrollTop,clientHeight:800});
+      conv.dispatchEvent({type:'scroll'});
+      assert.equal(comp.classList.contains('conv-hide'), false, '滚动时不隐藏发送框');
+      conv.dispatchEvent({type:'scrollend'});
+      assert.equal(conv.scrollTop, scrollTop, '滚动停止不强制顶底');
+    }
+    assert.equal(timers.length, 0, '滚动不安排回弹定时器');
+  });
+}
