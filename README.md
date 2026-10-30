@@ -1,155 +1,229 @@
-# claude-sessions 监控
+<div align="center">
 
-监控 Claude Code 会话任务内容和状态的 Web 服务。轮询 `~/.claude/projects/<项目>/<sessionId>.jsonl`
-转录文件，实时解析会话状态，提供 JSON API、SSE 事件流和网页看板。
+# Claude Sessions
 
-## 快速开始
+**Mission control for your Claude Code sessions.**
 
-```bash
-uv run monitor.py                    # 启动服务（默认 http://0.0.0.0:8765）
-uv run monitor.py --port 9000 --stale 600
-uv run monitor.py --webhook http://localhost:3000/hook
-```
+Monitor every project, understand what Claude is doing, respond to approvals, and keep conversations moving—from one real-time web dashboard.
 
-依赖管理使用 [uv](https://docs.astral.sh/uv/)：`uv add <pkg>` 添加依赖，改完 `pyproject.toml` 后执行 `uv lock`。
-唯一第三方依赖是 Jinja2，其余均为 Python 标准库。
+[Documentation](https://ciknight.github.io/cc-session/) · [English](README.md) · [简体中文](README.zh-CN.md)
 
-可用 `CLAUDE_CONFIG_DIR` 环境变量指向其他 Claude 配置目录做测试：
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Managed with uv](https://img.shields.io/badge/managed%20with-uv-6C4CF1)](https://docs.astral.sh/uv/)
+[![MIT license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](#contributing)
 
-```bash
-CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py
-```
+</div>
 
-## 命令行参数
+## Why Claude Sessions?
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--host` | `0.0.0.0` | 监听地址 |
-| `--port` | `8765` | 监听端口 |
-| `--interval` | `1.0` | 轮询间隔（秒） |
-| `--refresh` | `3.0` | 网页自动刷新间隔（秒） |
-| `--stale` | `300` | 多少秒无更新视为 stale |
-| `--webhook` | 无 | 把每个事件 POST 到该 URL |
-| `--claude-bin` | `claude` | Claude Code CLI 路径 |
-| `--claude-args` | 空 | 透传给每个 Claude 子进程的参数，例如 `--model sonnet` |
-| `--msg-timeout` | `600` | 一次性消息执行超时（秒） |
-| `--scan-subagents` | 关闭 | 启动时扫描子代理转录；默认懒加载，仅在 `?include_subagents=1` 或请求子代理 id 时读取 |
+Claude Code is great at running tasks. Once several sessions are active, keeping track of them becomes the hard part: Which one is still working? Which one needs approval? What did that agent finish? Where did that long conversation go?
 
-## 网页模型与项目配置
+**Claude Sessions puts those answers in one place.** It watches your existing Claude Code transcripts, turns them into a live multi-project dashboard, and lets you continue or host conversations directly from your browser.
 
-- 会话详情中的“模型选择”按 session ID 保存。选项包含默认和自定义模型 ID，以及仅从当前会话（新建时为目标项目）`cwd/.claude/settings.local.json` 的 `env` 中读取的 `OPUS_MODEL`、`SONNET_MODEL`、`HAIKU_MODEL`、`FABLE_MODEL` 对应值；各字段缺失时兼容 `ANTHROPIC_DEFAULT_<系列>_MODEL`。选项显示“系列: 模型 ID”；不读取其他 profile 或全局配置，不将通用 `env.ANTHROPIC_MODEL` 或顶层 `model` 当作系列模型。local 文件不存在、损坏或无有效系列字段时，仅保留默认和自定义选项。普通（非托管）会话将模型 ID 作为后续消息的 `--model` 参数；托管会话在轮次边界通过 `set_model` 切换。只保存和发送模型 ID，不应用 profile 的 local 配置，也不控制其他终端里的进程。
-- local 配置解析只向前端提供模型选项的 `name` 和 `model` 字段；配置正文和 credentials 不传到前端。“最近响应”来自会话转录，表示最后一次实际记录的模型，与下一条消息的选择分开显示。显式 Web 选择优先于服务级 `--claude-args` 中的 `--model`；清除 Web 选择后恢复服务配置/Claude 默认规则。
-- 托管会话在轮次边界通过 stream-json `set_model` 控制请求切换。控制失败或超时后不会把消息悄悄发给旧模型，托管进程需要退出并重新托管。
-- cc-switch local 配置控件仅在项目会话列表展示（会话详情和新建会话页不显示），且仅在已安装并可通过 PATH 找到 `cc-switch` 时启用。使用 cc-switch 的 `local <profile>` 命令写入显示的准确目录下 `.claude/settings.local.json`；服务端仅列出 profile 文件名供配置切换，模型选项则读取当前目录 local 配置，不会把配置正文或 credentials 传到前端。
-- cc-switch local 会整体覆盖目标文件，不合并原文件；应用前需确认，原文件会先备份到当前 Claude 配置目录下 `claude-sessions/backups/`。应用失败时保留备份，刷新检查磁盘状态后可人工恢复。配置目录不是默认 `~/.claude` 时会禁用切换，因为 cc-switch 不支持 `CLAUDE_CONFIG_DIR`。
-- cc-switch 调用失败时，服务终端会输出 `[cc-switch]` 安全诊断（失败阶段、退出码、系统错误号和可识别的原因类别）；浏览器也会提示非零退出码。CLI 原始输出和异常原文可能包含凭据，默认不记录、不返回。
-- local 是目录级配置，同目录的其他会话也会受到后续启动影响。已有托管进程不会自动重启；应用后需退出托管并重新托管才能加载。会话模型选择、服务环境变量仍可能覆盖 profile 的模型设置。
-- 会话详情和新建会话共用同一个输入对话框：Enter 发送，Shift+Enter 换行；输入法 composition 期间按 Enter 不会发送。
-- 主版服务默认监听 `0.0.0.0` 且没有身份认证。只能在可信网络使用；模型/配置接口不是凭据管理接口。不要将服务暴露给不可信网络。
+- **See everything at a glance** — sessions grouped by project, with working, idle, and stale states.
+- **Know what is happening** — inspect messages, tool calls, diffs, tasks, subagents, models, Git branches, and token usage.
+- **Keep work moving** — send follow-ups, queue messages while Claude is busy, interrupt a turn, or start a new session.
+- **Stay in control** — handle permission requests and `AskUserQuestion` prompts in the browser.
+- **Use it anywhere on your trusted network** — a responsive interface works on desktop and mobile, with live updates over SSE.
+- **Build on top of it** — consume the JSON API, SSE event stream, or optional webhooks in your own tools.
 
-## 多会话操作
+## Highlights
 
-- **独立草稿**：每个会话和每个项目的新建页分别保存输入内容，切换页面后可以继续编辑。发送被服务端接受后只清除该次提交的草稿，不清除等待期间新写的内容或其他会话的输入；发送失败保留草稿。新建会话自动进入对话时，会携带尚未发送的新草稿，不覆盖目标会话已有的非空草稿。
-- **新回复提示**：页面观察到主回合结束时间推进后，未查看的会话显示“新回复”，项目侧栏汇总未读会话数。首次加载的历史完成不标记；对应回合的消息成功加载展示且页面可见后清除。旧回复仍在页面上、消息加载失败或新消息尚未加载完整时，不会提前清除提示。提示不表示任务成功，也不表示后台子代理全部结束；仅有旧格式 `end_turn`、没有回合结束时间的转录不保证提示。
-- **项目内搜索与筛选**：在会话列表搜索别名、原始标题、项目/工作目录、分支、最近响应模型、首条及最近用户输入等已有会话信息；支持全部、工作中、托管中、待审批、新回复筛选，并可选择未归档、已归档或全部范围。条件同时生效，置顶项在前、各组内保留原排序，不改变项目总计；这不是完整对话的全文检索。
-- **全局待处理**：顶部待审批入口和侧栏入口打开 `/pending`，按项目汇总待审批会话及请求数量，包含已归档会话，不受项目搜索条件影响。点击进入原会话处理权限、计划或问答，不提供批量批准。
-- **别名、置顶与归档**：别名可保存或清除，原始标题保留；置顶和归档独立。默认列表隐藏已归档会话，但项目入口、会话直链和恢复操作仍可用。归档不会停止任务、清空队列或删除转录。
-- 整理元数据按 session ID 原子保存在 `CLAUDE_DIR/claude-sessions/session-metadata.json`，服务重启后保留；版本字段防止旧响应覆盖新设置。文件损坏时拒绝覆盖，应先修复或移走该文件。草稿、新回复状态及各项目的搜索条件仍仅保存在当前页面内存中，整页刷新或关闭页面后清除。
-
-## 托管、审批与发送
-
-- 托管会话的审批模式默认为 `auto`（交给 CLI 权限模式）。已有明确保存过 `ask`/`full` 的会话继续使用保存值；可在会话详情切换“询问”或“全部允许”。
-- 会话处于 `working` 时网页仍可发送消息：已托管会话进入常驻进程队列；非托管会话的“工作状态下也发送”默认勾选，会用 `force` 绕过 working 检查。非托管会话的一次性消息也会按会话排队（上限 32 条），上一条结束后自动执行下一条。
-- 新建会话的“托管”模式也会读取对话框里的审批选择，并作为首轮 `/hosted` 的 `approval` 提交。
-- 会话详情的发送队列展示执行项、FIFO 等待项及最近结束项，文本为摘要，模型为提交时的请求选择；“默认”不代表已确认的实际响应模型。
-- 只有仍在等待队列中的消息可单条取消。任务已被领取（包括正在切换模型）时不能取消，界面会提示并刷新；单条取消不会中断当前回合或影响其他等待项。
-- 中断按钮只对托管且正在执行的会话启用；排队中的消息会随中断一起取消。它与“取消单条等待项”是不同操作。
-- 队列和任务历史仅保存在服务进程内，不跨重启恢复。活动任务全部保留，全局最多保留最近 100 个终态任务，每个会话最多展示其中 20 条；提交时间不等于实际执行开始时间。状态查询失败不代表任务执行失败，队列以重新查询后的服务端状态为准。
-
-## 接口
-
-| 接口 | 说明 |
+| Capability | What you get |
 | --- | --- |
-| `GET /`、`GET /p/...` | 网页看板：左侧项目列表，右侧会话列表/对话视图，自动刷新可开关；`/p/<项目>`、`/p/<项目>/s/<会话>`、`/p/<项目>/new` 支持直接访问与浏览器前进后退 |
-| `GET /sessions` | 所有会话概览（`?full=1` 时含任务、子代理、最近事件等完整信息；`?include_subagents=1` 触发子代理懒加载） |
-| `GET /sessions/<id>` | 按 id 取单个会话完整信息 |
-| `GET /sessions/<id>/messages` | 按需解析该会话的完整对话（带缓存，跳过 sidechain 子代理对话） |
-| `GET /pending` | 全局待处理会话页面，支持直接访问与浏览器前进后退 |
-| `POST /sessions/<id>/metadata` | 局部保存 `alias`（字符串或 null）、`pinned`、`archived`（布尔）；返回完整整理字段与 `metadata_revision`，子代理只读 |
-| `GET /sessions/<id>/jobs` | 返回 `running`、`queued`、`recent` 队列快照，条目含 `cancellable` 和 FIFO `position` |
-| `POST /sessions/<id>/jobs/<job_id>/cancel` | JSON `{}`；仅取消真实等待项，成功或重复取消 200，已领取或其他终态 409，未知或跨会话 404 |
-| `GET /static/<file>` | 前端静态资源（marked / DOMPurify） |
-| `GET /events` | SSE 实时事件流（`?session=<id>` 可过滤） |
-| `GET /healthz` | 健康检查 |
-| `POST /sessions/<id>/model` | 保存会话 Web 模型选择：`{"model":"sonnet"}`；传 `null` 清除覆盖 |
-| `GET /cc-switch?cwd=<目录>` | 获取该已监控目录的 cc-switch 可用状态、profile 名称、仅含 `name`/`model` 的安全模型选项及目标文件摘要 |
-| `POST /cc-switch/local` | 确认后备份并调用已安装 cc-switch：`{"cwd":"<目录>","profile":"<名称>","confirm":true,"revision":"<摘要>"}` |
+| **Live session dashboard** | Automatic discovery, incremental updates, project grouping, search, filters, unread replies, pinning, aliases, and archiving. |
+| **Rich conversation view** | Markdown responses, user messages, tool results, diffs, task lists, and subagent activity in a readable chat interface. |
+| **Persistent hosted sessions** | A long-running `stream-json` Claude process with streaming text, queued follow-ups, model selection, effort controls, and interruption. |
+| **Flexible approvals** | Choose browser-based approval, Claude CLI permission handling, or automatic approval per hosted session. |
+| **Fast on large histories** | Incremental JSONL parsing, persistent scan caching, lazy subagent loading, and paginated message windows. |
+| **Self-contained frontend** | Local frontend assets with no external CDN required; the backend uses Python, Jinja2, and psutil. |
+| **System panel** | Host CPU and memory visibility, plus optional sleep, timed sleep, and restart controls. |
+| **cc-switch integration** | Optional project-local profile switching when `cc-switch` is installed, with confirmation and backups. |
 
-现有 `POST /sessions/<id>/message`、`POST /new`、`POST /hosted` 可选接受 `model` 字符串或 `null`。省略时使用该会话已保存的 Web 选择；新会话创建时通过该字段指定首轮模型。任务响应中的 `requested_model` 是本次提交的选择，不能当作服务端确认的实际响应模型。
+## Quick start
 
-## 会话信息
+### Prerequisites
 
-每个会话展示的信息均解析自转录文件：
+- Python **3.9+**
+- [uv](https://docs.astral.sh/uv/)
+- [Claude Code](https://code.claude.com/) installed and configured if you want to send messages or host sessions
 
-- 标题（ai-title）、项目目录（cwd）、git 分支、模型、Claude 版本
-- 首/末事件时间（时长）、用户/助手消息数
-- token 用量（input / output / cache）
-- 工具调用统计、子代理（Agent 工具）列表
-- 任务清单（TaskCreate / TaskUpdate 或 `~/.claude/tasks/<sid>` 目录）
+Monitoring existing transcripts does not start Claude or consume model tokens. Remote messaging and hosted sessions use your normal Claude Code configuration.
 
-会话状态：
+### Run it
 
-- `working` — 最近有活动，且最后一个事件不是"助手完成回复"；Agent 工具调用在收到与其 tool-use ID 匹配的 `tool_result` 前均视为活动，因此主助手轮次结束后仍可能处于 working。
-- `idle` — 助手已完成回复（`stop_reason=end_turn`），等待用户输入，且没有未完成的 Agent 工具调用。
-- `stale` — 超过 `--stale` 秒没有任何更新（动态计算，不存状态）；即使仍有未完成的 Agent 工具调用，若活动事件超过 stale 阈值，状态也为 stale。
+```bash
+git clone https://github.com/ciknight/cc-session.git
+cd cc-session
 
-会话详情中的子代理记录按最新优先展示。
+# Recommended for local-only use
+uv run monitor.py --host 127.0.0.1
+```
 
-## 架构
+Open **http://127.0.0.1:8765**. Existing Claude Code sessions are discovered automatically.
 
-服务入口 `monitor.py` + 扫描缓存模块 `scan_cache.py` + 会话偏好模块 `session_preferences.py` + 已安装 cc-switch 适配层 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地前端依赖 `static/marked.min.js`、`static/purify.min.js`（不依赖外网 CDN）。
+To make the dashboard available on a trusted private network, use the default host or set one explicitly:
 
-### 数据流
+```bash
+uv run monitor.py --host 0.0.0.0 --port 8765
+```
 
-1. **轮询线程**（`Monitor.run` → `scan_once`）：按 `--interval` 秒扫描 `CLAUDE_DIR/projects/*/*.jsonl`，
-   每个 `Session` 维护文件 offset 增量读取，半行留在 buffer 下次拼接。子代理转录默认不扫描；
-   `?include_subagents=1` 或请求 `<parent>::agent-*` 时按需加载（`scan_subagents_once`/`ensure_subagent`）。
-2. **扫描缓存**（`scan_cache.py`）：每个转录的 offset、末尾 4 KiB 校验值和累计状态保存在
-   `CLAUDE_DIR/claude-sessions/scan-cache.json`。重启时大小和末尾校验一致就直接恢复，只解析追加字节；
-   文件截断、重写或缓存损坏时回退全量解析。默认只缓存主会话，避免子代理全量扫描时反复写大文件。
-3. **行解析**（`handle_line`）：逐行 JSON 解析，更新 `Session` 的 cwd/git 分支/模型/token 用量/
-   工具统计/任务清单/状态等。事件经 `emit` 分发给 SSE 订阅者和可选 webhook；
-   **首次扫描只回放不推送**（`first_scan_done` 标志）。
-3. **HTTP 层**（`make_handler`，`ThreadingHTTPServer` + `BaseHTTPRequestHandler`）：
-   `GET /` 渲染看板模板，`/sessions`、`/sessions/<id>`、`/sessions/<id>/messages` 返回 JSON，
-   `/events` 是 SSE 流，`/static/` 提供静态文件。
+> [!WARNING]
+> The server has **no authentication**. It can send messages to Claude, change settings, approve tool calls, and perform host power actions. Never expose it to the public internet or an untrusted network. See [Security](#security).
 
-### 关键设计决策
+## Choose your workflow
 
-- **会话以文件路径为键**（`Monitor.sessions`）：同一 session id 可能出现在多个项目目录
-  （恢复/移动过），按 id 键控会让两个文件的读取 offset 互相干扰。对外接口用
-  `by_sid`/`unique_sessions` 按 id 去重（取最近活跃的）。
-- **任务清单双来源**：从转录里的 `TaskCreate`/`TaskUpdate` 工具调用推断，但
-  `~/.claude/tasks/<sid>/*.json` 目录存在时以它为准（`_merge_task_dirs`，按 UTF-8 读取）。
-- **子代理默认懒加载**：子代理转录通常占用大部分磁盘和首次扫描时间，而默认看板不展示它们；
-  显式请求时再扫描，父会话的 `subagent_count` 仍来自主转录里的 Agent 工具调用。
-- **扫描缓存以文件路径为键**：与 `Monitor.sessions` 一致，同一 sid 出现在多个项目目录时不会互相污染；
-  缓存只保存增量状态，不改写转录。
-- **对话消息按需增量提取**（`parse_msg_line`）：不随轮询解析，只在请求
-  `/sessions/<id>/messages` 时增量读取新增内容，保留半行并缓存序列化结果（`Monitor.msg_cache`）；
-  跳过 sidechain（子代理对话）和非错误工具结果。
-- **会话模型选择独立于转录**：`session_preferences.py` 按 sid 保存 Web 覆盖；`Session.model` 仍表示最近实际响应模型。
-- **local profile 只通过已安装 cc-switch 应用**：`cc_switch.py` 为模型选项解析 profile JSON 并只输出 `name`/`model` 字段；local 配置仍由 cc-switch 应用，服务不自行实现 profile 合并，也不把配置正文或 credentials 传到前端。
-- **项目归并**：`<proj>/.claude/worktrees/<name>` 和 `<proj>/.worktrees/<name>` 视为属于 `<proj>`；
-  `project_map()` 进一步把子目录里的会话归并到最外层祖先项目（如 `<proj>/web` → `<proj>`），
-  看板按项目分组依赖此逻辑。
+| Mode | Best for | How it works |
+| --- | --- | --- |
+| **Monitor** | Watching sessions already running in terminals | Incrementally reads Claude Code transcript files without changing them. |
+| **One-shot messaging** | Occasional browser follow-ups | Runs one `claude -p --resume` turn per message, with per-session queuing. |
+| **Hosted session** | Long-running, interactive work | Keeps a persistent Claude process alive for streaming, queued messages, approvals, and live control. |
 
-### 前端
+When hosting an existing session, exit its terminal process first so two processes do not write to the same conversation.
 
-`templates/index.html` 是自包含 SPA：左侧项目列表、右侧会话卡片/对话视图，
-对话用 marked + DOMPurify 渲染 markdown（用户气泡 / 助手 markdown / 工具调用紧凑行），
-自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
-会话页和新建会话页共用 `composerHtml` 输入对话框（Enter 发送、Shift+Enter 换行，
-新建会话的托管模式也可选审批模式）；
-工具调用、子代理、任务等 `<details>` 的展开状态记录在 `detailsOpen`，自动刷新重建后恢复，
-并写入 `sessionStorage` 以兼容整页刷新。
+Hosted sessions default to the **`full`** approval mode, which automatically approves permission requests. Switch to **`ask`** in the session view when you want to review each request, or **`auto`** to use Claude Code's own permission mode.
+
+## Configuration
+
+Common examples:
+
+```bash
+# Use another port and mark sessions stale after 10 minutes
+uv run monitor.py --port 9000 --stale 600
+
+# Forward session events to another local service
+uv run monitor.py --webhook http://localhost:3000/hook
+
+# Pass arguments to Claude child processes
+uv run monitor.py --claude-args "--model sonnet"
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--host` | `0.0.0.0` | HTTP listen address. Use `127.0.0.1` for local-only access. |
+| `--port` | `8765` | HTTP listen port. |
+| `--interval` | `1.0` | Transcript polling interval in seconds. |
+| `--refresh` | `3.0` | Dashboard fallback refresh interval in seconds. |
+| `--stale` | `300` | Seconds without content events before a session is shown as stale. |
+| `--webhook` | none | POST each emitted event to this URL. |
+| `--claude-bin` | `claude` | Path to the Claude Code CLI. |
+| `--claude-args` | empty | Extra arguments passed to Claude child processes. |
+| `--msg-timeout` | `600` | Maximum execution time for a one-shot message, in seconds. |
+| `--permission-timeout` | `300` | Seconds to wait for hosted approval before denying; `0` waits indefinitely. |
+| `--scan-subagents` | off | Scan all subagent transcripts at startup instead of loading them on demand. |
+
+To monitor a different Claude configuration directory:
+
+```bash
+CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py --host 127.0.0.1
+```
+
+## JSON API, SSE, and webhooks
+
+The dashboard is only one client of the service. You can use the same live data in scripts, notification tools, or another UI.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /sessions` | List session summaries; use `?full=1` for details or `?include_subagents=1` to load subagents. |
+| `GET /sessions/<id>` | Get one session, including tasks, subagents, interactions, and hosted state. |
+| `GET /sessions/<id>/messages` | Read paginated conversation messages (`limit`, `before`, `from`). |
+| `GET /events` | Subscribe to the SSE stream; `?session=<id>` filters to one session. |
+| `GET /interactions` | List pending permission and question interactions. |
+| `POST /sessions/<id>/message` | Queue or send a message with `{"text":"..."}`. |
+| `POST /new` | Start a new one-shot session in a project directory. |
+| `POST /hosted` | Start or resume a persistent hosted session. |
+| `GET /sessions/<id>/jobs` | Inspect running, queued, and recently completed jobs. |
+| `POST /sessions/<id>/interrupt` | Interrupt the active hosted turn and clear its queued messages. |
+| `POST /sessions/<id>/approval` | Set `ask`, `auto`, or `full` approval mode. |
+| `POST /sessions/<id>/effort` | Set hosted effort to `low`, `medium`, `high`, or `default`. |
+| `GET /jobs/<id>` | Query a messaging job. |
+| `GET /healthz` | Health check. |
+| `GET /system` | Host CPU, memory, and sleep-timer status. |
+
+For example:
+
+```bash
+curl http://127.0.0.1:8765/sessions
+curl -N http://127.0.0.1:8765/events
+```
+
+## How it works
+
+```text
+~/.claude/projects/*/*.jsonl
+              │
+              ▼
+   incremental polling + scan cache
+              │
+              ▼
+         monitor.py ───────────► JSON API / SSE / webhooks
+              │
+              ▼
+     responsive web dashboard
+              │
+              ├──► claude -p --resume       (one-shot)
+              └──► persistent stream-json  (hosted)
+```
+
+Claude Sessions reads the transcript files Claude Code already writes. It maintains per-file offsets, handles partial lines, caches validated scan state across restarts, and parses conversation messages only when requested. Subagent transcripts are lazy-loaded by default.
+
+The monitoring path does not rewrite your transcripts. Session organization and web preferences are stored separately under `<claude_dir>/claude-sessions/`.
+
+## Development
+
+Install dependencies and run the service:
+
+```bash
+uv sync
+uv run monitor.py --host 127.0.0.1
+```
+
+Run the test suites:
+
+```bash
+# Python
+PYTHONPATH=. uv run python -m unittest discover -s tests -p 'test_*.py' -v
+
+# Frontend controls
+node --test tests/test_frontend_controls.js
+```
+
+On Windows PowerShell, set `PYTHONPATH` for the Python test command:
+
+```powershell
+$env:PYTHONPATH = '.'
+uv run python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+The project intentionally stays lightweight: a Python standard-library HTTP server, Jinja2 templates, psutil system sampling, and a self-contained JavaScript frontend.
+
+The bilingual documentation website lives in [`docs/`](docs/). It is deployed to [GitHub Pages](https://ciknight.github.io/cc-session/) by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) on pushes to `main` that change the site. To preview it locally, open `docs/index.html` or serve that directory with any static HTTP server.
+
+## Contributing
+
+Issues, bug reports, documentation improvements, and pull requests are welcome.
+
+1. Open an issue first for substantial changes so the approach can be discussed.
+2. Keep changes focused and preserve the lightweight, local-first design.
+3. Run the relevant Python and frontend tests.
+4. Update both the English and Chinese README when user-facing behavior changes.
+
+## License
+
+Claude Sessions is released under the [MIT License](LICENSE). You are free to use, modify, and distribute it, subject to the license terms.
+
+## Security
+
+- There is **no authentication or multi-user isolation**. Run it only on a trusted machine or private network.
+- Prefer `--host 127.0.0.1`; the default `0.0.0.0` listens on all interfaces.
+- Remote messaging can execute Claude with your local permissions and environment.
+- Hosted **`full`** approval automatically allows permission requests. Use **`ask`** when human review is required.
+- The system panel can sleep or restart the host. Browser confirmation is not a security boundary.
+- Do not place the service behind a public reverse proxy unless you add appropriate authentication, authorization, transport security, and request protections yourself.
+
+---
+
+Claude Sessions is an independent community project and is not affiliated with or endorsed by Anthropic.
+
+If it makes your Claude Code workflow easier, consider starring the repository and sharing it with others.

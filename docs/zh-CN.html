@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Sessions — Claude Code 会话指挥中心</title>
+  <meta name="description" content="在一个实时、自托管的网页看板中监控、管理并继续所有 Claude Code 会话。开源、轻量，采用 MIT 许可证。">
+  <meta name="theme-color" content="#10150f">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Claude Sessions — 每个会话，尽在掌握">
+  <meta property="og:description" content="你的 Claude Code 实时会话指挥中心。">
+  <meta property="og:url" content="https://ciknight.github.io/cc-session/zh-CN.html">
+  <link rel="canonical" href="https://ciknight.github.io/cc-session/zh-CN.html">
+  <link rel="alternate" hreflang="en" href="https://ciknight.github.io/cc-session/">
+  <link rel="alternate" hreflang="zh-CN" href="https://ciknight.github.io/cc-session/zh-CN.html">
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到正文</a>
+  <header class="site-header">
+    <nav class="nav container" aria-label="主导航">
+      <a class="brand" href="./zh-CN.html" aria-label="Claude Sessions 首页">
+        <img src="./favicon.svg" alt="" width="34" height="34">
+        <span>Claude Sessions<small>会话指挥中心</small></span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">功能</a>
+        <a href="#quickstart">快速开始</a>
+        <a href="#api">API</a>
+        <a href="#security">安全</a>
+      </div>
+      <div class="nav-actions">
+        <a class="language" href="./index.html" lang="en" hreflang="en" aria-label="Read the English version">EN</a>
+        <a class="github-link" href="https://github.com/ciknight/cc-session" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Claude Sessions">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.2.8-.5v-2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0C16.1 4 17.1 4.3 17.1 4.3c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.5A11.5 11.5 0 0 0 12 .7Z"/></svg>
+          <span>GitHub</span>
+        </a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="hero-grid container">
+        <div class="hero-copy-wrap">
+          <p class="eyebrow">开源 · MIT 许可证</p>
+          <h1 class="hero-title">每个会话。<em>尽在掌握。</em></h1>
+          <p class="hero-copy">不必再在终端标签页之间来回寻找。集中查看每个 Claude Code 会话的进展，处理审批、排队追问、继续对话——全部在一个实时网页看板中完成。</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#quickstart">立即开始 <span aria-hidden="true">↘</span></a>
+            <a class="button button-ghost" href="https://github.com/ciknight/cc-session" target="_blank" rel="noopener noreferrer">在 GitHub 点星 <span aria-hidden="true">↗</span></a>
+          </div>
+          <p class="hero-note"><span class="status-dot" aria-hidden="true"></span> Python 3.9+ · uv · 本地优先 · 无外部 CDN</p>
+        </div>
+
+        <div class="console-wrap">
+          <span class="console-index" aria-hidden="true">会话控制 / 实时视图</span>
+          <div class="console" role="img" aria-label="Claude Sessions 多项目看板的风格化预览">
+            <div class="console-bar" aria-hidden="true">
+              <i></i><i></i><i></i>
+              <span class="console-title">CLAUDE SESSIONS / 工作区</span>
+              <span class="live-pill">● 实时</span>
+            </div>
+            <div class="console-body" aria-hidden="true">
+              <aside class="console-side">
+                <p class="console-label">项目 / 04</p>
+                <div class="project active">web-platform<span>3 个会话</span></div>
+                <div class="project">api-services<span>2 个会话</span></div>
+                <div class="project">mobile-app<span>1 个会话</span></div>
+                <div class="project">experiments<span>4 个会话</span></div>
+              </aside>
+              <div class="console-main">
+                <div class="console-heading"><strong>web-platform</strong><span>3 个活动会话</span></div>
+                <div class="session-card featured">
+                  <div class="session-top"><span class="status-dot"></span><strong>结算流程重构</strong><span class="session-state">工作中</span></div>
+                  <p class="session-meta">main · claude-opus · 18 个工具 · 2 个子代理</p>
+                  <div class="meter"><span style="width: 76%"></span></div>
+                </div>
+                <div class="session-card">
+                  <div class="session-top"><span class="status-dot"></span><strong>API 迁移</strong><span class="session-state">托管中</span></div>
+                  <p class="session-meta">feature/v2 · 3 条排队 · 流式输出</p>
+                  <div class="meter"><span style="width: 48%"></span></div>
+                </div>
+                <div class="session-card">
+                  <div class="session-top"><span class="status-dot" style="background:#77816f;box-shadow:none"></span><strong>发布说明</strong><span class="session-state idle">空闲</span></div>
+                  <p class="session-meta">docs/release · 4 分钟前完成</p>
+                </div>
+                <div class="console-command"><b>›</b> 即使 Claude 正在工作，也能继续发送追问…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="signal-strip" aria-label="项目特点">
+      <div class="signal-grid container">
+        <div class="signal"><strong>03</strong><span>种方式：监控、一次性消息、托管</span></div>
+        <div class="signal"><strong>01</strong><span>个实时视图，覆盖所有项目</span></div>
+        <div class="signal"><strong>00</strong><span>个外部前端 CDN 依赖</span></div>
+      </div>
+    </div>
+
+    <section class="section section-paper" id="features">
+      <div class="container">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">看见全局，才能持续推进</p>
+            <h2 class="section-title">代理可以并行。<br>你的视野也应该如此。</h2>
+          </div>
+          <p class="section-copy">Claude Sessions 把 Claude Code 已经写入的转录变成可执行的操作层。不需要专有数据库，不引入重量级 Web 框架，也不要求改变原有工作流。</p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card dark">
+            <span class="feature-number">01 / 实时概览</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><rect x="3" y="4" width="26" height="22" rx="2"/><path d="M3 11h26M11 11v15"/><circle cx="22" cy="7.5" r="1" fill="currentColor"/></svg>
+            <h3>现在哪里需要你，一眼就知道。</h3>
+            <p>工作中、空闲和 stale 状态，待审批、新回复、项目分组、搜索与筛选，让下一步行动始终清晰可见。</p>
+            <div class="mini-events"><span>● 工作中</span><span>◌ 空闲</span><span>◇ stale</span><span>! 审批</span></div>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">02 / 完整上下文</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M6 3h14l6 6v20H6z"/><path d="M20 3v7h6M11 16h10M11 21h10M11 11h4"/></svg>
+            <h3>不只是一个状态灯。</h3>
+            <p>阅读 Markdown 对话，检查工具结果和 diff，跟踪任务与子代理，并查看模型、分支和 token 用量。</p>
+          </article>
+
+          <article class="feature-card accent">
+            <span class="feature-number">03 / 托管会话</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M4 6h24v18H4zM10 28h12M16 24v4"/><path d="m10 12 4 4-4 4M17 20h6"/></svg>
+            <h3>让对话持续在线。</h3>
+            <p>常驻 stream-json 进程带来流式回复、追问排队、模型与思考档位控制、斜杠命令提示和中断能力。</p>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">04 / 人工控制</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M16 3 27 7v8c0 7-4.7 11.7-11 14-6.3-2.3-11-7-11-14V7z"/><path d="m10 16 4 4 8-9"/></svg>
+            <h3>自动化，也保留刹车。</h3>
+            <p>在浏览器中处理工具权限和 AskUserQuestion 提问。每个托管会话可选择 ask、auto 或 full，并能随时中断当前回合。</p>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">05 / 面向长历史</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M5 7h22v20H5zM9 3v8M23 3v8M5 12h22"/><path d="M10 17h4M18 17h4M10 22h4"/></svg>
+            <h3>再长的转录，也易于管理。</h3>
+            <p>增量 JSONL 解析、带校验的重启缓存、子代理懒加载和消息分页，让大型历史记录依然保持响应速度。</p>
+          </article>
+
+          <article class="feature-card dark">
+            <span class="feature-number">06 / 开放设计</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M11 8 4 16l7 8M21 8l7 8-7 8M19 4l-6 24"/></svg>
+            <h3>看板只是起点。</h3>
+            <p>基于同一套 JSON API、SSE 事件流和可选 webhook，构建通知、脚本或完全不同的客户端。</p>
+            <div class="endpoint-lines"><b>GET</b> /sessions<br><b>GET</b> /events<br><b>POST</b> /sessions/&lt;id&gt;/message</div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="statement" id="workflows">
+      <div class="statement-grid container">
+        <div>
+          <p class="eyebrow">选择你的工作方式</p>
+          <h2 class="statement-title">安静观察。<br>偶尔介入。<br><span class="lime">或者全程掌控。</span></h2>
+        </div>
+        <div class="workflow-list">
+          <article class="workflow">
+            <span class="workflow-number">01</span>
+            <h3>监控</h3>
+            <p>观察终端中正在运行的会话。增量读取不会修改原始转录，也不会消耗模型 token。</p>
+          </article>
+          <article class="workflow">
+            <span class="workflow-number">02</span>
+            <h3>一次性消息</h3>
+            <p>通过 <code>claude -p --resume</code> 偶尔从浏览器发送追问。消息按会话排队，避免相互冲突。</p>
+          </article>
+          <article class="workflow">
+            <span class="workflow-number">03</span>
+            <h3>托管会话</h3>
+            <p>为长时间的交互任务保持常驻 Claude 进程，支持流式输出、消息排队、审批和实时控制。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-paper" id="quickstart">
+      <div class="container">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">几分钟，从克隆到掌控</p>
+            <h2 class="section-title">三条命令即可开始。</h2>
+          </div>
+          <p class="section-copy">你需要 Python 3.9+ 和 uv；只有发送消息或托管会话时，才需要安装并配置 Claude Code CLI。监控已有转录不需要启动 Claude。</p>
+        </div>
+
+        <div class="steps">
+          <article class="step">
+            <h3>克隆仓库</h3>
+            <p>获取服务、看板、测试和完整文档。</p>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="git clone https://github.com/ciknight/cc-session.git &amp;&amp; cd cc-session" aria-label="复制克隆命令">复制</button>
+              <pre><span class="prompt">$</span> git clone https://github.com/ciknight/cc-session.git
+<span class="prompt">$</span> cd cc-session</pre>
+            </div>
+          </article>
+          <article class="step">
+            <h3>安装依赖</h3>
+            <p>让 uv 安装项目少量的 Python 依赖。</p>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="uv sync" aria-label="复制依赖安装命令">复制</button>
+              <pre><span class="prompt">$</span> uv sync</pre>
+            </div>
+          </article>
+          <article class="step">
+            <h3>打开看板</h3>
+            <p>在本机启动，然后访问 <strong>http://127.0.0.1:8765</strong>。</p>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="uv run monitor.py --host 127.0.0.1" aria-label="复制服务启动命令">复制</button>
+              <pre><span class="prompt">$</span> uv run monitor.py --host 127.0.0.1</pre>
+            </div>
+          </article>
+        </div>
+        <div class="quick-links">
+          <a class="text-link" href="https://github.com/ciknight/cc-session/blob/main/README.zh-CN.md#配置" target="_blank" rel="noopener noreferrer">配置选项 ↗</a>
+          <a class="text-link" href="https://github.com/ciknight/cc-session/blob/main/README.zh-CN.md#json-apisse-与-webhook" target="_blank" rel="noopener noreferrer">API 参考 ↗</a>
+          <a class="text-link" href="https://github.com/ciknight/cc-session#quick-start" target="_blank" rel="noopener noreferrer">English documentation ↗</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="api">
+      <div class="container">
+        <div class="api-grid">
+          <div>
+            <p class="eyebrow">不只是网页，更是服务</p>
+            <h2 class="section-title">把自己的工具接入执行回路。</h2>
+            <ul class="api-list">
+              <li><b>GET</b><span>/sessions</span></li>
+              <li><b>GET</b><span>/sessions/&lt;id&gt;/messages</span></li>
+              <li><b>GET</b><span>/events?session=&lt;id&gt;</span></li>
+              <li><b class="post">POST</b><span>/sessions/&lt;id&gt;/message</span></li>
+              <li><b class="post">POST</b><span>/hosted</span></li>
+              <li><b>GET</b><span>/healthz</span></li>
+            </ul>
+            <p class="api-note">订阅实时 SSE 更新，通过 webhook 转发事件，查询任务队列、管理审批，或者构建完全不同的客户端。</p>
+          </div>
+          <div>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="curl http://127.0.0.1:8765/sessions" aria-label="复制会话 API 示例">复制</button>
+              <pre><span class="comment"># 列出所有项目会话</span>
+<span class="prompt">$</span> curl http://127.0.0.1:8765/sessions
+
+<span class="comment"># 跟踪实时事件流</span>
+<span class="prompt">$</span> curl -N http://127.0.0.1:8765/events</pre>
+            </div>
+            <div class="code-block">
+              <pre><span class="comment"># 典型事件流</span>
+转录 → 会话状态 → SSE / webhook
+                         ↓
+                   看板 / 你的工具</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="architecture">
+          <div class="architecture-flow" aria-label="架构：转录文件进入监控服务，再进入看板和集成工具">
+            <div class="arch-node"><strong>JSONL 转录</strong><span>增量读取 + 扫描缓存</span></div>
+            <span class="arch-arrow" aria-hidden="true">──►</span>
+            <div class="arch-node"><strong>MONITOR.PY</strong><span>Python + Jinja2 + psutil</span></div>
+            <span class="arch-arrow" aria-hidden="true">──►</span>
+            <div class="arch-node"><strong>你的控制层</strong><span>看板 · API · SSE · Webhook</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section security" id="security">
+      <div class="security-grid container">
+        <div>
+          <p class="eyebrow">开放端口前请阅读</p>
+          <h2 class="security-title">控制能力强。<br>仅限可信网络。</h2>
+          <p class="security-intro">Claude Sessions 刻意保持轻量，不提供身份认证。请把它当作本地操作工具，而不是公网多用户服务。</p>
+        </div>
+        <ul class="security-list">
+          <li><strong>主动选择只监听本机。</strong><span>使用 <code>--host 127.0.0.1</code>。默认的 <code>0.0.0.0</code> 会监听所有网卡。</span></li>
+          <li><strong>了解默认审批模式。</strong><span>托管会话默认使用 <code>full</code>，会自动批准权限请求。需要人工审查时请选择 <code>ask</code>。</span></li>
+          <li><strong>保护服务所在的机器。</strong><span>发消息会以你的本地权限运行 Claude；系统控制可以让宿主机睡眠或重启。</span></li>
+          <li><strong>浏览器确认不等于授权。</strong><span>如需对外开放，必须自行添加身份认证、授权、TLS 和请求防护。</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="closing">
+      <div class="closing-inner container">
+        <p class="eyebrow" style="justify-content:center">少找标签页，多做正经事。</p>
+        <h2 class="closing-title">让每个 Claude 会话都进入你的视野。</h2>
+        <p>克隆仓库，在本机运行，让当前的 Claude Code 工作区实时呈现。如果它对你有帮助，点星也能帮助更多开发者发现这个项目。</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="https://github.com/ciknight/cc-session" target="_blank" rel="noopener noreferrer">在 GitHub 查看 <span aria-hidden="true">↗</span></a>
+          <a class="button button-ghost" href="#quickstart">在本机运行</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer container">
+      <span class="footer-brand">Claude Sessions</span>
+      <span>MIT · Python 3.9+</span>
+      <div class="footer-links">
+        <a href="https://github.com/ciknight/cc-session/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">许可证</a>
+        <a href="https://github.com/ciknight/cc-session/issues" target="_blank" rel="noopener noreferrer">问题反馈</a>
+        <a href="https://github.com/ciknight/cc-session/blob/main/README.zh-CN.md#贡献" target="_blank" rel="noopener noreferrer">参与贡献</a>
+      </div>
+    </div>
+    <p class="disclaimer container">独立社区项目，与 Anthropic 无隶属关系，也未获得其背书。</p>
+  </footer>
+  <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>

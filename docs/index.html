@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Sessions — Mission control for Claude Code</title>
+  <meta name="description" content="Monitor, manage, and chat with every Claude Code session from one real-time, self-hosted web dashboard. Open source and MIT licensed.">
+  <meta name="theme-color" content="#10150f">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Claude Sessions — Every session. One clear view.">
+  <meta property="og:description" content="A real-time mission control dashboard for your Claude Code sessions.">
+  <meta property="og:url" content="https://ciknight.github.io/cc-session/">
+  <link rel="canonical" href="https://ciknight.github.io/cc-session/">
+  <link rel="alternate" hreflang="en" href="https://ciknight.github.io/cc-session/">
+  <link rel="alternate" hreflang="zh-CN" href="https://ciknight.github.io/cc-session/zh-CN.html">
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <nav class="nav container" aria-label="Main navigation">
+      <a class="brand" href="./index.html" aria-label="Claude Sessions home">
+        <img src="./favicon.svg" alt="" width="34" height="34">
+        <span>Claude Sessions<small>MISSION CONTROL</small></span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#quickstart">Quick start</a>
+        <a href="#api">API</a>
+        <a href="#security">Security</a>
+      </div>
+      <div class="nav-actions">
+        <a class="language" href="./zh-CN.html" lang="zh-CN" hreflang="zh-CN" aria-label="阅读中文版">中文</a>
+        <a class="github-link" href="https://github.com/ciknight/cc-session" target="_blank" rel="noopener noreferrer" aria-label="View Claude Sessions on GitHub">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.2.8-.5v-2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0C16.1 4 17.1 4.3 17.1 4.3c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.5A11.5 11.5 0 0 0 12 .7Z"/></svg>
+          <span>GitHub</span>
+        </a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="hero-grid container">
+        <div class="hero-copy-wrap">
+          <p class="eyebrow">Open source · MIT licensed</p>
+          <h1 class="hero-title">Every session.<em>One clear view.</em></h1>
+          <p class="hero-copy">Stop juggling terminal tabs. See what every Claude Code session is doing, respond to approvals, queue follow-ups, and pick up conversations—from one real-time web dashboard.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#quickstart">Get started <span aria-hidden="true">↘</span></a>
+            <a class="button button-ghost" href="https://github.com/ciknight/cc-session" target="_blank" rel="noopener noreferrer">Star on GitHub <span aria-hidden="true">↗</span></a>
+          </div>
+          <p class="hero-note"><span class="status-dot" aria-hidden="true"></span> Python 3.9+ · uv · Local-first · No external CDN</p>
+        </div>
+
+        <div class="console-wrap">
+          <span class="console-index" aria-hidden="true">SESSION CONTROL / LIVE VIEW</span>
+          <div class="console" role="img" aria-label="Stylized preview of the Claude Sessions multi-project dashboard">
+            <div class="console-bar" aria-hidden="true">
+              <i></i><i></i><i></i>
+              <span class="console-title">CLAUDE SESSIONS / WORKSPACE</span>
+              <span class="live-pill">● LIVE</span>
+            </div>
+            <div class="console-body" aria-hidden="true">
+              <aside class="console-side">
+                <p class="console-label">PROJECTS / 04</p>
+                <div class="project active">web-platform<span>3 sessions</span></div>
+                <div class="project">api-services<span>2 sessions</span></div>
+                <div class="project">mobile-app<span>1 session</span></div>
+                <div class="project">experiments<span>4 sessions</span></div>
+              </aside>
+              <div class="console-main">
+                <div class="console-heading"><strong>web-platform</strong><span>3 ACTIVE SESSIONS</span></div>
+                <div class="session-card featured">
+                  <div class="session-top"><span class="status-dot"></span><strong>Checkout refactor</strong><span class="session-state">working</span></div>
+                  <p class="session-meta">main · claude-opus · 18 tools · 2 agents</p>
+                  <div class="meter"><span style="width: 76%"></span></div>
+                </div>
+                <div class="session-card">
+                  <div class="session-top"><span class="status-dot"></span><strong>API migration</strong><span class="session-state">hosted</span></div>
+                  <p class="session-meta">feature/v2 · 3 queued · streaming</p>
+                  <div class="meter"><span style="width: 48%"></span></div>
+                </div>
+                <div class="session-card">
+                  <div class="session-top"><span class="status-dot" style="background:#77816f;box-shadow:none"></span><strong>Release notes</strong><span class="session-state idle">idle</span></div>
+                  <p class="session-meta">docs/release · completed 4m ago</p>
+                </div>
+                <div class="console-command"><b>›</b> Send a follow-up, even while Claude is working…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="signal-strip" aria-label="Project facts">
+      <div class="signal-grid container">
+        <div class="signal"><strong>03</strong><span>ways to work: monitor, one-shot, hosted</span></div>
+        <div class="signal"><strong>01</strong><span>live view across every project</span></div>
+        <div class="signal"><strong>00</strong><span>external frontend CDNs required</span></div>
+      </div>
+    </div>
+
+    <section class="section section-paper" id="features">
+      <div class="container">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Visibility becomes momentum</p>
+            <h2 class="section-title">Your agents are parallel.<br>Your visibility should be too.</h2>
+          </div>
+          <p class="section-copy">Claude Sessions turns the transcripts Claude Code already writes into an actionable operations layer. No proprietary database, no heavyweight web stack, no changes to your existing workflow.</p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card dark">
+            <span class="feature-number">01 / LIVE OVERVIEW</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><rect x="3" y="4" width="26" height="22" rx="2"/><path d="M3 11h26M11 11v15"/><circle cx="22" cy="7.5" r="1" fill="currentColor"/></svg>
+            <h3>Know what needs you now.</h3>
+            <p>Working, idle, and stale states; pending approvals; unread replies; project grouping; search and filters. The next action is always visible.</p>
+            <div class="mini-events"><span>● working</span><span>◌ idle</span><span>◇ stale</span><span>! approval</span></div>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">02 / FULL CONTEXT</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M6 3h14l6 6v20H6z"/><path d="M20 3v7h6M11 16h10M11 21h10M11 11h4"/></svg>
+            <h3>More than a status light.</h3>
+            <p>Read Markdown conversations, inspect tool results and diffs, follow tasks and subagents, and compare model, branch, and token usage.</p>
+          </article>
+
+          <article class="feature-card accent">
+            <span class="feature-number">03 / HOSTED SESSIONS</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M4 6h24v18H4zM10 28h12M16 24v4"/><path d="m10 12 4 4-4 4M17 20h6"/></svg>
+            <h3>Keep the conversation alive.</h3>
+            <p>A persistent stream-json process brings streaming replies, queued follow-ups, model and effort controls, slash-command hints, and interruption.</p>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">04 / HUMAN CONTROL</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M16 3 27 7v8c0 7-4.7 11.7-11 14-6.3-2.3-11-7-11-14V7z"/><path d="m10 16 4 4 8-9"/></svg>
+            <h3>Automation with a brake pedal.</h3>
+            <p>Handle tool permissions and AskUserQuestion prompts in the browser. Choose ask, auto, or full approval per hosted session—and interrupt when priorities change.</p>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">05 / BUILT FOR HISTORY</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M5 7h22v20H5zM9 3v8M23 3v8M5 12h22"/><path d="M10 17h4M18 17h4M10 22h4"/></svg>
+            <h3>Large transcripts stay manageable.</h3>
+            <p>Incremental JSONL parsing, validated restart caches, lazy subagent loading, and paginated message windows keep long histories responsive.</p>
+          </article>
+
+          <article class="feature-card dark">
+            <span class="feature-number">06 / OPEN BY DESIGN</span>
+            <svg class="feature-icon" viewBox="0 0 32 32" fill="none" stroke="currentColor" aria-hidden="true"><path d="M11 8 4 16l7 8M21 8l7 8-7 8M19 4l-6 24"/></svg>
+            <h3>Your dashboard is just the beginning.</h3>
+            <p>Build notifications, scripts, or another interface on the same JSON API, SSE event stream, and optional webhooks.</p>
+            <div class="endpoint-lines"><b>GET</b> /sessions<br><b>GET</b> /events<br><b>POST</b> /sessions/&lt;id&gt;/message</div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="statement" id="workflows">
+      <div class="statement-grid container">
+        <div>
+          <p class="eyebrow">Choose your workflow</p>
+          <h2 class="statement-title">Watch quietly.<br>Jump in occasionally.<br><span class="lime">Or stay in control.</span></h2>
+        </div>
+        <div class="workflow-list">
+          <article class="workflow">
+            <span class="workflow-number">01</span>
+            <h3>Monitor</h3>
+            <p>Watch sessions already running in terminals. Incremental transcript reads never modify the original files or consume model tokens.</p>
+          </article>
+          <article class="workflow">
+            <span class="workflow-number">02</span>
+            <h3>One-shot messaging</h3>
+            <p>Send occasional browser follow-ups through <code>claude -p --resume</code>. Messages queue per session instead of colliding.</p>
+          </article>
+          <article class="workflow">
+            <span class="workflow-number">03</span>
+            <h3>Hosted sessions</h3>
+            <p>Keep a persistent Claude process for long-running interactive work, with streaming, queued messages, approvals, and live controls.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-paper" id="quickstart">
+      <div class="container">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">From clone to control in minutes</p>
+            <h2 class="section-title">Start with three commands.</h2>
+          </div>
+          <p class="section-copy">You need Python 3.9+, uv, and—only for messaging or hosting—an installed and configured Claude Code CLI. Monitoring existing transcripts works without starting Claude.</p>
+        </div>
+
+        <div class="steps">
+          <article class="step">
+            <h3>Clone the repository</h3>
+            <p>Get the service, dashboard, tests, and documentation.</p>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="git clone https://github.com/ciknight/cc-session.git &amp;&amp; cd cc-session" aria-label="Copy clone command">Copy</button>
+              <pre><span class="prompt">$</span> git clone https://github.com/ciknight/cc-session.git
+<span class="prompt">$</span> cd cc-session</pre>
+            </div>
+          </article>
+          <article class="step">
+            <h3>Install dependencies</h3>
+            <p>Let uv resolve the small Python dependency set.</p>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="uv sync" aria-label="Copy dependency installation command">Copy</button>
+              <pre><span class="prompt">$</span> uv sync</pre>
+            </div>
+          </article>
+          <article class="step">
+            <h3>Open your dashboard</h3>
+            <p>Start locally, then visit <strong>http://127.0.0.1:8765</strong>.</p>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="uv run monitor.py --host 127.0.0.1" aria-label="Copy server start command">Copy</button>
+              <pre><span class="prompt">$</span> uv run monitor.py --host 127.0.0.1</pre>
+            </div>
+          </article>
+        </div>
+        <div class="quick-links">
+          <a class="text-link" href="https://github.com/ciknight/cc-session#configuration" target="_blank" rel="noopener noreferrer">Configuration options ↗</a>
+          <a class="text-link" href="https://github.com/ciknight/cc-session#json-api-sse-and-webhooks" target="_blank" rel="noopener noreferrer">API reference ↗</a>
+          <a class="text-link" href="https://github.com/ciknight/cc-session/blob/main/README.zh-CN.md" target="_blank" rel="noopener noreferrer">完整中文文档 ↗</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="api">
+      <div class="container">
+        <div class="api-grid">
+          <div>
+            <p class="eyebrow">A service, not just a page</p>
+            <h2 class="section-title">Wire your own tools into the loop.</h2>
+            <ul class="api-list">
+              <li><b>GET</b><span>/sessions</span></li>
+              <li><b>GET</b><span>/sessions/&lt;id&gt;/messages</span></li>
+              <li><b>GET</b><span>/events?session=&lt;id&gt;</span></li>
+              <li><b class="post">POST</b><span>/sessions/&lt;id&gt;/message</span></li>
+              <li><b class="post">POST</b><span>/hosted</span></li>
+              <li><b>GET</b><span>/healthz</span></li>
+            </ul>
+            <p class="api-note">Subscribe to real-time SSE updates, forward events with a webhook, query job queues, manage approvals, or build a completely different client.</p>
+          </div>
+          <div>
+            <div class="code-block">
+              <button class="copy-button" type="button" data-copy="curl http://127.0.0.1:8765/sessions" aria-label="Copy sessions API example">Copy</button>
+              <pre><span class="comment"># List every active project session</span>
+<span class="prompt">$</span> curl http://127.0.0.1:8765/sessions
+
+<span class="comment"># Follow the live event stream</span>
+<span class="prompt">$</span> curl -N http://127.0.0.1:8765/events</pre>
+            </div>
+            <div class="code-block">
+              <pre><span class="comment"># Typical event flow</span>
+transcript → session state → SSE / webhook
+                                   ↓
+                         dashboard / your tools</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="architecture">
+          <div class="architecture-flow" aria-label="Architecture: transcript files to monitor service to dashboard and integrations">
+            <div class="arch-node"><strong>JSONL TRANSCRIPTS</strong><span>Incremental reads + scan cache</span></div>
+            <span class="arch-arrow" aria-hidden="true">──►</span>
+            <div class="arch-node"><strong>MONITOR.PY</strong><span>Python + Jinja2 + psutil</span></div>
+            <span class="arch-arrow" aria-hidden="true">──►</span>
+            <div class="arch-node"><strong>YOUR CONTROL LAYER</strong><span>Dashboard · API · SSE · Webhooks</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section security" id="security">
+      <div class="security-grid container">
+        <div>
+          <p class="eyebrow">Read before exposing the port</p>
+          <h2 class="security-title">Powerful controls.<br>Trusted networks only.</h2>
+          <p class="security-intro">Claude Sessions is intentionally lightweight and has no authentication. Treat it as a local operations tool, not a public multi-user service.</p>
+        </div>
+        <ul class="security-list">
+          <li><strong>Bind to localhost by choice.</strong><span>Use <code>--host 127.0.0.1</code>. The default <code>0.0.0.0</code> listens on every interface.</span></li>
+          <li><strong>Know the default approval mode.</strong><span>Hosted sessions default to <code>full</code>, which automatically approves permission requests. Choose <code>ask</code> for human review.</span></li>
+          <li><strong>Protect the machine behind it.</strong><span>Messaging can run Claude with your local permissions; system controls can sleep or restart the host.</span></li>
+          <li><strong>A browser prompt is not authorization.</strong><span>Do not expose the service publicly without adding proper authentication, authorization, TLS, and request protections.</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="closing">
+      <div class="closing-inner container">
+        <p class="eyebrow" style="justify-content:center">Less tab hunting. More building.</p>
+        <h2 class="closing-title">Give every Claude session a place on your radar.</h2>
+        <p>Clone it, run it locally, and see your current Claude Code workspace come alive. If it helps, a star helps other developers find it too.</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="https://github.com/ciknight/cc-session" target="_blank" rel="noopener noreferrer">View on GitHub <span aria-hidden="true">↗</span></a>
+          <a class="button button-ghost" href="#quickstart">Run it locally</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer container">
+      <span class="footer-brand">Claude Sessions</span>
+      <span>MIT · Python 3.9+</span>
+      <div class="footer-links">
+        <a href="https://github.com/ciknight/cc-session/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">License</a>
+        <a href="https://github.com/ciknight/cc-session/issues" target="_blank" rel="noopener noreferrer">Issues</a>
+        <a href="https://github.com/ciknight/cc-session#contributing" target="_blank" rel="noopener noreferrer">Contribute</a>
+      </div>
+    </div>
+    <p class="disclaimer container">Independent community project. Not affiliated with or endorsed by Anthropic.</p>
+  </footer>
+  <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>
