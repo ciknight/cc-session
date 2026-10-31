@@ -1034,14 +1034,21 @@ class Monitor:
         return self._new_session(sid, path, parent_id, is_subagent)
 
     def _scan_path(self, path, sid, parent_id, is_subagent):
-        """增量读取单个转录文件；缓存命中时只解析新增字节。
-
-        同一路径由 scan_lock 串行化；stat、读取文件和缓存尾部校验都在
-        mon.lock 外执行，只有注册、截断判定和 offset 提交持锁。
-        """
+        """同一路径由 scan_lock 串行化整个读取-提交过程（轮询线程与
+        ensure_subagent 的 HTTP 线程可能并发扫同一文件）。"""
         key = str(path)
         with self.scan_locks_guard:
             scan_lock = self.scan_locks.setdefault(key, threading.Lock())
+        with scan_lock:
+            self._scan_path_locked(path, sid, parent_id, is_subagent)
+
+    def _scan_path_locked(self, path, sid, parent_id, is_subagent):
+        """增量读取单个转录文件；缓存命中时只解析新增字节。
+
+        调用方持有该路径的 scan_lock；stat、读取文件和缓存尾部校验都在
+        mon.lock 外执行，只有注册、截断判定和 offset 提交持锁。
+        """
+        key = str(path)
         try:
             size = path.stat().st_size
         except OSError:

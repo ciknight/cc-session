@@ -274,6 +274,27 @@ class ScanLockTests(unittest.TestCase):
         gate.set()
         self.assertTrue(done.wait(2))
 
+    def test_scan_path_serializes_with_scan_lock(self):
+        # 解析期间必须持有该路径的 scan_lock（读取-提交串行化）：
+        # 轮询线程与 ensure_subagent 的 HTTP 线程可能并发扫同一文件
+        proj = self.root / "config" / "projects" / "p1"
+        proj.mkdir(parents=True)
+        (proj / "s1.jsonl").write_text(
+            json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n",
+            encoding="utf-8")
+        mon = monitor.Monitor(300)
+        seen = []
+        original = mon.handle_line
+
+        def checking(sess, line):
+            seen.append(mon.scan_locks[str(sess.path)].locked())
+            return original(sess, line)
+
+        mon.handle_line = checking
+        mon.scan_once()
+        self.assertTrue(seen)
+        self.assertTrue(all(seen), "handle_line 期间应持有该路径的 scan_lock")
+
     def test_task_dir_read_does_not_hold_monitor_lock_and_merges(self):
         tasks = self.root / "config" / "tasks" / "s1"
         tasks.mkdir(parents=True)
