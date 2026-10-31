@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import monitor
+from claude_sessions import util
 
 
 class SessionStateTests(unittest.TestCase):
@@ -14,7 +15,7 @@ class SessionStateTests(unittest.TestCase):
         self.sess = monitor.Session("sid-1", Path(self.temp.name) / "session.jsonl")
         self.mon = monitor.Monitor(stale_after=300)
         self.now = 1_700_000_000
-        self.clock = patch.object(monitor, "now_ts", return_value=self.now)
+        self.clock = patch.object(util, "now_ts", return_value=self.now)
         self.clock.start()
         self.addCleanup(self.clock.stop)
         self.addCleanup(self.temp.cleanup)

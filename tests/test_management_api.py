@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 import monitor
+from claude_sessions import config, core, hook, system
 
 
 class ManagementAPITests(unittest.TestCase):
@@ -25,7 +26,7 @@ class ManagementAPITests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.project = self.root / "project"
         self.project.mkdir()
-        self.config_patch = patch.object(monitor, "CLAUDE_DIR", self.root / ".claude")
+        self.config_patch = patch.object(config, "CLAUDE_DIR", self.root / ".claude")
         self.config_patch.start()
         self.mon = monitor.Monitor(600)
         self.sess = monitor.Session("sid-1", self.project / "session.jsonl")
@@ -179,7 +180,7 @@ class ManagementAPITests(unittest.TestCase):
         secret = self.root / "static-secret" / "secret.txt"
         secret.parent.mkdir()
         secret.write_text("not-public", encoding="utf-8")
-        with patch.object(monitor, "STATIC_DIR", static):
+        with patch.object(config, "STATIC_DIR", static):
             with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3) as sock:
                 sock.sendall(b"GET /static/../static-secret/secret.txt HTTP/1.0\r\n\r\n")
                 chunks = []
@@ -312,8 +313,8 @@ class ManagementAPITests(unittest.TestCase):
 
     def test_messages_tail_window_loads_earlier_chunks(self):
         self._write_transcript(250)
-        with patch.object(monitor, "MSG_TAIL_BYTES", 500), \
-                patch.object(monitor, "MSG_CHUNK_BYTES", 2000):
+        with patch.object(config, "MSG_TAIL_BYTES", 500), \
+                patch.object(config, "MSG_CHUNK_BYTES", 2000):
             page = json.load(self.request("/sessions/sid-1/messages?limit=100"))
             messages = list(page["messages"])
             self.assertLess(page["total"], 250)
@@ -392,8 +393,8 @@ class ManagementAPITests(unittest.TestCase):
         path = self.project / "sid-1.jsonl"
         path.write_text(tool + result, encoding="utf-8")
         self.sess.path = path
-        with patch.object(monitor, "MSG_TAIL_BYTES", len(result.encode())), \
-                patch.object(monitor, "MSG_CHUNK_BYTES", len(tool.encode())):
+        with patch.object(config, "MSG_TAIL_BYTES", len(result.encode())), \
+                patch.object(config, "MSG_CHUNK_BYTES", len(tool.encode())):
             first = json.load(self.request("/sessions/sid-1/messages"))
             self.assertEqual(first["messages"][0]["parts"][0]["type"], "tool_result")
             older = json.load(self.request("/sessions/sid-1/messages?before=0&limit=100"))
@@ -649,7 +650,7 @@ class ManagementAPITests(unittest.TestCase):
         fake_opener = SimpleNamespace(open=fake_open)
         with patch.object(sys, "stdin",
                           SimpleNamespace(buffer=io.BytesIO(b"{}"))), \
-                patch.object(monitor.urllib.request, "build_opener",
+                patch.object(hook.urllib.request, "build_opener",
                              return_value=fake_opener):
             monitor.hook_client(["--port", "1234", "--token", "tok",
                                  "--timeout", "0"])
@@ -798,7 +799,7 @@ class ManagementAPITests(unittest.TestCase):
 
 
     def test_commands_endpoint_scans_user_and_project_dirs(self):
-        user_commands = monitor.CLAUDE_DIR / "commands"
+        user_commands = config.CLAUDE_DIR / "commands"
         user_commands.mkdir(parents=True)
         (user_commands / "global.md").write_text("# /global", encoding="utf-8")
         (user_commands / "notes.txt").write_text("not a command", encoding="utf-8")
@@ -819,7 +820,7 @@ class ManagementAPITests(unittest.TestCase):
             swap_memory=lambda: SimpleNamespace(total=2 * 2**30, used=2**30, percent=50.0),
             boot_time=lambda: time.time() - 3600,
         )
-        with patch.object(monitor, "psutil", fake):
+        with patch.object(system, "psutil", fake):
             result = json.load(self.request('/system'))
         # cpu_percent 必须来自 per-core 列表的均值（非 percpu 值 99.0 不应出现）
         self.assertEqual(result['cpu_percent'], 16.5)
@@ -837,18 +838,18 @@ class ManagementAPITests(unittest.TestCase):
             swap_memory=lambda: SimpleNamespace(total=0, used=0, percent=0.0),
             boot_time=lambda: time.time() + 100,
         )
-        with patch.object(monitor, "psutil", edge):
+        with patch.object(system, "psutil", edge):
             result = json.load(self.request('/system'))
         self.assertEqual(result['cpu_percent'], 0.0)
         self.assertEqual(result['cpu_cores'], [])
         self.assertEqual(result['uptime'], 0)
 
     def test_power_command_platform_matrix(self):
-        with patch.object(monitor.sys, "platform", "win32"):
+        with patch.object(system.sys, "platform", "win32"):
             self.assertEqual(monitor.power_command("restart"), ["shutdown", "/r", "/t", "3"])
             self.assertEqual(monitor.power_command("sleep"),
                              ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
-        with patch.object(monitor.sys, "platform", "linux"):
+        with patch.object(system.sys, "platform", "linux"):
             self.assertEqual(monitor.power_command("restart"), ["systemctl", "reboot"])
             self.assertEqual(monitor.power_command("sleep"), ["systemctl", "suspend"])
         with self.assertRaises(ValueError):
@@ -857,8 +858,8 @@ class ManagementAPITests(unittest.TestCase):
     def test_power_endpoint_spawns_command(self):
         calls = []
         commands = {"restart": ["x", "r"], "sleep": ["x", "s"]}
-        with patch.object(monitor, "power_command", lambda action: commands[action]), \
-             patch.object(monitor.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)):
+        with patch.object(system, "power_command", lambda action: commands[action]), \
+             patch.object(system.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)):
             result = json.load(self.request('/system/power', {"action": "restart"},
                                             {"Content-Type": "application/json"}))
         self.assertEqual(result, {"ok": True})
@@ -873,8 +874,8 @@ class ManagementAPITests(unittest.TestCase):
         commands = {"restart": ["x", "r"]}
         def boom(cmd, **kw):
             raise OSError("no such file")
-        with patch.object(monitor, "power_command", lambda action: commands[action]), \
-             patch.object(monitor.subprocess, "Popen", boom):
+        with patch.object(system, "power_command", lambda action: commands[action]), \
+             patch.object(system.subprocess, "Popen", boom):
             with self.assertRaises(HTTPError) as ctx:
                 self.request('/system/power', {"action": "restart"},
                              {"Content-Type": "application/json"})
@@ -892,7 +893,7 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 415)
 
     def test_system_endpoint_unavailable_without_psutil(self):
-        with patch.object(monitor, "psutil", None):
+        with patch.object(system, "psutil", None):
             with self.assertRaises(HTTPError) as ctx:
                 self.request('/system')
             self.assertEqual(ctx.exception.code, 503)
@@ -915,7 +916,7 @@ class ManagementAPITests(unittest.TestCase):
 
     def test_sleep_timer_cancel_stops_timer(self):
         headers = {'Content-Type': 'application/json'}
-        with patch.object(monitor.threading, "Timer") as timer_cls:
+        with patch.object(core.threading, "Timer") as timer_cls:
             json.load(self.request('/system/sleep-timer', {"minutes": 30}, headers))
             self.assertTrue(timer_cls.called)
             result = json.load(self.request('/system/sleep-timer', {"minutes": 0}, headers))
@@ -936,7 +937,7 @@ class ManagementAPITests(unittest.TestCase):
     def test_sleep_timer_fire_clears_state_and_spawns_sleep(self):
         self.mon.sleep_timer_deadline = time.time() + 60
         self.mon.sleep_timer = threading.current_thread()   # fire 只认自己所属的 Timer 线程
-        with patch.object(monitor, "spawn_power") as spawn:
+        with patch.object(system, "spawn_power") as spawn:
             self.mon._fire_sleep_timer()
         spawn.assert_called_once_with("sleep")
         self.assertIsNone(self.mon.sleep_timer_deadline)
@@ -945,18 +946,18 @@ class ManagementAPITests(unittest.TestCase):
     def test_sleep_timer_fire_swallows_spawn_failure(self):
         self.mon.sleep_timer_deadline = time.time() + 60
         self.mon.sleep_timer = threading.current_thread()
-        with patch.object(monitor, "spawn_power", side_effect=OSError("boom")):
+        with patch.object(system, "spawn_power", side_effect=OSError("boom")):
             self.mon._fire_sleep_timer()   # 不应抛出
         self.assertIsNone(self.mon.sleep_timer_deadline)
 
     def test_sleep_timer_stale_fire_aborts_without_clearing_replacement(self):
         # 旧 Timer 的 cancel 来不及时 fire 仍会跑：发现自己已被新定时替换就作废，
         # 不清新状态、不执行睡眠
-        new_timer = monitor.threading.Timer(900, lambda: None)
+        new_timer = threading.Timer(900, lambda: None)
         try:
             self.mon.sleep_timer_deadline = time.time() + 900
             self.mon.sleep_timer = new_timer
-            with patch.object(monitor, "spawn_power") as spawn:
+            with patch.object(system, "spawn_power") as spawn:
                 self.mon._fire_sleep_timer()   # 当前线程不是 new_timer
             spawn.assert_not_called()
             self.assertEqual(self.mon.sleep_timer, new_timer)
@@ -986,6 +987,38 @@ class SSEDisconnectTests(unittest.TestCase):
             _snapshot=lambda only: {"seq": 1, "session": None, "type": "snapshot", "data": {}},
         )
         handler._sse(fake, None)   # 不应抛出
+        self.assertEqual(mon.subscribers, [])
+
+    def test_queue_full_marks_subscriber_overflowed(self):
+        # 队列满时不再静默丢事件：标记溢出，由 SSE 循环断开强制全量对账
+        mon = monitor.Monitor(600)
+        mon.first_scan_done = True
+        sess = monitor.Session("sid-1", Path("x.jsonl"))
+        q = queue.Queue(maxsize=1)
+        mon.subscribers.append(q)
+        mon.emit(sess, "user_message", {"text": "a"})
+        self.assertFalse(getattr(q, "overflowed", False))
+        mon.emit(sess, "user_message", {"text": "b"})   # 队列已满，第二条被丢弃并标记
+        self.assertTrue(q.overflowed)
+
+    def test_sse_disconnects_overflowed_subscriber(self):
+        # 溢出标记置位后 SSE 循环立即结束并移除订阅者（客户端重连走 snapshot 对账）
+        mon = monitor.Monitor(600)
+        handler = monitor.make_handler(mon, 3)
+        writes = []
+
+        def snapshot(only):
+            mon.subscribers[0].overflowed = True   # q 已注册、尚未进入事件循环
+            return {"seq": 1, "session": None, "type": "snapshot", "data": {}}
+
+        fake = SimpleNamespace(
+            wfile=SimpleNamespace(write=lambda data: writes.append(data), flush=lambda: None),
+            send_response=lambda *a: None,
+            send_header=lambda *a: None,
+            end_headers=lambda *a: None,
+            _snapshot=snapshot,
+        )
+        handler._sse(fake, None)   # 不 hang、不抛出
         self.assertEqual(mon.subscribers, [])
 
 

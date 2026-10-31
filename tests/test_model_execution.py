@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import monitor
+from claude_sessions import config, core, hosted
 
 
 class ExecutionTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class ExecutionTests(unittest.TestCase):
         except TypeError:   # Python 3.9
             self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.config_patch = patch.object(monitor, "CLAUDE_DIR", self.root / "config")
+        self.config_patch = patch.object(config, "CLAUDE_DIR", self.root / "config")
         self.config_patch.start()
         self.mon = monitor.Monitor(600)
         self.sess = monitor.Session("existing", self.root / "existing.jsonl")
@@ -49,7 +50,7 @@ class ExecutionTests(unittest.TestCase):
         fake = str(Path(__file__).with_name("fake_claude.py"))
         def popen(cmd, **kwargs):
             return original([sys.executable, fake] + cmd[1:], **kwargs)
-        with patch.object(monitor.subprocess, "Popen", side_effect=popen):
+        with patch.object(hosted.subprocess, "Popen", side_effect=popen):
             code, response = self.mon.host_session(str(self.root), None, text, model=model)
         self.assertEqual(code, 202)
         host = self.mon.hosted[response["hosted_id"]]
@@ -59,7 +60,7 @@ class ExecutionTests(unittest.TestCase):
     def test_oneshot_model_overrides_service_args(self):
         self.mon.claude_args = ["--model=haiku", "--verbose"]
         completed = subprocess.CompletedProcess([], 0, json.dumps({"result": "ok"}), "")
-        with patch.object(monitor.subprocess, "run", return_value=completed) as run:
+        with patch.object(core.subprocess, "run", return_value=completed) as run:
             code, response = self.mon.send_message("existing", "hello", model="vendor-model-7")
             self.assertEqual(code, 202)
             job = self.wait_done(response["job_id"])
@@ -109,7 +110,7 @@ class ExecutionTests(unittest.TestCase):
         code, _ = self.mon.send_message("existing", "hello")
         self.assertEqual(code, 409)
         completed = subprocess.CompletedProcess([], 0, json.dumps({"result": "ok"}), "")
-        with patch.object(monitor.subprocess, "run", return_value=completed):
+        with patch.object(core.subprocess, "run", return_value=completed):
             code, response = self.mon.send_message("existing", "hello", force=True)
             self.assertEqual(code, 202)
             job = self.wait_done(response["job_id"])
@@ -164,7 +165,7 @@ class ExecutionTests(unittest.TestCase):
             if kwargs['input'] == 'third':
                 finished.set()
             return subprocess.CompletedProcess(cmd, 0, json.dumps({'result': 'ok'}), '')
-        with patch.object(monitor.subprocess, 'run', side_effect=run):
+        with patch.object(core.subprocess, 'run', side_effect=run):
             _, first = self.mon.send_message('existing', 'first', model='opus')
             self.assertTrue(entered.wait(2))
             _, middle = self.mon.send_message('existing', 'middle', model='sonnet')
@@ -263,7 +264,7 @@ class ExecutionTests(unittest.TestCase):
                 second_entered.set()
                 self.assertTrue(release_second.wait(5))
             return subprocess.CompletedProcess(cmd, 0, '{"result":"ok"}', '')
-        with patch.object(monitor.subprocess, 'run', side_effect=run), patch.object(monitor, 'REMOTE_QUEUE_LIMIT', 1):
+        with patch.object(core.subprocess, 'run', side_effect=run), patch.object(config, 'REMOTE_QUEUE_LIMIT', 1):
             self.mon.send_message('existing', 'first')
             self.assertTrue(first_entered.wait(2))
             _, cancelled = self.mon.send_message('existing', 'cancel')
@@ -298,7 +299,7 @@ class ExecutionTests(unittest.TestCase):
 
     def test_new_oneshot_result_binds_session_atomically(self):
         completed = subprocess.CompletedProcess([], 0, '{"session_id":"new-id","result":"ok"}', '')
-        with patch.object(monitor.subprocess, 'run', return_value=completed):
+        with patch.object(core.subprocess, 'run', return_value=completed):
             _, response = self.mon.new_session(str(self.root), 'new')
             self.wait_done(response['job_id'])
         snapshot = self.mon.session_jobs('new-id')[1]
@@ -317,7 +318,7 @@ class ExecutionTests(unittest.TestCase):
         def popen(cmd, **popen_kwargs):
             captured.append(cmd)
             return original([sys.executable, fake] + cmd[1:], **popen_kwargs)
-        with patch.object(monitor.subprocess, "Popen", side_effect=popen):
+        with patch.object(hosted.subprocess, "Popen", side_effect=popen):
             code, response = self.mon.host_session(str(self.root), kwargs.pop("resume_id", None),
                                                    "hi", **kwargs)
         self.assertEqual(code, 202)

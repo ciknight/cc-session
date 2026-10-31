@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import monitor
+from claude_sessions import config, core
 
 
 def _ts(epoch):
@@ -19,7 +20,7 @@ class ScanCacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.patch = patch.object(monitor, "CLAUDE_DIR", self.root / "config")
+        self.patch = patch.object(config, "CLAUDE_DIR", self.root / "config")
         self.patch.start()
         self.proj = self.root / "config" / "projects" / "p1"
         self.proj.mkdir(parents=True)
@@ -192,7 +193,7 @@ class ScanCacheTests(unittest.TestCase):
             return real_open(path, *args, **kwargs)
 
         mon = monitor.Monitor(600)
-        with patch.object(monitor, "open", fake_open, create=True):
+        with patch.object(core, "open", fake_open, create=True):
             mon.scan_once()   # 不应抛出
         self.assertEqual(mon.by_sid("sid-1").offset, 0)
         self.assertEqual(mon.by_sid("sid-2").user_msgs, 1)
@@ -214,7 +215,7 @@ class ScanLockTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.patch = patch.object(monitor, "CLAUDE_DIR", self.root / "config")
+        self.patch = patch.object(config, "CLAUDE_DIR", self.root / "config")
         self.patch.start()
 
     def tearDown(self):

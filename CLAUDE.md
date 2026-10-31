@@ -25,9 +25,23 @@ uv run monitor.py --webhook http://localhost:3000/hook
 
 ## 架构
 
-主服务 `monitor.py` + 扫描缓存 `scan_cache.py` + 会话偏好 `session_preferences.py` +
-cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地前端依赖
-`static/marked.min.js`、`static/purify.min.js`（不依赖外网 CDN）。
+根 `monitor.py` 是入口与兼容 facade（re-export 公共符号，`import monitor` 的旧用法与
+`uv run monitor.py` 均不变）；实现按职责拆在 `claude_sessions/` 包：
+
+- `core.py` — `Monitor`：会话注册表、轮询扫描、远程消息/队列、审批协调、事件分发（协调中枢）
+- `hosted.py` — `Hosted`：常驻 claude 进程（stream-json 双向）
+- `session.py` — `Session`：单个转录的累计状态与列表/详情投影
+- `transcript.py` — 转录行解析（`parse_msg_line` 等对话消息提取）
+- `http_api.py` — `make_handler`：REST/SSE/hook 回调/静态资源
+- `interactions.py` — `Interaction` 与审批预览；`system.py` — 系统采样与电源；
+  `commands.py` — slash 命令扫描；`util.py` — 纯工具函数；`config.py` — 路径与可调常量；
+  `hook.py` — hook 客户端；`app.py` — CLI 入口与完整用法文档
+
+**可替换依赖约定**：`config` 常量、`system` 电源/采样函数、`util.now_ts` 时钟一律以
+模块属性访问（`config.X` / `system.X` / `util.now_ts()`），测试 patch 对应模块属性即全局生效；
+其余纯函数自由 from import。根级另有扫描缓存 `scan_cache.py` + 会话偏好
+`session_preferences.py` + cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` +
+本地前端依赖 `static/marked.min.js`、`static/purify.min.js`（不依赖外网 CDN）。
 
 ### 数据流
 
@@ -142,6 +156,15 @@ cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` + 本地�
   断线重连后全量对账；SSE 事件触发节流刷新，保留定时轮询兜底。
   对话只加载最近 100 条，消息列表顶部按钮加载更早；`cursor` 记录已加载末尾，
   服务端前插旧块时用响应里的 `shift` 调整，避免增量漏消息。
+- **通知与连接健康**：SSE 慢消费者队列满时标记 `overflowed` 并断开连接（不再静默丢事件），
+  客户端重连走 `snapshot` 全量对账；keepalive 为无 id 事件帧（15 秒，游标粘性不受影响），
+  前端看门狗 90 秒无帧重建连接、回前台 45 秒检查（系统睡眠/网络切换造成的假死无错误事件），
+  后台不做定时重连。浏览器通知（header 🔔 开关存 localStorage `notify`，权限在用户手势里申请）
+  只由实时 SSE 事件驱动、仅页面隐藏时发送（新回复 `turn_finished` / 待审批 `interaction_pending` /
+  失败 `hosted_turn_done`、`remote_message_done`，按 kind+sid+id 5 秒冷却去重，覆盖两路重复投递），
+  重连对账与轮询不补发，点击通知聚焦并 `navigate` 到对应会话；
+  无 Service Worker/推送/唤醒锁，系统睡眠零干预，睡眠期间错过的事件只更新看板不补通知。
+  标题栏显示 `(未读+待审批数)` 前缀（`updateDocTitle`）。
 - **URL 路由**：看板视图与地址栏同步，`/p/<项目路径>` 是项目列表，
   `/p/<项目路径>/s/<会话ID>` 是对话，`/p/<项目路径>/new` 是新建；项目路径保留目录层级
   （反斜杠归一为 `/`，冒号保留，仅转义空格等特殊字符），旧的整体编码链接仍可解析。

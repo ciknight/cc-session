@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import monitor
+from claude_sessions import config, hosted
 
 
 class InteractionTests(unittest.TestCase):
@@ -23,7 +24,7 @@ class InteractionTests(unittest.TestCase):
         except TypeError:   # Python 3.9
             self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.patch = patch.object(monitor, "CLAUDE_DIR", self.root / "config")
+        self.patch = patch.object(config, "CLAUDE_DIR", self.root / "config")
         self.patch.start()
         self.mon = monitor.Monitor(600, permission_timeout=0.3)
         self.sess = monitor.Session("fake-session", self.root / "fake.jsonl")
@@ -47,7 +48,7 @@ class InteractionTests(unittest.TestCase):
         fake = str(Path(__file__).with_name("fake_claude.py"))
         def popen(cmd, **kwargs):
             return original([sys.executable, fake] + cmd[1:], **kwargs)
-        with patch.object(monitor.subprocess, "Popen", side_effect=popen):
+        with patch.object(hosted.subprocess, "Popen", side_effect=popen):
             code, resp = self.mon.host_session(str(self.root), None, text,
                                                model="opus", approval=approval)
         self.assertEqual(code, 202)
@@ -175,7 +176,7 @@ class InteractionTests(unittest.TestCase):
             captured["cmd"] = cmd
             return original([sys.executable, fake] + cmd[1:], **kwargs)
 
-        with patch.object(monitor.subprocess, "Popen", side_effect=popen):
+        with patch.object(hosted.subprocess, "Popen", side_effect=popen):
             code, resp = self.mon.host_session(str(self.root), None, "first",
                                                model="opus", approval="ask")
         self.assertEqual(code, 202)
@@ -201,7 +202,7 @@ class InteractionTests(unittest.TestCase):
             captured["cmd"] = cmd
             return original([sys.executable, fake] + cmd[1:], **kwargs)
 
-        with patch.object(monitor.subprocess, "Popen", side_effect=popen):
+        with patch.object(hosted.subprocess, "Popen", side_effect=popen):
             code, resp = self.mon.host_session(str(self.root), None, "first",
                                                model="opus", approval="ask")
         self.assertEqual(code, 202)

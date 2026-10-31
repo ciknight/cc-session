@@ -267,6 +267,7 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   <button id="pendingbadge" class="back"
           title="有权限请求等待审批，点击跳转">待审批 0</button>
   <span id="err"></span>
+  <button id="notifybtn" class="back" title="开启浏览器通知">🔕</button>
   <button id="sysbtn" class="back" style="margin-left:auto" title="系统状态与电源操作">🖥 系统</button>
 </header>
 <div id="app">
@@ -325,7 +326,10 @@ function viewingSession(id){
 function markDisplayedRead(){
   const id = view.session;
   if(viewingSession(id) && (displayedTurnEnd.get(id) || 0) >= (turnEndHighWater.get(id) || 0)
-     && unreadSessions.delete(id)) renderSidebar(groupByProject());
+     && unreadSessions.delete(id)){
+    updateDocTitle();
+    renderSidebar(groupByProject());
+  }
 }
 function confirmDisplayedMessages(id, requestEnd){
   displayedSession = id;
@@ -349,6 +353,7 @@ function applySessions(next){
   }
   sessions = next;
   sessionsVersion++;
+  updateDocTitle();
   markDisplayedRead();
   renderMain();
 }
@@ -922,6 +927,7 @@ function scheduleConvRefresh(sid){
   }, 500);
 }
 function onGlobalSse(event){
+  lastGlobalSseActivity = Date.now();
   let msg;
   try{ msg = JSON.parse(event.data); }catch{ return; }
   if(msg.seq && msg.seq <= globalSeq) return;
@@ -929,6 +935,7 @@ function onGlobalSse(event){
   handleSseMessage(msg);
 }
 function onSessionSse(event){
+  lastSessionSseActivity = Date.now();
   let msg;
   try{ msg = JSON.parse(event.data); }catch{ return; }
   if(msg.seq && msg.seq <= sessionSeq) return;
@@ -957,14 +964,18 @@ function handleSseMessage(msg){
   }
   scheduleListRefresh();
   if(msg.session) scheduleConvRefresh(msg.session);
+  maybeNotify(msg);
 }
 function connectGlobalSse(){
   if(!window.EventSource) return;
   if(esGlobal) esGlobal.close();
+  lastGlobalSseActivity = Date.now();
   esGlobal = new EventSource("/events");
   for(const type of SSE_TYPES) esGlobal.addEventListener(type, onGlobalSse);
+  esGlobal.addEventListener("keepalive", () => { lastGlobalSseActivity = Date.now(); });
   let opened = false;
   esGlobal.onopen = () => {
+    lastGlobalSseActivity = Date.now();
     if(opened){
       globalSeq = 0;
       load();
@@ -976,10 +987,13 @@ function connectGlobalSse(){
 function connectSessionSse(id){
   if(!window.EventSource) return;
   disconnectSessionSse();
+  lastSessionSseActivity = Date.now();
   esSession = new EventSource("/events?session=" + encodeURIComponent(id));
   for(const type of SSE_TYPES) esSession.addEventListener(type, onSessionSse);
+  esSession.addEventListener("keepalive", () => { lastSessionSseActivity = Date.now(); });
   let opened = false;
   esSession.onopen = () => {
+    lastSessionSseActivity = Date.now();
     sessionSeq = 0;
     if(opened && view.session === id) renderConversation(id, true);
     opened = true;
@@ -988,6 +1002,73 @@ function connectSessionSse(id){
 function disconnectSessionSse(){
   if(esSession){ esSession.close(); esSession = null; }
 }
+
+/* ---------- 浏览器通知 / 标题待办 / SSE 看门狗 ---------- */
+// 通知只由实时 SSE 事件驱动：页面隐藏时才发，正看着不打扰；
+// 重连对账（snapshot/轮询）不补发，系统睡眠期间错过的事件醒来后只更新看板与标题。
+// 无 Service Worker / 推送，不持有任何唤醒锁，系统睡眠行为不受影响。
+const notifyCooldown = new Map();   // 去重键 -> 上次通知毫秒（全局+单会话两路 SSE 会重复投递）
+function notifyOn(){
+  return localStorage.getItem("notify") === "1" && window.Notification
+    && Notification.permission === "granted";
+}
+function sessionDisplayName(sid){
+  const s = sessions.find(x => x.id === sid);
+  return (s && (s.alias || s.title)) || (s && s.cwd) || sid || "会话";
+}
+function maybeNotify(msg){
+  if(!msg || !msg.type || !document.hidden || !notifyOn()) return;
+  let kind = null;
+  if(msg.type === "turn_finished") kind = "reply";
+  else if(msg.type === "interaction_pending") kind = "approval";
+  else if(msg.type === "hosted_turn_done" && (msg.data.is_error || msg.data.status === "failed")) kind = "failed";
+  else if(msg.type === "remote_message_done" && msg.data.status === "failed") kind = "failed";
+  if(!kind) return;
+  const sid = msg.session || msg.data.session_id || "";
+  const key = kind + ":" + sid + ":" + (msg.data.id || msg.data.job || "");
+  const now = Date.now();
+  if(now - (notifyCooldown.get(key) || 0) < 5000) return;   // 两路重复/连发冷却
+  notifyCooldown.set(key, now);
+  if(notifyCooldown.size > 200) notifyCooldown.clear();     // 长期运行的有界保护
+  const name = sessionDisplayName(sid);
+  let title, body;
+  if(kind === "reply"){ title = "新回复 · " + name; body = msg.data.last || ""; }
+  else if(kind === "approval"){ title = "待审批 · " + (msg.data.tool_name || "权限请求"); body = name; }
+  else { title = "任务失败 · " + name; body = msg.data.error || msg.data.result || ""; }
+  try{
+    const n = new Notification(title, {body: String(body).slice(0, 140), tag: key});
+    n.onclick = () => {
+      window.focus();
+      const s = sessions.find(x => x.id === sid);
+      navigate({project: s ? s.project : null, session: sid || null, new: false});
+      n.close();
+    };
+  }catch(e){ /* 某些平台页面级 Notification 构造可能失败，忽略不影响看板 */ }
+}
+function updateNotifyBtn(){
+  const btn = document.getElementById("notifybtn");
+  if(!btn) return;
+  const on = notifyOn();
+  btn.textContent = on ? "🔔" : "🔕";
+  btn.title = on ? "浏览器通知已开启（页面隐藏时提醒新回复/待审批/失败），点击关闭"
+                 : "开启浏览器通知（页面隐藏时提醒新回复/待审批/失败）";
+}
+function updateDocTitle(){
+  const pending = sessions.reduce((sum, s) => sum + (s.pending_interactions || 0), 0);
+  const total = unreadSessions.size + pending;
+  document.title = total ? `(${total}) claude-sessions` : "claude-sessions";
+}
+// 看门狗：keepalive 事件 15s 一次；90s 无任何帧说明连接假死（系统睡眠/网络切换
+// 常无错误事件），重建连接。回前台超过 45s 立即检查，后台不做定时重连。
+let lastGlobalSseActivity = 0, lastSessionSseActivity = 0;
+function reconnectStaleSse(threshold){
+  if(!window.EventSource) return;
+  const now = Date.now();
+  if(esGlobal && now - lastGlobalSseActivity > threshold) connectGlobalSse();
+  if(esSession && view.session && now - lastSessionSseActivity > threshold) connectSessionSse(view.session);
+}
+setInterval(() => { if(!document.hidden) reconnectStaleSse(90000); }, 30000);
+
 function applySessionDetail(d){
   if(!d) return;
   d = mergeMetadata(d);
@@ -2615,6 +2696,26 @@ async function setSleepTimer(minutes){
 }
 // 不 stopPropagation：syspop 自己的 document 级关闭 handler 已豁免 #sysbtn，
 // 放行冒泡可让队列浮层等其他 document 级浮层借这次点击正常收起
+document.getElementById("notifybtn").addEventListener("click", async () => {
+  if(!window.Notification){ alert("当前浏览器不支持通知"); return; }
+  if(notifyOn()){
+    localStorage.setItem("notify", "0");
+  }else{
+    // 权限申请必须发生在用户手势里；denied 时不再重复弹窗，引导到站点设置
+    if(Notification.permission === "denied"){
+      alert("浏览器已拒绝通知权限，请在地址栏的站点设置中允许通知");
+      return;
+    }
+    if(Notification.permission !== "granted"){
+      const p = await Notification.requestPermission();
+      if(p !== "granted") return;
+    }
+    localStorage.setItem("notify", "1");
+  }
+  updateNotifyBtn();
+});
+updateNotifyBtn();
+
 document.getElementById("sysbtn").addEventListener("click", e => {
   toggleSysPop(sysPop.timer == null);
 });
@@ -2646,6 +2747,7 @@ if(typeof window !== "undefined" && window.addEventListener)
 if(document.addEventListener){
   document.addEventListener("visibilitychange", () => {
     if(document.hidden) return;
+    reconnectStaleSse(45000);   // 锁屏/睡眠可能让 socket 假死且无错误事件
     markDisplayedRead();
     if(view.session && unreadSessions.has(view.session)) scheduleConvRefresh(view.session);
   });

@@ -123,10 +123,11 @@ class SubagentDiscoveryTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from unittest.mock import patch
+        from claude_sessions import config
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.patch = patch.object(monitor, "CLAUDE_DIR", self.root)
+        self.patch = patch.object(config, "CLAUDE_DIR", self.root)
         self.patch.start()
         self.addCleanup(self.patch.stop)
         proj = self.root / "projects" / "p1"
