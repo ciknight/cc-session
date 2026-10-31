@@ -950,6 +950,31 @@ class ManagementAPITests(unittest.TestCase):
             self.mon._fire_sleep_timer()   # 不应抛出
         self.assertIsNone(self.mon.sleep_timer_deadline)
 
+    def test_keep_awake_unsupported_platform_returns_400(self):
+        with patch.object(system, "keep_awake_supported", return_value=False):
+            code, resp = self.mon.set_keep_awake(True)
+        self.assertEqual(code, 400)
+        self.assertFalse(self.mon.keep_awake)
+
+    def test_keep_awake_follows_working_sessions_and_persists(self):
+        calls = []
+        with patch.object(system, "keep_awake_supported", return_value=True), \
+                patch.object(system, "set_keep_awake", side_effect=lambda on: calls.append(on)):
+            self.mon.set_keep_awake(True)   # 无 working 会话：不开持有
+            self.assertEqual(calls, [])
+            self.sess.state = "working"
+            self.sess.last_event_ts = time.time()
+            self.mon._apply_keep_awake()
+            self.assertEqual(calls, [True])
+            self.assertTrue(self.mon.awake_held)
+            self.sess.state = "idle"
+            self.mon._apply_keep_awake()
+            self.assertEqual(calls, [True, False])
+            self.assertFalse(self.mon.awake_held)
+        data = json.loads((self.root / ".claude" / "claude-sessions" / "power.json")
+                          .read_text(encoding="utf-8"))
+        self.assertTrue(data["keep_awake"])
+
     def test_sleep_timer_stale_fire_aborts_without_clearing_replacement(self):
         # 旧 Timer 的 cancel 来不及时 fire 仍会跑：发现自己已被新定时替换就作废，
         # 不清新状态、不执行睡眠

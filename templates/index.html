@@ -1024,6 +1024,10 @@ function maybeNotify(msg){
   else if(msg.type === "hosted_turn_done" && (msg.data.is_error || msg.data.status === "failed")) kind = "failed";
   else if(msg.type === "remote_message_done" && msg.data.status === "failed") kind = "failed";
   if(!kind) return;
+  // 短回合过滤（Belay 式）：仅新回复类；待审批与任务失败始终提醒
+  const minDur = Number(localStorage.getItem("notify_min_duration") || 30);
+  if(kind === "reply" && minDur > 0 && typeof msg.data.duration === "number"
+     && msg.data.duration < minDur) return;
   const sid = msg.session || msg.data.session_id || "";
   const key = kind + ":" + sid + ":" + (msg.data.id || msg.data.job || "");
   const now = Date.now();
@@ -2583,6 +2587,30 @@ function systimerHtml(data){
     ${[15, 30, 60, 120].map(m => `<option value="${m}">${m} 分钟</option>`).join("")}
     </select><button class="ibtn secondary" data-sleep-set>定时睡眠</button></div>`;
 }
+// 推迟睡眠开关与通知过滤行：开关状态来自服务端，过滤阈值存 localStorage，
+// 轮询重写 innerHTML 时两者都按数据源重设，不会丢失选择
+// 残留进程：托管进程退出后仍存活的后代；逐个或全部结束（terminate，前端 confirm）
+function orphansHtml(data){
+  const list = data.orphans || [];
+  if(!list.length) return "";
+  return `<div class="sysrow" style="margin-top:10px"><span>残留进程（托管已退出）</span></div>
+    ${list.map(o => `<div class="sysrow"><span>${esc(o.name)} <span class="mut">#${o.pid} · ${fmtUptime(o.age)}</span></span>
+      <button class="ibtn secondary" data-orphan-end="${o.pid}">结束</button></div>`).join("")}
+    <div class="sysacts"><button class="ibtn secondary" data-orphan-end-all>全部结束</button></div>`;
+}
+function keepAwakeHtml(data){
+  if(!data.keep_awake_supported) return "";
+  return `<div class="systimer"><label title="有会话工作时阻止系统自动睡眠；不唤醒已睡系统、不影响定时/手动睡眠，屏幕可正常关闭">
+    <input type="checkbox" id="keepawake" ${data.keep_awake ? "checked" : ""}> 干活时推迟睡眠</label>
+    ${data.awake_held ? '<span class="mut">保持中</span>' : ""}</div>`;
+}
+function notifyFilterHtml(){
+  const v = localStorage.getItem("notify_min_duration") || "30";
+  return `<div class="systimer"><label title="短于该时长的回合完成不发送浏览器通知（待审批与失败不受影响）">短回合不提醒
+    <select id="notifymindur">${[[0, "不限制"], [10, "10 秒"], [30, "30 秒"], [60, "60 秒"]]
+      .map(([n, t]) => `<option value="${n}" ${String(n) === v ? "selected" : ""}>${t}</option>`).join("")}
+    </select></label></div>`;
+}
 function sysPopHtml(data){
   if(!data) return '<div class="mut">加载中…</div>';
   // 错误分支也保留操作提示与定时行：已设定的定时仍在跑，错误态下必须还能看到剩余时间并取消
@@ -2602,7 +2630,10 @@ function sysPopHtml(data){
     <div class="sysbar"><i style="width:${Math.min(100, data.swap_percent || 0)}%"></i></div>` : ""}
     <div class="sysrow" style="margin-top:10px"><span>已运行 ${fmtUptime(data.uptime || 0)} · ${esc(data.hostname || "")}</span></div>
     ${sysPop.note ? `<div role="status" style="margin-top:6px">${esc(sysPop.note)}</div>` : ""}
+    ${orphansHtml(data)}
+    ${keepAwakeHtml(data)}
     ${systimerHtml(data)}
+    ${notifyFilterHtml()}
     <div class="sysacts"><button class="ibtn danger" data-power="restart">重启</button>
       <button class="ibtn danger" data-power="sleep">睡眠</button></div>`;
 }
@@ -2719,9 +2750,54 @@ updateNotifyBtn();
 document.getElementById("sysbtn").addEventListener("click", e => {
   toggleSysPop(sysPop.timer == null);
 });
+document.getElementById("syspop").addEventListener("change", e => {
+  if(!e.target) return;
+  if(e.target.id === "keepawake") setKeepAwake(e.target.checked);
+  if(e.target.id === "notifymindur") localStorage.setItem("notify_min_duration", e.target.value);
+});
+async function endOrphans(body){
+  try{
+    const r = await fetchT("/system/orphans/end", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const j = await r.json().catch(() => null);
+    if(r.ok && j && sysData){
+      sysData.orphans = j.orphans || [];
+      sysPop.note = "已发送终止指令";
+    }else{
+      sysPop.note = (j && j.error) || "操作失败";
+    }
+  }catch(e){ sysPop.note = "操作失败：" + (e && e.message || e); }
+  renderSysPop();
+}
+async function setKeepAwake(enabled){
+  try{
+    const r = await fetchT("/system/keep-awake", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({enabled})});
+    let j = null;
+    try{ j = await r.json(); }catch(e){}
+    if(r.ok && j && sysData){
+      sysData.keep_awake = j.keep_awake;
+      sysData.awake_held = j.awake_held;
+      sysPop.note = enabled ? "已开启：有会话工作时阻止系统自动睡眠" : "已关闭推迟睡眠";
+    }else{
+      sysPop.note = (j && j.error) || "设置失败";
+    }
+  }catch(e){ sysPop.note = "设置失败：" + (e && e.message || e); }
+  renderSysPop();
+}
 document.getElementById("syspop").addEventListener("click", e => {
   const btn = e.target.closest && e.target.closest("[data-power]");
   if(btn){ e.preventDefault(); sendPower(btn.dataset.power); return; }
+  const orphanEnd = e.target.closest && e.target.closest("[data-orphan-end]");
+  if(orphanEnd){
+    if(window.confirm(`结束进程 #${orphanEnd.dataset.orphanEnd}？`))
+      endOrphans({pid: Number(orphanEnd.dataset.orphanEnd)});
+    return;
+  }
+  if(e.target.closest && e.target.closest("[data-orphan-end-all]")){
+    if(window.confirm("结束全部残留进程？")) endOrphans({all: true});
+    return;
+  }
   const set = e.target.closest && e.target.closest("[data-sleep-set]");
   if(set){
     const sel = document.getElementById("sleeptimermin");

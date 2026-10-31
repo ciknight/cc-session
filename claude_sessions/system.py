@@ -61,3 +61,25 @@ def spawn_power(action):
     subprocess.Popen(power_command(action), stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL,
                      creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+
+
+def keep_awake_supported():
+    """目前仅实现 Windows 的推迟睡眠（其他平台开关不展示）。"""
+    return sys.platform == "win32"
+
+
+def set_keep_awake(enabled):
+    """设置/解除「阻止系统空闲自动睡眠」。
+
+    ES_SYSTEM_REQUIRED 只影响 idle 睡眠：不唤醒已睡系统、不关屏幕（不含
+    ES_DISPLAY_REQUIRED）、也不影响主动睡眠指令（定时睡眠/手动睡眠照常）。
+    该状态是进程级的，进程退出后自动失效，无需担心残留（fail-safe）。
+    """
+    if not keep_awake_supported():
+        raise SystemInfoUnavailable("当前平台不支持推迟睡眠")
+    import ctypes
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    state = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if enabled else 0)
+    if ctypes.windll.kernel32.SetThreadExecutionState(state) == 0:
+        raise OSError("SetThreadExecutionState 调用失败")

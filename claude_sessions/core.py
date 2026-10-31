@@ -30,6 +30,7 @@ from .util import clip
 from .session import Session
 from .transcript import classify_user_line, TASK_TOOL_USE_ID_RE, _result_text
 from .hosted import Hosted
+from .orphans import OrphanWatcher
 
 
 class Monitor:
@@ -94,6 +95,60 @@ class Monitor:
         self.sleep_timer_lock = threading.Lock()
         self.sleep_timer = None
         self.sleep_timer_deadline = None
+        # 干活时推迟睡眠：仅跟随 working 状态持有，进程退出自动失效；
+        # 开关本身持久化，默认关
+        self.keep_awake = self._load_keep_awake_pref()
+        self.awake_held = False
+        self.last_awake_check = 0.0
+        # 孤儿进程观察：托管退出后仍存活的后代进程
+        self.orphans = OrphanWatcher()
+        self.last_orphan_sample = 0.0
+
+    def _keep_awake_pref_path(self):
+        return config.CLAUDE_DIR / "claude-sessions" / "power.json"
+
+    def _load_keep_awake_pref(self):
+        try:
+            data = json.loads(self._keep_awake_pref_path().read_text(encoding="utf-8"))
+            return bool(data.get("keep_awake"))
+        except (OSError, ValueError):
+            return False
+
+    def set_keep_awake(self, enabled):
+        """开关「有会话工作时阻止系统自动睡眠」；立即按当前状态评估一次。"""
+        if enabled and not system.keep_awake_supported():
+            return 400, {"error": "当前平台不支持推迟睡眠"}
+        self.keep_awake = bool(enabled)
+        path = self._keep_awake_pref_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"keep_awake": self.keep_awake}), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f"[system] 保存推迟睡眠开关失败: {e}", flush=True)
+        self._apply_keep_awake()
+        return 200, {"keep_awake": self.keep_awake, "awake_held": self.awake_held}
+
+    def _keep_awake_needed(self):
+        if not self.keep_awake:
+            return False
+        now = util.now_ts()
+        with self.lock:
+            return any(s.state == "working" and s.last_event_ts
+                       and now - s.last_event_ts <= self.stale_after
+                       for s in self.unique_sessions())
+
+    def _apply_keep_awake(self):
+        needed = self._keep_awake_needed()
+        if needed == self.awake_held:
+            return
+        try:
+            system.set_keep_awake(needed)
+            self.awake_held = needed
+            print(f"[system] 推迟睡眠 {'开启（有会话工作中）' if needed else '解除'}", flush=True)
+        except (OSError, system.SystemInfoUnavailable) as e:
+            print(f"[system] 推迟睡眠设置失败: {e}", flush=True)
 
     def with_metadata(self, summary):
         """仅装饰公开投影，不修改 Session/title/扫描缓存。"""
@@ -737,7 +792,9 @@ class Monitor:
         if sess.state == "idle":
             return
         sess.state = "idle"
-        self.emit(sess, "turn_finished", {"last": sess.last_assistant})
+        # 回合时长近似为最后用户输入到回合结束；供前端过滤短回合通知
+        duration = max(0, util.now_ts() - sess.last_input_ts) if sess.last_input_ts else None
+        self.emit(sess, "turn_finished", {"last": sess.last_assistant, "duration": duration})
 
     def handle_line(self, sess, line):
         try:
@@ -1267,5 +1324,20 @@ class Monitor:
             if not self.first_scan_done:
                 self.first_scan_done = True
                 print(f"[monitor] 初次扫描完成，发现 {len(self.sessions)} 个会话")
+            # 推迟睡眠每 15 秒评估一次；开关切换时 set_keep_awake 会立即评估
+            if util.now_ts() - self.last_awake_check >= 15:
+                self.last_awake_check = util.now_ts()
+                self._apply_keep_awake()
+            # 孤儿进程每 60 秒采样一次后代树（退出时 ppid 可能已断链）
+            if util.now_ts() - self.last_orphan_sample >= 60:
+                self.last_orphan_sample = util.now_ts()
+                self.orphans.sample(self.hosted)
             self.shutdown_event.wait(interval)
         self.maybe_save_cache(force=True)
+        # 服务退出：解除推迟睡眠（进程退出本身也会失效，这里尽早恢复正常）
+        if self.awake_held:
+            try:
+                system.set_keep_awake(False)
+                self.awake_held = False
+            except (OSError, system.SystemInfoUnavailable):
+                pass

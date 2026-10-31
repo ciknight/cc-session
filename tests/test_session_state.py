@@ -47,6 +47,17 @@ class SessionStateTests(unittest.TestCase):
         }], stop_reason="tool_use")
         self.line("assistant", [{"type": "text", "text": "Done"}], stop_reason="end_turn")
 
+    def test_turn_finished_event_includes_duration(self):
+        events = []
+        self.mon.first_scan_done = True
+        self.mon.emit = lambda sess, kind, data, transient=False: events.append((kind, data))
+        self.line("user", "hello")
+        self.sess.last_input_ts = self.now - 42
+        self.line("assistant", [{"type": "text", "text": "done"}], stop_reason="end_turn")
+        finished = [d for k, d in events if k == "turn_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["duration"], 42)
+
     def test_active_agent_keeps_session_working_after_main_turn_ends(self):
         self.start_agent_and_finish_main_turn()
 

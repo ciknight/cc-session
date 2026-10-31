@@ -466,6 +466,8 @@ class Hosted:
             "result": clip(job.get("result") or "", 300),
             "cost_usd": job.get("cost_usd"),
             "result_session_id": job.get("result_session_id"),
+            "duration": (max(0, job["finished_at"] - job["started_at"])
+                         if job.get("finished_at") and job.get("started_at") else None),
             "is_error": job.get("result_is_error", False)})
 
     def _on_stream_event(self, obj):

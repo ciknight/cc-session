@@ -33,8 +33,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - `session.py` — `Session`：单个转录的累计状态与列表/详情投影
 - `transcript.py` — 转录行解析（`parse_msg_line` 等对话消息提取）
 - `http_api.py` — `make_handler`：REST/SSE/hook 回调/静态资源
-- `interactions.py` — `Interaction` 与审批预览；`system.py` — 系统采样与电源；
-  `commands.py` — slash 命令扫描；`util.py` — 纯工具函数；`config.py` — 路径与可调常量；
+- `interactions.py` — `Interaction` 与审批预览；`system.py` — 系统采样、电源与推迟睡眠；
+  `orphans.py` — 托管残留进程观察；`commands.py` — slash 命令扫描；
+  `util.py` — 纯工具函数；`config.py` — 路径与可调常量；
   `hook.py` — hook 客户端；`app.py` — CLI 入口与完整用法文档
 
 **可替换依赖约定**：`config` 常量、`system` 电源/采样函数、`util.now_ts` 时钟一律以
@@ -73,6 +74,12 @@ uv run monitor.py --webhook http://localhost:3000/hook
    `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲），
 `POST /system/sleep-timer` 定时睡眠（服务端 `threading.Timer` 内存态，minutes 0-720、0 取消，
 `GET /system` 的 `sleep_timer_remaining` 随轮询返回剩余秒）。
+`POST /system/keep-awake` 开关「干活时推迟睡眠」（仅 Windows `SetThreadExecutionState(ES_SYSTEM_REQUIRED)`：
+只挡 idle 自动睡眠，不唤醒已睡系统、不妨碍屏幕关闭与定时/手动睡眠；有非 stale 的 working 会话时持有，
+15 秒评估一次，进程退出自动失效 fail-safe；开关持久化在 `claude-sessions/power.json`）。
+`OrphanWatcher`（`orphans.py`）每 60 秒采样托管进程后代树（退出时 ppid 可能断链，故持续采样），
+托管退出后仍存活的后代列为残留进程（PID 复用一律比对 create_time，只读短进程名），
+`GET /system` 带 `orphans` 列表，`POST /system/orphans/end` 按 pid 或 all 发送 terminate。
 4. **远程发消息/托管**（`send_message` + `Hosted`）：`POST /sessions/<id>/message` 用
    `claude -p --resume` 跑一轮（异步 job，`GET /jobs/<id>` 查询）；`POST /hosted` 启动
    stream-json 双向的常驻 claude 进程，消息写 stdin、忙时排队，已托管会话的
@@ -164,6 +171,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
   失败 `hosted_turn_done`、`remote_message_done`，按 kind+sid+id 5 秒冷却去重，覆盖两路重复投递），
   重连对账与轮询不补发，点击通知聚焦并 `navigate` 到对应会话；
   无 Service Worker/推送/唤醒锁，系统睡眠零干预，睡眠期间错过的事件只更新看板不补通知。
+  短回合过滤：`turn_finished` 与 `hosted_turn_done` 带 `duration`（回合秒数），
+  系统面板可选 10/30/60 秒阈值（localStorage `notify_min_duration`，默认 30），
+  仅过滤新回复类通知，待审批与失败始终提醒。
   标题栏显示 `(未读+待审批数)` 前缀（`updateDocTitle`）。
 - **URL 路由**：看板视图与地址栏同步，`/p/<项目路径>` 是项目列表，
   `/p/<项目路径>/s/<会话ID>` 是对话，`/p/<项目路径>/new` 是新建；项目路径保留目录层级
@@ -217,4 +227,4 @@ detail 轮询的 `commands`，仅托管会话有），`<details>` 的展开状�
 或输入法。草稿、未读及搜索条件随整页刷新清空；别名/置顶/归档由独立元数据持久化。
 归档范围与原搜索/状态条件取交集后稳定按置顶分组，组内保留原顺序；详情标题软更新，不重建输入区。
 待处理页和队列摘要均不能因查看、取消或整理操作提前清除新回复提示。
-header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/睡眠经 `window.confirm` 二次确认后 POST；定时睡眠行按 `sleep_timer_remaining` 切换（未设定：预设下拉（15/30/60/120 分钟）+ 设定按钮，已设定：剩余时间 + 取消），轮询重写 innerHTML 时保留用户选中的预设值。
+header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/睡眠经 `window.confirm` 二次确认后 POST；定时睡眠行按 `sleep_timer_remaining` 切换（未设定：预设下拉（15/30/60/120 分钟）+ 设定按钮，已设定：剩余时间 + 取消），轮询重写 innerHTML 时保留用户选中的预设值。另有「干活时推迟睡眠」开关（`#keepawake`）、短回合通知阈值（`#notifymindur`）与残留进程区块（`orphansHtml`，逐个/全部结束均 confirm 后 POST）。

@@ -73,6 +73,10 @@ def make_handler(mon, refresh_interval):
                     return self._json({"error": f"系统状态采集失败：{e}",
                                        "sleep_timer_remaining": mon.sleep_timer_remaining()}, 500)
                 data["sleep_timer_remaining"] = mon.sleep_timer_remaining()
+                data["keep_awake"] = mon.keep_awake
+                data["awake_held"] = mon.awake_held
+                data["keep_awake_supported"] = system.keep_awake_supported()
+                data["orphans"] = mon.orphans.list()
                 return self._json(data)
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
@@ -374,6 +378,24 @@ def make_handler(mon, refresh_interval):
                 except OSError as e:
                     return self._json({"error": f"电源命令执行失败：{e}"}, 500)
                 return self._json({"ok": True})
+            if u.path == "/system/orphans/end":
+                body = self._read_body()
+                if not isinstance(body, dict):
+                    return self._json({"error": "invalid JSON body"}, 400)
+                if body.get("all") is True:
+                    mon.orphans.end_all()
+                else:
+                    pid = body.get("pid")
+                    if isinstance(pid, bool) or not isinstance(pid, int):
+                        return self._json({"error": "body must contain integer pid, or {\"all\": true}"}, 400)
+                    mon.orphans.end(pid)
+                return self._json({"orphans": mon.orphans.list()})
+            if u.path == "/system/keep-awake":
+                body = self._read_body()
+                if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+                    return self._json({"error": "body must contain {\"enabled\": true|false}"}, 400)
+                code, resp = mon.set_keep_awake(body["enabled"])
+                return self._json(resp, code)
             if u.path == "/system/sleep-timer":
                 body = self._read_body()
                 raw = body.get("minutes") if isinstance(body, dict) else None
