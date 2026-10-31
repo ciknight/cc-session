@@ -38,7 +38,8 @@ Claude Code is great at running tasks. Once several sessions are active, keeping
 | **Flexible approvals** | Choose browser-based approval, Claude CLI permission handling, or automatic approval per hosted session. |
 | **Fast on large histories** | Incremental JSONL parsing, persistent scan caching, lazy subagent loading, and paginated message windows. |
 | **Self-contained frontend** | Local frontend assets with no external CDN required; the backend uses Python, Jinja2, and psutil. |
-| **System panel** | Host CPU and memory visibility, plus optional sleep, timed sleep, and restart controls. |
+| **Browser notifications** | Alerts for new replies, pending approvals, and failures while the tab is hidden, with short-turn filtering and an unread count in the tab title. |
+| **System panel** | Host CPU and memory, optional sleep/timed sleep/restart, keep-awake while sessions work (Windows), and orphaned-process cleanup. |
 | **cc-switch integration** | Optional project-local profile switching when `cc-switch` is installed, with confirmation and backups. |
 
 ## Quick start
@@ -139,7 +140,7 @@ The dashboard is only one client of the service. You can use the same live data 
 | `POST /sessions/<id>/effort` | Set hosted effort to `low`, `medium`, `high`, or `default`. |
 | `GET /jobs/<id>` | Query a messaging job. |
 | `GET /healthz` | Health check. |
-| `GET /system` | Host CPU, memory, and sleep-timer status. |
+| `GET /system` | Host CPU, memory, sleep-timer, keep-awake, and orphaned-process status. |
 
 For example:
 
@@ -197,6 +198,8 @@ uv run python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 The project intentionally stays lightweight: a Python standard-library HTTP server, Jinja2 templates, psutil system sampling, and a self-contained JavaScript frontend.
+
+The backend is organized as the `claude_sessions` package: `core` (scanning, jobs, events), `hosted` (persistent Claude processes), `session` and `transcript` (session state and message parsing), `http_api` (REST/SSE), plus `interactions`, `system`, `orphans`, `commands`, `util`, `config`, `hook`, and `app`. The root `monitor.py` remains the entry point and a compatibility facade that re-exports the public symbols.
 
 The bilingual documentation website lives in [`docs/`](docs/). It is deployed to [GitHub Pages](https://ciknight.github.io/cc-session/) by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) on pushes to `main` that change the site. To preview it locally, open `docs/index.html` or serve that directory with any static HTTP server.
 

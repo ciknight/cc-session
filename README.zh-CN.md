@@ -38,7 +38,8 @@ Claude Code 很擅长执行任务，但同时运行多个会话后，管理本�
 | **灵活的审批方式** | 每个托管会话可选择网页审批、交给 Claude CLI 权限模式，或自动放行。 |
 | **大型历史记录也高效** | 增量解析 JSONL、持久化扫描缓存、子代理懒加载，以及按需分页的消息窗口。 |
 | **自包含前端** | 前端依赖全部本地提供，不依赖外部 CDN；后端仅使用 Python、Jinja2 和 psutil。 |
-| **系统面板** | 查看宿主机 CPU 和内存，并提供可选的睡眠、定时睡眠和重启操作。 |
+| **浏览器通知** | 页面隐藏时提醒新回复、待审批和任务失败，支持短回合过滤，标签页标题显示未读与待审批计数。 |
+| **系统面板** | 查看宿主机 CPU 和内存，提供睡眠、定时睡眠、重启操作，以及干活时推迟睡眠（Windows）和残留进程清理。 |
 | **cc-switch 集成** | 安装 `cc-switch` 后可切换项目 local 配置，带确认和备份机制。 |
 
 ## 快速开始
@@ -139,7 +140,7 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py --host 127.0.0.1
 | `POST /sessions/<id>/effort` | 设置托管思考档位：`low`、`medium`、`high` 或 `default`。 |
 | `GET /jobs/<id>` | 查询发消息任务。 |
 | `GET /healthz` | 健康检查。 |
-| `GET /system` | 获取宿主机 CPU、内存和定时睡眠状态。 |
+| `GET /system` | 获取宿主机 CPU、内存、定时睡眠、推迟睡眠和残留进程状态。 |
 
 例如：
 
@@ -197,6 +198,8 @@ uv run python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 项目刻意保持轻量：Python 标准库 HTTP 服务、Jinja2 模板、psutil 系统采样，以及自包含的 JavaScript 前端。
+
+后端按 `claude_sessions` 包组织：`core`（扫描、任务、事件）、`hosted`（常驻 Claude 进程）、`session` 与 `transcript`（会话状态与消息解析）、`http_api`（REST/SSE），以及 `interactions`、`system`、`orphans`、`commands`、`util`、`config`、`hook`、`app` 等模块。根目录 `monitor.py` 仍是入口，同时作为兼容层重新导出公共符号。
 
 双语文档网站位于 [`docs/`](docs/)。当 `main` 分支上的站点文件发生变化时，[`.github/workflows/pages.yml`](.github/workflows/pages.yml) 会自动部署到 [GitHub Pages](https://ciknight.github.io/cc-session/zh-CN.html)。本地预览可以直接打开 `docs/index.html`，或使用任意静态 HTTP 服务托管该目录。
 
