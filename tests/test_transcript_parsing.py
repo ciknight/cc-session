@@ -108,6 +108,53 @@ class ParseMessageTests(unittest.TestCase):
         self.assertEqual(msg["parts"][0]["type"], "command_output")
         self.assertEqual(msg["parts"][0]["text"], "switched to model x")
 
+    def test_user_and_tool_images_keep_base64_blocks(self):
+        source = {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}
+        user = monitor.parse_msg_line(line({
+            "type": "user", "message": {"content": [
+                {"type": "text", "text": "看图"}, {"type": "image", "source": source}]}}))
+        image = user["parts"][1]
+        self.assertEqual({k: image[k] for k in ("type", "media_type", "data")}, {
+            "type": "image", "media_type": "image/png", "data": "aW1hZ2U="})
+        self.assertEqual(len(image["image_id"]), 64)
+        result = monitor.parse_msg_line(line({
+            "type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "read-1",
+                "content": [{"type": "image", "source": source}]}]},
+            "toolUseResult": {"type": "image", "file": {
+                "base64": "aW1hZ2U=", "type": "image/png"}}}))["parts"][0]
+        self.assertEqual(result["kind"], "image")
+        self.assertEqual(result["text"], "图片")
+        self.assertEqual(len(result["images"]), 1)
+        self.assertEqual(result["images"][0]["data"], "aW1hZ2U=")
+        self.assertEqual(result["images"][0]["image_id"], image["image_id"])
+
+    def test_tool_image_content_ignores_non_dict_blocks(self):
+        source = {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}
+        result = monitor.parse_msg_line(line({
+            "type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "read-1",
+                "content": [None, "ignored", {"type": "image", "source": source}]}]}}))["parts"][0]
+        self.assertEqual(result["kind"], "image")
+        self.assertEqual(len(result["images"]), 1)
+
+    def test_line_level_image_without_path_keeps_placeholder(self):
+        result = monitor.parse_msg_line(line({
+            "type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "read-1", "content": ""}]},
+            "toolUseResult": {"type": "image"}}))["parts"][0]
+        self.assertEqual(result["kind"], "image")
+        self.assertEqual(result["text"], "图片")
+
+    def test_external_or_svg_images_are_not_rendered(self):
+        for source in ({"type": "url", "url": "https://invalid/x.svg"},
+                       {"type": "base64", "media_type": [], "data": "aW1hZ2U="}):
+            with self.subTest(source=source):
+                msg = monitor.parse_msg_line(line({
+                    "type": "user", "message": {"content": [{
+                        "type": "image", "source": source}]}}))
+                self.assertIsNone(msg)
+
     def test_other_system_text_unchanged(self):
         obj = {
             "type": "user",

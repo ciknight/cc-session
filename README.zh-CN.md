@@ -33,8 +33,8 @@ Claude Code 很擅长执行任务，但同时运行多个会话后，管理本�
 | 能力 | 你能获得什么 |
 | --- | --- |
 | **实时会话看板** | 自动发现会话、增量更新、项目分组、搜索、筛选、新回复提示、置顶、别名和归档。 |
-| **完整的对话视图** | 在易读的聊天界面中查看 Markdown 回复、用户消息、工具结果、diff、任务清单和子代理活动。 |
-| **常驻托管会话** | 常驻 `stream-json` Claude 进程，支持流式文本、追问排队、模型选择、思考档位和中断。 |
+| **完整的对话视图** | 在易读的聊天界面中查看 Markdown 回复、用户消息、图片、工具结果、diff、任务清单和子代理活动。 |
+| **常驻托管会话** | 常驻 `stream-json` Claude 进程，支持流式文本、图片附件、追问排队、模型选择、思考档位和中断。 |
 | **灵活的审批方式** | 每个托管会话可选择网页审批、交给 Claude CLI 权限模式，或自动放行。 |
 | **大型历史记录也高效** | 增量解析 JSONL、持久化扫描缓存、子代理懒加载，以及按需分页的消息窗口。 |
 | **自包含前端** | 前端依赖全部本地提供，不依赖外部 CDN；后端仅使用 Python、Jinja2 和 psutil。 |
@@ -131,7 +131,7 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py --host 127.0.0.1
 | `GET /sessions/<id>/messages` | 分页读取对话消息（`limit`、`before`、`from`）。 |
 | `GET /events` | 订阅 SSE 事件流；`?session=<id>` 只接收单个会话。 |
 | `GET /interactions` | 获取待处理的权限和提问交互。 |
-| `POST /sessions/<id>/message` | 使用 `{"text":"..."}` 发送或排队一条消息。 |
+| `POST /sessions/<id>/message` | 使用 `{"text":"..."}` 发送或排队一条消息，可附带 `images`。 |
 | `POST /new` | 在项目目录中创建新的一次性会话。 |
 | `POST /hosted` | 创建或恢复常驻托管会话。 |
 | `GET /sessions/<id>/jobs` | 查看执行中、排队中和最近结束的任务。 |
@@ -141,6 +141,10 @@ CLAUDE_CONFIG_DIR=/path/to/.claude uv run monitor.py --host 127.0.0.1
 | `GET /jobs/<id>` | 查询发消息任务。 |
 | `GET /healthz` | 健康检查。 |
 | `GET /system` | 获取宿主机 CPU、内存、定时睡眠、推迟睡眠和残留进程状态。 |
+
+网页发送框支持选择或粘贴 PNG、JPEG、GIF、WebP 图片，新建、一次性和托管消息均可只发图片。
+API 通过 `images: [{"media_type":"image/png","data":"<纯 base64>"}]` 附件；每次最多 8 张，
+单张原始数据不超过 3.75 MiB，总计不超过 20 MiB。
 
 例如：
 

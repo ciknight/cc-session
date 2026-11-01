@@ -47,6 +47,20 @@ class SessionStateTests(unittest.TestCase):
         }], stop_reason="tool_use")
         self.line("assistant", [{"type": "text", "text": "Done"}], stop_reason="end_turn")
 
+    def test_image_only_user_message_advances_input_state_without_base64_event(self):
+        events = []
+        self.mon.first_scan_done = True
+        self.mon.emit = lambda sess, kind, data, transient=False: events.append((kind, data))
+        self.line("user", [{"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}}])
+        self.assertEqual(self.sess.user_msgs, 1)
+        self.assertEqual(self.sess.last_input_ts, self.now)
+        self.assertEqual(self.sess.first_user, "[图片 1 张]")
+        self.assertEqual(self.sess.last_user, "[图片 1 张]")
+        self.assertEqual(self.sess.state, "working")
+        user_events = [data for kind, data in events if kind == "user_message"]
+        self.assertEqual(user_events, [{"text": "[图片 1 张]"}])
+
     def test_turn_finished_event_includes_duration(self):
         events = []
         self.mon.first_scan_done = True

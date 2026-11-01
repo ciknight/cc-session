@@ -27,6 +27,17 @@ _jinja = Environment(
 )
 
 
+def _payload_bytes(value):
+    """估算缓存 payload 大小；字符串取长度，避免为大图片再做一次编码/序列化。"""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_payload_bytes(v) for v in value.values())
+    if isinstance(value, list):
+        return sum(_payload_bytes(v) for v in value)
+    return 0
+
+
 def make_handler(mon, refresh_interval):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -151,7 +162,7 @@ def make_handler(mon, refresh_interval):
                                 with open(s.path, "rb") as f:
                                     base = _align_line_start(f, size - config.MSG_TAIL_BYTES, size)
                             st = mon.msg_cache[cache_key] = {"base": base, "off": base, "buf": b"",
-                                                             "msgs": [], "tools": {}}
+                                                             "msgs": [], "tools": {}, "bytes": 0}
                         if size != st["off"]:
                             with open(s.path, "rb") as f:
                                 f.seek(st["off"])
@@ -189,6 +200,7 @@ def make_handler(mon, refresh_interval):
                             before = prepended
                             # 吸收会删掉旧窗口的消息：净位移才是调用方游标的移动量
                             shift = len(st["msgs"]) - total_before
+                        st["bytes"] = _payload_bytes(st["msgs"]) + len(st["buf"])
                         total = len(st["msgs"])
                         if before is not None:
                             start, end = max(0, before - limit), min(before, total)
@@ -211,13 +223,18 @@ def make_handler(mon, refresh_interval):
                             mon.msg_active[cache_key] -= 1
                         mon.msg_lru[cache_key] = None
                         mon.msg_lru.move_to_end(cache_key)
-                        # 淘汰最久未用且无活动请求的缓存；全部都在活动中时允许暂时超限
-                        while len(mon.msg_cache) > config.MSG_CACHE_SESSION_LIMIT and mon.msg_lru:
+                        # 淘汰最久未用且无活动请求的缓存；全部都在活动中时允许暂时超限。
+                        # 图片让单文件缓存差异很大，因此文件数与估算字节预算同时生效。
+                        total_bytes = sum(st.get("bytes", 0) for st in mon.msg_cache.values())
+                        while ((len(mon.msg_cache) > config.MSG_CACHE_SESSION_LIMIT
+                                or total_bytes > config.MSG_CACHE_MAX_BYTES) and mon.msg_lru):
                             oldest = next(iter(mon.msg_lru))
                             if oldest in mon.msg_active:
                                 break
                             mon.msg_lru.pop(oldest)
-                            mon.msg_cache.pop(oldest, None)
+                            evicted = mon.msg_cache.pop(oldest, None)
+                            if evicted:
+                                total_bytes -= evicted.get("bytes", 0)
                             mon.msg_locks.pop(oldest, None)
             if u.path.startswith("/sessions/"):
                 sid = u.path.split("/", 2)[2]
@@ -270,10 +287,10 @@ def make_handler(mon, refresh_interval):
                 return self._sse(parse_qs(u.query).get("session", [None])[0])
             self._json({"error": "not found"}, 404)
 
-        def _read_body(self):
+        def _read_body(self, max_bytes=1_000_000):
             try:
                 n = int(self.headers.get("Content-Length", 0))
-                return json.loads(self.rfile.read(min(n, 1_000_000)) or b"{}")
+                return json.loads(self.rfile.read(min(n, max_bytes)) or b"{}")
             except (ValueError, json.JSONDecodeError):
                 return None
 
@@ -438,29 +455,30 @@ def make_handler(mon, refresh_interval):
                             continue
                     return self._json(result)
             if u.path == "/hosted":
-                body = self._read_body()
+                body = self._read_body(config.HTTP_IMAGE_BODY_LIMIT)
                 if not isinstance(body, dict):
                     return self._json({"error": "invalid JSON body"}, 400)
-                text = body.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    return self._json({"error": "body must contain \"text\" (first message)"}, 400)
+                text = body.get("text", "")
+                if not isinstance(text, str):
+                    return self._json({"error": '"text" 必须是字符串'}, 400)
                 code, resp = mon.host_session(body.get("cwd"), body.get("resume_id"),
                                               text, bool(body.get("force")),
                                               body.get("model", UNSET), body.get("approval"),
-                                              body.get("effort", UNSET))
+                                              body.get("effort", UNSET), body.get("images"))
                 return self._json(resp, code)
             if u.path.startswith("/interactions/") and u.path.endswith("/respond"):
                 iid = u.path.split("/")[2]
                 code, resp = mon.respond_interaction(iid, self._read_body())
                 return self._json(resp, code)
             if u.path == "/new":
-                body = self._read_body()
+                body = self._read_body(config.HTTP_IMAGE_BODY_LIMIT)
                 if not isinstance(body, dict):
                     return self._json({"error": "invalid JSON body"}, 400)
-                text = body.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    return self._json({"error": "body must contain \"text\" (first message)"}, 400)
-                code, resp = mon.new_session(body.get("cwd"), text, body.get("model", UNSET))
+                text = body.get("text", "")
+                if not isinstance(text, str):
+                    return self._json({"error": '"text" 必须是字符串'}, 400)
+                code, resp = mon.new_session(body.get("cwd"), text, body.get("model", UNSET),
+                                             body.get("images"))
                 return self._json(resp, code)
             parts = u.path.strip("/").split("/")
             if len(parts) == 5 and parts[0] == "sessions" and parts[2] == "jobs" and parts[4] == "cancel":
@@ -514,14 +532,14 @@ def make_handler(mon, refresh_interval):
                 code, resp = mon.set_effort(parts[1], level)
                 return self._json(resp, code)
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "message":
-                body = self._read_body()
+                body = self._read_body(config.HTTP_IMAGE_BODY_LIMIT)
                 if not isinstance(body, dict):
                     return self._json({"error": "invalid JSON body"}, 400)
-                text = body.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    return self._json({"error": "body must be {\"text\": \"...\"}"}, 400)
+                text = body.get("text", "")
+                if not isinstance(text, str):
+                    return self._json({"error": '"text" 必须是字符串'}, 400)
                 code, resp = mon.send_message(parts[1], text, bool(body.get("force")),
-                                              body.get("model", UNSET))
+                                              body.get("model", UNSET), body.get("images"))
                 return self._json(resp, code)
             self._json({"error": "not found"}, 404)
 

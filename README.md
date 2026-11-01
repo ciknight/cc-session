@@ -33,8 +33,8 @@ Claude Code is great at running tasks. Once several sessions are active, keeping
 | Capability | What you get |
 | --- | --- |
 | **Live session dashboard** | Automatic discovery, incremental updates, project grouping, search, filters, unread replies, pinning, aliases, and archiving. |
-| **Rich conversation view** | Markdown responses, user messages, tool results, diffs, task lists, and subagent activity in a readable chat interface. |
-| **Persistent hosted sessions** | A long-running `stream-json` Claude process with streaming text, queued follow-ups, model selection, effort controls, and interruption. |
+| **Rich conversation view** | Markdown responses, user messages, images, tool results, diffs, task lists, and subagent activity in a readable chat interface. |
+| **Persistent hosted sessions** | A long-running `stream-json` Claude process with streaming text, image attachments, queued follow-ups, model selection, effort controls, and interruption. |
 | **Flexible approvals** | Choose browser-based approval, Claude CLI permission handling, or automatic approval per hosted session. |
 | **Fast on large histories** | Incremental JSONL parsing, persistent scan caching, lazy subagent loading, and paginated message windows. |
 | **Self-contained frontend** | Local frontend assets with no external CDN required; the backend uses Python, Jinja2, and psutil. |
@@ -131,7 +131,7 @@ The dashboard is only one client of the service. You can use the same live data 
 | `GET /sessions/<id>/messages` | Read paginated conversation messages (`limit`, `before`, `from`). |
 | `GET /events` | Subscribe to the SSE stream; `?session=<id>` filters to one session. |
 | `GET /interactions` | List pending permission and question interactions. |
-| `POST /sessions/<id>/message` | Queue or send a message with `{"text":"..."}`. |
+| `POST /sessions/<id>/message` | Queue or send a message with `{"text":"..."}` and optional `images`. |
 | `POST /new` | Start a new one-shot session in a project directory. |
 | `POST /hosted` | Start or resume a persistent hosted session. |
 | `GET /sessions/<id>/jobs` | Inspect running, queued, and recently completed jobs. |
@@ -141,6 +141,10 @@ The dashboard is only one client of the service. You can use the same live data 
 | `GET /jobs/<id>` | Query a messaging job. |
 | `GET /healthz` | Health check. |
 | `GET /system` | Host CPU, memory, sleep-timer, keep-awake, and orphaned-process status. |
+
+The composer accepts pasted or selected PNG, JPEG, GIF, and WebP images; new, one-shot, and hosted messages can be image-only.
+The API accepts `images: [{"media_type":"image/png","data":"<raw base64>"}]`, up to 8 images,
+3.75 MiB of raw data per image, and 20 MiB in total.
 
 For example:
 

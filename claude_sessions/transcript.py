@@ -3,9 +3,11 @@
 与 core.handle_line 的累计状态解析不同，这里只负责 /sessions/<id>/messages
 的按需提取：不维护会话状态，输出 {role, ts, parts} 结构。
 """
+import hashlib
 import json
 import re
 
+from . import config
 from .util import clip, _parse_iso
 
 # 转录里 type=user 的行不一定是真人输入：工具结果回传、isMeta 注入、
@@ -74,15 +76,31 @@ def _patch_text(patch):
     return "\n".join(lines)
 
 
+def _image_part(block):
+    """保留转录里的 base64 图片；不接收 SVG 或外部 URL，前端只生成受控 data URL。"""
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return None
+    media_type, data = source.get("media_type"), source.get("data")
+    if not isinstance(media_type, str) or media_type not in config.IMAGE_MEDIA_TYPES \
+            or not isinstance(data, str) or not data:
+        return None
+    return {"type": "image", "media_type": media_type, "data": data,
+            "image_id": hashlib.sha256(data.encode("utf-8")).hexdigest()}
+
+
 def parse_tool_result(o, block):
     """把 tool_result 与行级 toolUseResult 合并成可展示结果。"""
     tur = o.get("toolUseResult")
     text = _result_text(block)
     kind = "error" if block.get("is_error") else "text"
     content = block.get("content")
-    if isinstance(content, list) and any(
-            isinstance(x, dict) and x.get("type") == "image" for x in content):
-        kind, text = "image", "图片"
+    images = ([p for p in (_image_part(x) for x in content if isinstance(x, dict)) if p]
+              if isinstance(content, list) else [])
+    if images:
+        kind = "image"
+        if not text:
+            text = "图片"
     if isinstance(tur, dict):
         patch = tur.get("structuredPatch")
         if isinstance(patch, list) and patch:
@@ -95,14 +113,23 @@ def parse_tool_result(o, block):
                 chunks.append("[stderr]\n" + str(tur["stderr"]))
             if chunks:
                 text = "\n".join(chunks)
+        elif tur.get("type") == "image":
+            kind = "image"
+            f = tur.get("file") if isinstance(tur.get("file"), dict) else {}
+            path = tur.get("path") or tur.get("filePath") or f.get("filePath")
+            if path:
+                text = str(path)
+            elif not text:
+                text = "图片"
         elif isinstance(tur.get("file"), dict):
             f = tur["file"]
             text = f"{f.get('filePath', '')} ({f.get('numLines', '?')} 行)"
-        elif tur.get("type") == "image":
-            kind, text = "image", str(tur.get("path") or tur.get("filePath") or "图片")
-    return {"type": "tool_result", "tool_use_id": block.get("tool_use_id"),
-            "is_error": bool(block.get("is_error")), "kind": kind,
-            "text": clip(text, 8000)}
+    result = {"type": "tool_result", "tool_use_id": block.get("tool_use_id"),
+              "is_error": bool(block.get("is_error")), "kind": kind,
+              "text": clip(text, 8000)}
+    if images:
+        result["images"] = images
+    return result
 
 
 def _align_line_start(f, offset, size):
@@ -239,6 +266,10 @@ def parse_msg_line(ln, clip_len=8000):
                 # 系统文本（任务通知/命令输出等）截短即可，不需要全文
                 parts.append({"type": "text",
                               "text": clip(text, 500 if role == "system" else clip_len)})
+        elif bt == "image":
+            image = _image_part(b)
+            if image:
+                parts.append(image)
         elif bt == "tool_use":
             parts.append({"type": "tool", "tool_use_id": b.get("id"),
                           "name": b.get("name"), "input": clip(b.get("input") or {}, 500)})

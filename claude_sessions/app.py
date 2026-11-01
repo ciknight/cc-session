@@ -28,6 +28,7 @@ hook 子命令（由托管进程的内联 --settings 调用，不面向用户）
 
 远程发消息:
   POST /sessions/<id>/message  给会话发消息 {"text": "...", "force": false}，返回 job_id。
+                               可选 images: [{"media_type":"image/png","data":"<纯 base64>"}]
                                内部执行 `claude -p --resume <id>`（工作目录取会话的 cwd，
                                环境变量原样继承，所以自建 API / ANTHROPIC_BASE_URL 同样适用）
   GET /jobs/<job_id>           查询发消息任务的状态和回复 (queued / running / done / failed)

@@ -162,6 +162,15 @@ class ManagementAPITests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 403)
                 call.assert_not_called()
 
+    def test_message_api_accepts_image_only_and_forwards_images(self):
+        images = [{'media_type': 'image/png', 'data': 'aW1hZ2U='}]
+        with patch.object(self.mon, 'send_message', return_value=(202, {'job_id': 'j1'})) as send:
+            result = json.load(self.request('/sessions/sid-1/message',
+                {'text': '', 'images': images}, {'Content-Type': 'application/json'}))
+        self.assertEqual(result['job_id'], 'j1')
+        self.assertEqual(send.call_args.args[1], '')
+        self.assertEqual(send.call_args.args[4], images)
+
     def test_hosted_delete_rejects_cross_site_before_stopping(self):
         hosted = SimpleNamespace(stop=lambda *a: None,
                                  info=lambda: {"hosted_id": "h1"})
@@ -416,6 +425,21 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(len(self.mon.msg_cache), 8)
         self.assertNotIn(str(self.project / "s0.jsonl"), self.mon.msg_cache)
         self.assertIn(str(self.project / "s8.jsonl"), self.mon.msg_cache)
+
+    def test_messages_cache_evicts_lru_when_byte_budget_exceeded(self):
+        paths = []
+        for index in range(2):
+            path = self.project / f"image-cache-{index}.jsonl"
+            path.write_text(self._message_line("x" * 100), encoding="utf-8")
+            self.mon.sessions[str(path)] = monitor.Session(f"cache-{index}", path)
+            paths.append(str(path))
+        json.load(self.request("/sessions/cache-0/messages"))
+        budget = self.mon.msg_cache[paths[0]]["bytes"]
+        with patch.object(config, "MSG_CACHE_MAX_BYTES", budget):
+            json.load(self.request("/sessions/cache-1/messages"))
+        self.assertNotIn(paths[0], self.mon.msg_cache)
+        self.assertIn(paths[1], self.mon.msg_cache)
+        self.assertLessEqual(self.mon.msg_cache[paths[1]]["bytes"], budget)
 
     def test_messages_paging_rejects_bad_params(self):
         with self.assertRaises(HTTPError) as error:

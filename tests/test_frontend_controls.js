@@ -1912,6 +1912,109 @@ test('队列：取消旧同文等待项后新回显仍能由自己转录对账�
  b.run('convState.msgs.push({role:"user",parts:[{type:"text",text:"same"}]}); renderConvList()'); assert.equal(b.run('pendingEcho.a'),undefined);
 });
 
+test('图片消息与工具结果渲染受控 data URL', () => {
+ const b=boot();
+ const image='{type:"image",media_type:"image/png",data:"aW1hZ2U="}';
+ const html=b.run(`convHtml([{role:"user",parts:[${image}]},{role:"tool",parts:[{type:"tool_result",kind:"image",images:[${image}]}]}])`);
+ assert.equal((html.match(/<img class="msg-image"/g)||[]).length,2);
+ assert.match(html,/src="data:image\/png;base64,aW1hZ2U="/);
+ assert.equal(b.run('imageHtml({media_type:"image/svg+xml",data:"x"})'),'');
+ assert.equal(b.run(`echoVisible([{role:"user",parts:[${image}]}],{text:"",images:[{data:"x"}]})`),false);
+ const sig=b.run('convGroupSig({role:"user",ts:1,parts:[{type:"image",image_id:"hash-1",media_type:"image/png",data:"aW1hZ2U="}]})');
+ assert.doesNotMatch(sig,/aW1hZ2U=/); assert.match(sig,/hash-1/);
+ assert.notEqual(b.run('convGroupSig({role:"user",parts:[{type:"image",image_id:"hash-2",data:"aW1hZ2U="}]})'),sig);
+ assert.match(b.run('convGroupSig({role:"user",parts:[{type:"image",data:"legacy"}]})'),/legacy/);
+});
+
+test('输入框粘贴图片进入独立附件草稿', async () => {
+ const b=boot();
+ b.context.FileReader=class {readAsDataURL(){this.result='data:image/png;base64,aW1hZ2U=';this.onload();}};
+ b.run('bindSendBox("a",{})');
+ const event={type:'paste',clipboardData:{files:[{type:'image/png',name:'x.png',size:5}]},preventDefault(){this.prevented=true;}};
+ b.node('msgbox').dispatchEvent(event); await flush();
+ assert.equal(event.prevented,true);
+ assert.equal(b.run('imageDraft("a").items.length'),1);
+ assert.equal(b.run('imageDraft("b").items.length'),0);
+ assert.match(b.node('imagedrafts').innerHTML,/data:image\/png;base64/);
+});
+
+test('纯图片发送提交 images，202 后只清理已提交版本', async () => {
+ let body;
+ const b=boot(async(url,opts={})=>{
+   if(url.endsWith('/message')){body=JSON.parse(opts.body);return {ok:true,status:202,json:async()=>({job_id:'j'})};}
+   if(url==='/jobs/j') return response({status:'done'});
+   return frontendFetch(url);
+ }); b.context.setTimeout=fn=>{fn();return 1;};
+ b.run('view={project:"/p",session:"a"};curPanel={type:"conv",key:"a"};bindSendBox("a",{});'+
+   'imageDraft("a").items=[{media_type:"image/png",data:"aW1hZ2U=",name:"x",size:5}];imageDraft("a").version=2;');
+ await b.node('sendbtn').onclick();
+ assert.equal(body.text,''); assert.equal(body.images[0].data,'aW1hZ2U=');
+ assert.equal(b.run('imageDraft("a").items.length'),0);
+});
+
+test('附件读取按草稿串行，pending 禁发且并发不突破数量限制', async () => {
+ const readers=[]; const b=boot();
+ b.context.FileReader=class {constructor(){readers.push(this);} readAsDataURL(){}};
+ b.run('view={project:"/p",session:"a"};curPanel={type:"conv",key:"a"};bindSendBox("a",{});'+
+   'imageDraft("a").items=Array.from({length:6},(_,i)=>({media_type:"image/png",data:"old"+i,size:1}));');
+ const file=name=>({type:'image/png',name,size:1});
+ b.context.files=[file('a'),file('b')]; b.context.more=[file('c'),file('d')];
+ const first=b.run('addImageFiles("a",files)');
+ const second=b.run('addImageFiles("a",more)');
+ await flush();
+ assert.equal(readers.length,1); assert.equal(b.node('sendbtn').disabled,true);
+ readers[0].result='data:image/png;base64,QQ=='; readers[0].onload(); await flush();
+ assert.equal(readers.length,2);
+ readers[1].result='data:image/png;base64,Qg=='; readers[1].onload();
+ await first; await second; await flush();
+ assert.equal(readers.length,2,'达到上限后第二批不应再读取文件');
+ assert.equal(b.run('imageDraft("a").items.length'),8);
+ assert.equal(b.run('imageDraft("a").pending'),0);
+ assert.equal(b.node('sendbtn').disabled,false);
+ assert.match(b.node('sendst').textContent,/最多发送 8 张/);
+});
+
+test('新建 SID 迁移只携带 202 前追加的未提交图片', async () => {
+ const posts=[],polls=[]; const b=boot((url,opts={})=>{
+   if(url==='/new') return new Promise(r=>posts.push(r));
+   if(url==='/jobs/j') return new Promise(r=>polls.push(r));
+   return frontendFetch(url);
+ }); b.context.setTimeout=fn=>{fn();return 1;};
+ b.run('sessions=[{id:"created",project:"/p"}];navigate({project:"/p",new:true});');
+ typeDraft(b,'first');
+ b.run('imageDraft("new:/p").items=[{media_type:"image/png",data:"QQ==",name:"sent",size:1}];');
+ const pending=b.node('sendbtn').onclick(); await flush();
+ b.run('const d=imageDraft("new:/p");d.items.push({media_type:"image/png",data:"Qg==",name:"next",size:1});d.version++;');
+ posts.shift()({ok:true,status:202,json:async()=>({job_id:'j'})}); await flush();
+ assert.equal(b.run('imageDraft("new:/p").items.map(x=>x.data).join()'),'Qg==');
+ polls.shift()(response({status:'running',result_session_id:'created'})); await flush();
+ assert.equal(b.run('view.session'),'created');
+ assert.equal(b.run('imageDraft("new:/p").items.length'),0);
+ assert.equal(b.run('imageDraft("created").items.map(x=>x.data).join()'),'Qg==');
+ polls.shift()(response({status:'done',session:'created'})); await pending;
+});
+
+test('202 按附件身份清理，删除旧图不会留下已提交副本', () => {
+ const b=boot();
+ b.run('imageDraft("a").items=['+
+   '{media_type:"image/png",data:"A",size:1},{media_type:"image/png",data:"B",size:1}];'+
+   'submittedImages=captureImageDraft("a");'+
+   'imageDraft("a").items.push({media_type:"image/png",data:"C",size:1});'+
+   'imageDraft("a").items.shift();clearSubmittedImages(submittedImages);');
+ assert.equal(b.run('imageDraft("a").items.map(x=>x.data).join()'),'C');
+});
+
+test('图文混合粘贴保留文本默认行为并添加图片', async () => {
+ const b=boot();
+ b.context.FileReader=class {readAsDataURL(){this.result='data:image/png;base64,QQ==';this.onload();}};
+ b.run('bindSendBox("a",{})');
+ const event={type:'paste',clipboardData:{files:[{type:'image/png',name:'x',size:1}],getData:()=>'混合文本'},
+   preventDefault(){this.prevented=true;}};
+ b.node('msgbox').dispatchEvent(event); await flush();
+ assert.equal(event.prevented,undefined);
+ assert.equal(b.run('imageDraft("a").items.length'),1);
+});
+
 
 test('发送所有权：旧POST的202/non202/catch都不能替换最新槽或回显', async () => {
  for(const result of ['202','500','catch']){

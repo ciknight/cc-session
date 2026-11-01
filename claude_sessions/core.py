@@ -26,7 +26,7 @@ from session_preferences import (APPROVAL_MODES, ApprovalPreferences, EFFORT_LEV
 from cc_switch import CCSwitch
 
 from . import config, system, util
-from .util import clip
+from .util import clip, message_content, message_summary, _arg_present
 from .session import Session
 from .transcript import classify_user_line, TASK_TOOL_USE_ID_RE, _result_text
 from .hosted import Hosted
@@ -257,7 +257,11 @@ class Monitor:
         self.preferences.set(sid, model)
         return model
 
-    def send_message(self, sid, text, force=False, model=UNSET):
+    def send_message(self, sid, text, force=False, model=UNSET, images=None):
+        try:
+            content = message_content(text, images)
+        except ValueError as e:
+            return 400, {"error": str(e)}
         # 子代理默认懒加载；这里补加载以保留“只读、拒绝发送”的 400 语义
         self.ensure_subagent(sid)
         with self.lock:
@@ -271,7 +275,7 @@ class Monitor:
         if not cwd or not os.path.isdir(cwd):
             return 400, {"error": f"session cwd unavailable: {cwd}"}
         with self.cc_switch.operation(cwd):
-            return self._send_message_locked(sid, text, force, model)
+            return self._send_message_locked(sid, content, force, model)
 
     def _send_message_locked(self, sid, text, force=False, model=UNSET):
         """给会话发消息；model 是该会话后续发送的模型覆盖。"""
@@ -359,7 +363,27 @@ class Monitor:
     def _exec(self, job, cmd, cwd, text):
         """同步跑一轮；结果先存局部，最终在 owner 锁下一次提交。"""
         result, result_sid, error = None, None, None
+        stream_json = isinstance(text, list)
         try:
+            # 带图片时输入/输出都必须是 stream-json；CLI 拒绝 stream-json 输入 + json 输出。
+            if stream_json:
+                # 用户 --claude-args 里同名参数也要移除，保证最终协议只有一组。
+                for name in ("--input-format", "--output-format"):
+                    filtered, skip = [], False
+                    for arg in cmd:
+                        if skip:
+                            skip = False
+                        elif arg == name:
+                            skip = True
+                        elif not arg.startswith(name + "="):
+                            filtered.append(arg)
+                    cmd = filtered
+                cmd += ["--input-format", "stream-json",
+                        "--output-format", "stream-json"]
+                if not _arg_present(cmd, "--verbose"):
+                    cmd.append("--verbose")
+                text = json.dumps({"type": "user", "message": {
+                    "role": "user", "content": text}}, ensure_ascii=False) + "\n"
             # 环境变量原样继承，所以 ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY 等自定义配置同样生效
             # 显式 utf-8：Windows 中文系统默认是 gbk，会把中文消息和回复弄乱
             p = subprocess.run(cmd, input=text, capture_output=True, text=True,
@@ -367,11 +391,24 @@ class Monitor:
                                cwd=cwd, timeout=self.msg_timeout)
             out = p.stdout.strip()
             try:
-                data = json.loads(out)
-                result = data.get("result")
-                result_sid = data.get("session_id")
-                if data.get("is_error") or p.returncode != 0:
-                    error = clip(data.get("result") or p.stderr, 500)
+                if stream_json:
+                    data = None
+                    for raw in out.splitlines():
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(event, dict) and event.get("type") == "result":
+                            data = event
+                    if data is None:
+                        error = clip("Claude 未返回 result 事件: " + (p.stderr or out), 500)
+                else:
+                    data = json.loads(out)
+                if data is not None:
+                    result = data.get("result")
+                    result_sid = data.get("session_id")
+                    if data.get("is_error") or p.returncode != 0:
+                        error = clip(data.get("result") or p.stderr or out, 500)
             except json.JSONDecodeError:
                 result = clip(out, 2000)
                 if p.returncode != 0:
@@ -390,8 +427,12 @@ class Monitor:
                 sid = job["session"]
             self.queue_changed(sid)
 
-    def new_session(self, cwd, text, model=UNSET):
+    def new_session(self, cwd, text, model=UNSET, images=None):
         """在 cwd 启动一个全新会话；返回 job_id。"""
+        try:
+            content = message_content(text, images)
+        except ValueError as e:
+            return 400, {"error": str(e)}
         if not isinstance(cwd, str) or not cwd or not os.path.isdir(cwd):
             return 400, {"error": f"cwd unavailable: {cwd}"}
         try:
@@ -405,10 +446,10 @@ class Monitor:
                 if key in self.new_cwd_busy:
                     return 409, {"error": "该目录的新会话仍在运行，请稍后再试"}
                 self.new_cwd_busy.add(key)
-            job = self._new_job(None, text, selected)
+            job = self._new_job(None, content, selected)
             with self.lock:
                 job["status"] = "running"
-            threading.Thread(target=self._run_new_job, args=(cwd, job, text, selected, key), daemon=True).start()
+            threading.Thread(target=self._run_new_job, args=(cwd, job, content, selected, key), daemon=True).start()
         return 202, {"job_id": job["id"], "status": "running"}
 
     def _run_new_job(self, cwd, job, text, selected_model=None, cwd_key=None):
@@ -433,7 +474,8 @@ class Monitor:
 
     def _new_job(self, sid, text, selected_model=None, owner=None):
         job = {"id": secrets.token_hex(6), "session": sid, "status": "queued",
-               "started_at": util.now_ts(), "finished_at": None, "text": clip(text, 200),
+               "started_at": util.now_ts(), "finished_at": None,
+               "text": clip(message_summary(text), 200),
                "requested_model": selected_model, "_owner": owner,
                "result": None, "error": None, "result_session_id": None}
         with self.lock:
@@ -543,7 +585,11 @@ class Monitor:
             self.emit(sess, "queue_changed", {"session": sid})
 
     def host_session(self, cwd, resume_id, text, force=False, model=UNSET,
-                     approval=None, effort=UNSET):
+                     approval=None, effort=UNSET, images=None):
+        try:
+            content = message_content(text, images)
+        except ValueError as e:
+            return 400, {"error": str(e)}
         # 子代理默认懒加载；补加载以保留“只读、拒绝托管”的 400 语义
         if resume_id:
             self.ensure_subagent(resume_id)
@@ -553,7 +599,7 @@ class Monitor:
         if not isinstance(target, str) or not target or not os.path.isdir(target):
             return 400, {"error": f"cwd unavailable: {target}"}
         with self.cc_switch.operation(target):
-            return self._host_session_locked(cwd, resume_id, text, force, model,
+            return self._host_session_locked(cwd, resume_id, content, force, model,
                                              approval, effort)
 
     def _host_session_locked(self, cwd, resume_id, text, force=False, model=UNSET,
@@ -908,13 +954,16 @@ class Monitor:
             if kind == "user" and not sidechain:
                 text = " ".join(b.get("text", "") for b in blocks
                                 if isinstance(b, dict) and b.get("type") == "text")
-                if text:
+                image_count = sum(isinstance(b, dict) and b.get("type") == "image"
+                                  for b in blocks)
+                if text or image_count:
+                    summary = text or f"[图片 {image_count} 张]"
                     sess.user_msgs += 1
                     sess.last_api_error = None
                     sess.last_input_ts = ts_epoch or util.now_ts()
                     if sess.first_user is None:
-                        sess.first_user = clip(text, 80)
-                    sess.last_user = clip(text)
+                        sess.first_user = clip(summary, 80)
+                    sess.last_user = clip(summary)
                     self._set_working(sess)
                     self.emit(sess, "user_message", {"text": sess.last_user})
             elif sidechain or kind in ("tool", "injected", "system", "meta_tool"):

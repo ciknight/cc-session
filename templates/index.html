@@ -160,6 +160,14 @@ h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-tra
 .model-controls input[hidden]{display:none}
 .composer{position:relative}
 .composer textarea{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit}
+.msg-image{display:block;max-width:min(420px,100%);max-height:420px;object-fit:contain;
+  border:1px solid var(--bd);border-radius:8px;margin:6px 0;background:var(--card2)}
+#imageinput{display:none}
+#imagedrafts{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.image-draft{position:relative;width:72px;height:72px}
+.image-draft .msg-image{width:72px;height:72px;margin:0;object-fit:cover}
+.image-draft button{position:absolute;right:-5px;top:-5px;width:20px;height:20px;padding:0;
+  border:1px solid var(--bd);border-radius:50%;background:var(--bg);color:var(--fg);cursor:pointer}
 /* 次要控件：桌面原样展开；窄屏藏进 ⚙ 浮层（DOM 不动、事件不重挂） */
 .composer-extra{display:contents}
 .composer-cog{display:none}
@@ -402,6 +410,109 @@ function clearSubmittedDraft(submitted){
     box.value = "";
     box.dataset.draftVersion = String(cleared.version);
   }
+}
+
+/* 图片附件与文字草稿一样按会话隔离，仅保存在页面内存中。 */
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024 * 3 / 4, IMAGE_MAX_COUNT = 8;
+const IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const imageDrafts = new Map();
+function imageDraft(key){
+  if(!imageDrafts.has(key)) imageDrafts.set(key, {
+    items: [], version: 0, pending: 0, queue: Promise.resolve(), error: ""});
+  return imageDrafts.get(key);
+}
+function imageUrl(image){ return `data:${image.media_type};base64,${image.data}`; }
+function imageHtml(image, alt = "图片"){
+  if(!image || !IMAGE_TYPES.has(image.media_type) || typeof image.data !== "string") return "";
+  return `<img class="msg-image" loading="lazy" alt="${esc(alt)}" src="${esc(imageUrl(image))}">`;
+}
+function renderImageDraft(key){
+  const box = document.getElementById("msgbox"), root = document.getElementById("imagedrafts");
+  if(!root || box?.dataset.draftKey !== key) return;
+  const items = imageDraft(key).items;
+  root.innerHTML = items.map((image, i) => `<div class="image-draft">${imageHtml(image, image.name || "待发送图片")}` +
+    `<button type="button" data-image-index="${i}" aria-label="移除图片" title="移除图片">×</button></div>`).join("");
+  root.querySelectorAll("[data-image-index]").forEach(btn => { btn.onclick = () => {
+    const draft = imageDraft(key);
+    draft.items.splice(Number(btn.dataset.imageIndex), 1);
+    draft.version++;
+    renderImageDraft(key);
+  }; });
+}
+function captureImageDraft(key){
+  const draft = imageDraft(key);
+  return {key, version: draft.version, items: draft.items.slice(),
+    images: draft.items.map(({media_type, data}) => ({media_type, data}))};
+}
+function clearSubmittedImages(submitted){
+  if(!submitted.items.length) return;
+  const draft = imageDraft(submitted.key), sent = new Set(submitted.items);
+  const remaining = draft.items.filter(item => !sent.has(item));
+  if(remaining.length === draft.items.length) return;
+  // 按附件对象身份消费本次提交；后续新增、删除和重排都属于下一版草稿。
+  draft.items = remaining;
+  draft.version++;
+  renderImageDraft(submitted.key);
+}
+function readImageFile(file){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",", 2)[1] || "");
+    reader.onerror = () => reject(Error("读取失败"));
+    reader.onabort = () => reject(Error("读取已取消"));
+    reader.readAsDataURL(file);
+  });
+}
+async function addImageFilesNow(key, files){
+  const draft = imageDraft(key);
+  let error = "";
+  for(const file of files){
+    if(!IMAGE_TYPES.has(file.type)){ error = "仅支持 PNG / JPEG / GIF / WebP 图片"; continue; }
+    if(file.size <= 0 || file.size > IMAGE_MAX_BYTES){ error = "单张图片不能为空且不能超过 3.75 MiB"; continue; }
+    if(draft.items.length >= IMAGE_MAX_COUNT){ error = `一次最多发送 ${IMAGE_MAX_COUNT} 张图片`; break; }
+    if(draft.items.reduce((n, x) => n + x.size, 0) + file.size > IMAGE_TOTAL_BYTES){
+      error = "一次发送的图片总大小不能超过 20 MiB"; break;
+    }
+    try{
+      const data = await readImageFile(file);
+      draft.items.push({media_type: file.type, data, name: file.name || "粘贴的图片", size: file.size});
+      draft.version++;
+    }catch(e){ error = `${file.name || "图片"}读取失败`; }
+  }
+  renderImageDraft(key);
+  return error;
+}
+function addImageFiles(key, files){
+  const draft = imageDraft(key), selected = Array.from(files || []);
+  draft.pending++;
+  draft.error = "";
+  // 同一草稿串行读取，数量/总量检查与前一批完成后的状态保持一致。
+  const run = async () => { draft.error = await addImageFilesNow(key, selected); };
+  draft.queue = draft.queue.then(run, run).finally(() => {
+    draft.pending--;
+    updateSendSt(key);
+  });
+  updateSendSt(key);
+  return draft.queue;
+}
+function wireImageComposer(key){
+  bindMessageDraft(key);
+  renderImageDraft(key);
+  const picker = document.getElementById("imageinput"), button = document.getElementById("imagebtn");
+  if(button && picker){
+    button.onclick = () => picker.click();
+    picker.onchange = () => { const files = Array.from(picker.files || []); picker.value = ""; addImageFiles(key, files); };
+  }
+  const box = document.getElementById("msgbox");
+  box?.addEventListener("paste", event => {
+    const files = Array.from(event.clipboardData?.files || []).filter(file => file.type.startsWith("image/"));
+    if(!files.length) return;
+    const text = event.clipboardData.getData ? event.clipboardData.getData("text") : "";
+    // 图文混合粘贴保留默认文本输入；纯图片则阻止浏览器插入占位内容。
+    if(!text) event.preventDefault();
+    addImageFiles(key, files);
+  });
 }
 
 /* ---------- 工具 ---------- */
@@ -664,10 +775,13 @@ function composerHtml(mode, d){
   return `<div class="info-panel composer"${isNew ? "" : ' id="convcomposer"'}>
     ${isNew ? '<div class="mut" style="margin-bottom:6px">将在此目录启动一个全新会话（不依赖已有会话历史），首轮跑完自动进入对话视图。</div>' : ""}
     ${modelControlsHtml()}
-    <textarea id="msgbox" rows="3" placeholder="${isNew ? "输入首条消息…" : "给该会话发消息…"}"></textarea>
+    <textarea id="msgbox" rows="3" placeholder="${isNew ? "输入首条消息，可粘贴图片…" : "给该会话发消息，可粘贴图片…"}"></textarea>
+    <input id="imageinput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
+    <div id="imagedrafts"></div>
     <div id="cmdhints" hidden></div>
     <div class="composer-actions">
       <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
+      <button class="back" id="imagebtn" type="button" title="选择图片，也可以直接粘贴到输入框">📎 图片</button>
       ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断并清空队列</button>`}
       <button class="back composer-cog" id="cogbtn" aria-label="发送选项"
               title="审批 / 思考 / 发送选项">⚙</button>
@@ -1316,7 +1430,11 @@ function toolResultHtml(p){
   const r = p.result || (p.type === "tool_result" ? p : null);
   if(!r) return "";
   if(r.kind === "diff") return `<pre class="tool-out">${diffHtml(r.text)}</pre>`;
-  if(r.kind === "image") return `<div class="mut">[图片] ${esc(r.text || "")}</div>`;
+  if(r.kind === "image"){
+    const images = (r.images || []).map(image => imageHtml(image)).join("");
+    const caption = r.text && r.text !== "图片" ? `<div class="mut">${esc(r.text)}</div>` : "";
+    return images + caption || '<div class="mut">[图片]</div>';
+  }
   if(r.is_error || r.kind === "error") return `<div class="terror">✗ ${esc(r.text || "")}</div>`;
   return `<pre class="tool-out">${esc(r.text || "")}</pre>`;
 }
@@ -1379,6 +1497,7 @@ function convGroupHtml(g){
     if(p.type === "command_output")
       // 无独立 id，key 由内容派生，重渲染后展开状态可恢复
       return `<details class="fold"${detailsAttrs("cmdout:" + p.text)}><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
+    if(p.type === "image") return imageHtml(p);
     if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
     return "";
   }).join("");
@@ -1600,6 +1719,12 @@ function renderConvList(){
     if(live && live.remove) live.remove();
   }
 }
+function convGroupSig(g){
+  return JSON.stringify([g.role, g.ts, g.parts], function(key, value){
+    // 图片以服务端内容哈希识别；签名和 Map key 不再复制整段 base64。
+    return key === "data" && this.image_id ? undefined : value;
+  });
+}
 function renderConvDom(el, groups, echoStr){
   if(convDom.id !== convState.id){
     // 切换会话：旧节点全部作废，清空容器重新开始
@@ -1623,7 +1748,7 @@ function renderConvDom(el, groups, echoStr){
   const wanted = [];
   const seen = new Set();
   for(const g of groups){
-    const sig = JSON.stringify([g.role, g.ts, g.parts]);
+    const sig = convGroupSig(g);
     let node = convDom.nodes.get(sig);
     if(!node){
       node = makeNodeFromHtml(convGroupHtml(g));
@@ -1972,11 +2097,11 @@ function moveSubmission(source, target, token){
   if(echo?.token === token && (!pendingEcho[target] || pendingEcho[target].token === token)) pendingEcho[target] = echo;
   return true;
 }
-function submissionEcho(key, text, token, jobId){
+function submissionEcho(key, text, token, jobId, images = []){
   // after 是提交前的消息末尾；分页前插时同步 shift，不匹配历史同文。
   const after = convState.id === key ? Math.max(convState.total || 0, convState.cursor || 0) : 0;
   const previous = pendingEcho[key];
-  return {text, token, jobId, after, submittedAt: Date.now() / 1000,
+  return {text, images, token, jobId, after, submittedAt: Date.now() / 1000,
     previous: previous && !previous.failed && previous.text.trim() === text.trim()
       && echoVisible(convState.id === key ? convState.msgs : [], previous) ? previous : null};
 }
@@ -2007,7 +2132,7 @@ function sendJobText(id){
   return "";
 }
 function echoVisible(messages, echo){
-  if(!echo || !echo.text || !messages) return false;
+  if(!echo || (!echo.text && !(echo.images || []).length) || !messages) return false;
   if(echo.failed) return true; // 失败回显是错误反馈，不由普通转录对账消费。
   // 同文连续提交需要不同的新消息确认；前一条未对账时，不能借它的转录清除后一条。
   const waiting = [];
@@ -2021,7 +2146,8 @@ function echoVisible(messages, echo){
       if(e.submittedAt && m.ts && m.ts < e.submittedAt) continue;
       const matches = (m.parts || []).some(p =>
         p.type === "command" && (p.command + (p.args ? " " + p.args : "")) === e.text.trim()
-        || m.role === "user" && p.type === "text" && (p.text || "").trim() === e.text.trim());
+        || m.role === "user" && p.type === "text" && (p.text || "").trim() === e.text.trim()
+        || m.role === "user" && p.type === "image" && !e.text.trim() && (e.images || []).length);
       if(matches){ found = true; next = i + 1; break; }
     }
     if(!found) return true;
@@ -2031,7 +2157,8 @@ function echoVisible(messages, echo){
 function echoHtml(echo){
   return `<div class="msg user pending${echo.failed ? " failed" : ""}">` +
     `<div class="mhead">用户 · ${echo.failed ? "发送失败" : "发送中…"}</div>` +
-    `<div class="ubody">${esc(echo.text)}</div></div>`;
+    `<div class="ubody">${esc(echo.text)}</div>` +
+    (echo.images || []).map(image => imageHtml(image, image.name || "待发送图片")).join("") + `</div>`;
 }
 function markEchoFailed(key, token){
   // token 守卫：即使文本相同，旧任务也不能修改后续发送的回显；
@@ -2062,13 +2189,14 @@ function panelMatch(id){
 function updateSendSt(id){
   if(!panelMatch(id)) return;
   const st = document.getElementById("sendst");
-  if(st) st.textContent = sendJobText(id);
+  const images = imageDraft(id);
+  if(st) st.textContent = images.pending ? "图片读取中…" : (images.error || sendJobText(id));
   const btn = document.getElementById("sendbtn");
   const j = sendJobs[id];
   // 对话视图里 running/queued 仍可继续发送：托管会话会排队；新建会话必须先拿到 sid，
   // 否则连点会创建多个新会话，所以新建面板继续锁住。
   const newPanel = curPanel && curPanel.type === "new";
-  if(btn) btn.disabled = !!j && (j.status === "sending"
+  if(btn) btn.disabled = images.pending > 0 || !!j && (j.status === "sending"
     || (newPanel && ["queued", "running"].includes(j.status)));
 }
 
@@ -2098,7 +2226,7 @@ function bindNewBox(p){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
   const key = "new:" + p.cwd;
-  bindMessageDraft(key);
+  wireImageComposer(key);
   bindComposerKeys();
   const newCommands = {list: []};
   loadProjectCommands(p.cwd).then(list => { newCommands.list = list; });
@@ -2111,8 +2239,10 @@ function bindNewBox(p){
     syncEffort();
   }
   btn.onclick = async () => {
+    imageDraft(key).error = "";
     const submitted = captureMessageDraft(key), text = submitted.rawText.trim();
-    if(!text) return;
+    const submittedImages = captureImageDraft(key), images = submittedImages.images;
+    if(!text && !images.length) return;
     const useHost = document.getElementById("hostcb").checked;
     const approval = document.getElementById("approvalsel")?.value || "full";
     const effort = newEffortSel && !newEffortSel.disabled ? newEffortSel.value : "default";
@@ -2120,7 +2250,7 @@ function bindNewBox(p){
     if(selectedModel === undefined) return;
     const token = ++submissionToken;
     sendJobs[key] = {token, status: "sending", requested_model: selectedModel, text};
-    const echo = submissionEcho(key, text, token, null);   // 时间与窗口属于提交，不属于稍后的 sid 发现。
+    const echo = submissionEcho(key, text, token, null, images);   // 时间与窗口属于提交，不属于稍后的 sid 发现。
     let accepted = false;
     const owns = () => ownsSubmission(sid || key, token);
     updateSendSt(key);
@@ -2137,6 +2267,13 @@ function bindNewBox(p){
       if(follow){
         saveComposerDraft();
         const remaining = messageDrafts.get(source)?.text || "";
+        const sourceImages = imageDraft(source), targetImages = imageDraft(sid);
+        if(sourceImages.items.length && !targetImages.items.length){
+          targetImages.items = sourceImages.items;
+          targetImages.version++;
+          sourceImages.items = [];
+          sourceImages.version++;
+        }
         // 只有确实自动导航时迁移；目标已有草稿优先，源草稿保留以免丢失。
         if(remaining && !messageDrafts.get(sid)?.text){
           saveMessageDraft(sid, remaining);
@@ -2158,8 +2295,8 @@ function bindNewBox(p){
         method: "POST", headers: {"Content-Type": "application/json"},
         // 非托管 /new 不接受 approval/effort；托管时把对话框里的选择带给首轮进程
         body: JSON.stringify(useHost
-          ? {cwd: p.cwd, text, model: selectedModel, approval, effort}
-          : {cwd: p.cwd, text, model: selectedModel}),
+          ? {cwd: p.cwd, text, ...(images.length ? {images} : {}), model: selectedModel, approval, effort}
+          : {cwd: p.cwd, text, ...(images.length ? {images} : {}), model: selectedModel}),
       }, 30000);
       const j = await r.json();
       if(!owns()) return;
@@ -2171,6 +2308,7 @@ function bindNewBox(p){
       sendJobs[key] = {token, text, jobId: j.job_id, status: j.status || "queued"};
       echo.jobId = j.job_id;
       clearSubmittedDraft(submitted);
+      clearSubmittedImages(submittedImages);
       const deadline = Date.now() + SEND_POLL_TIMEOUT_MS;
       for(;;){
         if(!owns()) break;
@@ -2229,7 +2367,7 @@ function bindNewBox(p){
 function bindSendBox(id, d){
   const btn = document.getElementById("sendbtn");
   if(!btn) return;
-  bindMessageDraft(id);
+  wireImageComposer(id);
   bindComposerKeys();
   wireCommandHints(document.getElementById("msgbox"),
     () => (view.session === id ? sessionCommands : []));
@@ -2295,8 +2433,10 @@ function bindSendBox(id, d){
     }
   };
   btn.onclick = async () => {
+    imageDraft(id).error = "";
     const submitted = captureMessageDraft(id), text = submitted.rawText.trim();
-    if(!text) return;
+    const submittedImages = captureImageDraft(id), images = submittedImages.images;
+    if(!text && !images.length) return;
     const force = document.getElementById("forcecb").checked;
     const selectedModel = modelSnapshot(id);
     if(selectedModel === undefined) return;
@@ -2304,14 +2444,16 @@ function bindSendBox(id, d){
     const useHost = document.getElementById("hostcb").checked
       && !(d.hosted || sessions.find(s => s.id === id)?.hosted);
     const token = ++submissionToken;
-    const echo = submissionEcho(id, text, token, null);
+    const echo = submissionEcho(id, text, token, null, images);
     sendJobs[id] = {token, status: "sending", requested_model: selectedModel, text};
     let accepted = false;
     updateSendSt(id);
     try{
       const r = await fetchT(useHost ? "/hosted" : "/sessions/" + encodeURIComponent(id) + "/message", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(useHost ? {resume_id: id, text, force, model: selectedModel} : {text, force, model: selectedModel}),
+        body: JSON.stringify(useHost
+          ? {resume_id: id, text, ...(images.length ? {images} : {}), force, model: selectedModel}
+          : {text, ...(images.length ? {images} : {}), force, model: selectedModel}),
       }, 30000);
       const j = await r.json();
       if(!ownsSubmission(id, token)) return;
@@ -2321,6 +2463,7 @@ function bindSendBox(id, d){
       }
       accepted = true;
       clearSubmittedDraft(submitted);
+      clearSubmittedImages(submittedImages);
       sendJobs[id] = {token, jobId: j.job_id, status: j.status || "queued", text};
       pendingEcho[id] = {...echo, jobId: j.job_id};
       renderConvList();

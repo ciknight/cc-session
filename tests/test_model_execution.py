@@ -306,6 +306,67 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(snapshot['recent'][0]['id'], response['job_id'])
         self.assertEqual(self.mon.job_snapshot(response['job_id'])['session'], 'new-id')
 
+    def test_oneshot_image_uses_stream_json_without_base64_in_job(self):
+        stdout = '\n'.join([
+            '{"type":"system","subtype":"init","session_id":"new-id"}',
+            '{"type":"assistant","message":{"content":[]}}',
+            '{"type":"result","session_id":"new-id","result":"ok"}',
+        ])
+        completed = subprocess.CompletedProcess([], 0, stdout, '')
+        self.mon.claude_args = ['--output-format=json', '--input-format', 'text']
+        with patch.object(core.subprocess, 'run', return_value=completed) as run:
+            code, response = self.mon.new_session(str(self.root), '看图', images=[{
+                'media_type': 'image/png', 'data': 'aW1hZ2U='}])
+            self.assertEqual(code, 202)
+            job = self.wait_done(response['job_id'])
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[cmd.index('--input-format') + 1], 'stream-json')
+        self.assertEqual(cmd[cmd.index('--output-format') + 1], 'stream-json')
+        self.assertIn('--verbose', cmd)
+        self.assertEqual(cmd.count('--input-format'), 1)
+        self.assertEqual(cmd.count('--output-format'), 1)
+        self.assertNotIn('json', cmd)
+        payload = json.loads(run.call_args.kwargs['input'])
+        self.assertEqual(payload['message']['content'][0], {'type': 'text', 'text': '看图'})
+        self.assertEqual(payload['message']['content'][1]['source']['data'], 'aW1hZ2U=')
+        self.assertEqual(job['status'], 'done')
+        self.assertEqual(job['result'], 'ok')
+        self.assertEqual(job['result_session_id'], 'new-id')
+        self.assertNotIn('aW1hZ2U=', job['text'])
+        self.assertIn('[图片 1 张]', job['text'])
+
+    def test_oneshot_stream_json_requires_result_event(self):
+        completed = subprocess.CompletedProcess([], 0, '{"type":"system","subtype":"init"}', '')
+        with patch.object(core.subprocess, 'run', return_value=completed):
+            _, response = self.mon.new_session(str(self.root), '', images=[{
+                'media_type': 'image/png', 'data': 'aW1hZ2U='}])
+            job = self.wait_done(response['job_id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('result', job['error'])
+
+    def test_hosted_image_message_queues_content_blocks(self):
+        from unittest.mock import Mock
+        host = monitor.Hosted(self.mon, str(self.root), 'existing')
+        host.status, host.proc = 'running', Mock()
+        self.mon.hosted_by_sid['existing'] = host
+        code, _ = self.mon.send_message('existing', '', images=[{
+            'media_type': 'image/png', 'data': 'aW1hZ2U='}])
+        self.assertEqual(code, 202)
+        content = host.pending[0][0]
+        self.assertEqual(len(content), 1)
+        self.assertEqual(content[0]['type'], 'image')
+        self.assertEqual(content[0]['source']['media_type'], 'image/png')
+        self.assertNotIn('aW1hZ2U=', host.pending[0][1]['text'])
+        host.status = 'exited'
+
+    def test_invalid_image_does_not_create_job(self):
+        for image in ({'media_type': 'image/png', 'data': 'not base64!'},
+                      {'media_type': [], 'data': 'aW1hZ2U='}):
+            with self.subTest(image=image):
+                code, response = self.mon.send_message('existing', 'hi', images=[image])
+                self.assertEqual(code, 400)
+                self.assertEqual(self.mon.jobs, {})
+
     def test_invalid_model_does_not_create_job(self):
         code, _ = self.mon.send_message("existing", "hi", model=[])
         self.assertEqual(code, 400)

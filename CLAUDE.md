@@ -100,9 +100,11 @@ uv run monitor.py --webhook http://localhost:3000/hook
   后续请求只解析新增部分（offset 按实际读取字节推进，stat 与 read 之间追加不重复解析）。
   超过 2 MiB 的转录首次只解析尾部窗口，`before` 翻页时按 1 MiB 块向前加载并前插，
   旧窗口里因 tool_use 在窗口外而独立展示的结果/备注此时并入对应工具条目；
-  缓存最多保留 8 个最近使用的文件（LRU，活动请求不淘汰，超限允许暂时），
-  每个文件有独立解析锁。
+  缓存最多保留 8 个最近使用的文件（LRU，活动请求不淘汰，超限允许暂时），并限制
+  估算 payload 总量 64 MiB；文件数或字节超限时都淘汰最久未用缓存。每个文件有独立解析锁。
   跳过 sidechain（子代理对话）。工具结果合并行级 `toolUseResult`（diff/stdout/图片），
+  用户与工具结果中的 base64 `image` block 保留为图片 part，并附 SHA-256 `image_id`
+  供前端做轻量 DOM 签名；`toolUseResult.file.base64` 只是同图元数据，不重复渲染。
   `isMeta` 分 boilerplate / sourceToolUseID / origin 注入三种语义。
 - **子代理会话**：`projects/<proj>/<parent>/subagents/agent-*.jsonl` 默认**不扫描**（懒加载），
   id 为 `<parent>::agent-<hash>`，默认不在 `/sessions` 返回；`?include_subagents=1`
@@ -141,6 +143,13 @@ uv run monitor.py --webhook http://localhost:3000/hook
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有
   `completed/cancelled/discarded/refused/dropped` 结束回合。
+- **图片消息**：`/message`、`/new`、`/hosted` 接受可选
+  `images: [{"media_type", "data"}]`（纯 base64），`message_content` 统一校验并生成
+  文字在前、图片在后的 content blocks；托管直接写数组，一次性消息为此切到双向
+  stream-json（`--verbose`），逐行读取 stdout 并以最终 `result` 事件收尾。
+  支持 PNG/JPEG/GIF/WebP，每次最多 8 张、单张原始数据 3.75 MiB、合计 20 MiB，
+  job/队列只保留文字与图片数量摘要，不复制 base64。网页支持选择/粘贴、缩略图和纯图片发送，
+  附件读取按会话串行并在 pending 时禁发；202 后按提交项身份清理，保留后续新增附件。
 - **队列查询与单项取消**：`GET /sessions/<sid>/jobs` 投影执行、等待及最近终态；取消接口只在
   owner 锁内移除真实等待成员，已领取（包括切模型）返回 409，不能调用会增加 turns 的回合收尾。
   非托管 job/队列归 `Monitor.lock`，托管归 `Hosted.ready`；注册表与终态历史归 Monitor，
