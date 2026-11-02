@@ -111,7 +111,7 @@ uv run monitor.py --claude-args "--model sonnet"
 | `--claude-bin` | `claude` | Claude Code CLI 路径。 |
 | `--claude-args` | 空 | 透传给 Claude 子进程的额外参数。 |
 | `--msg-timeout` | `600` | 一次性消息的最长执行时间，单位为秒。 |
-| `--permission-timeout` | `300` | 托管审批等待秒数，超时拒绝；`0` 表示无限等待。 |
+| `--permission-timeout` | `1800` | 托管审批等待秒数（默认 30 分钟），超时拒绝；`0` 表示无限等待。 |
 | `--scan-subagents` | 关闭 | 启动时扫描全部子代理转录，而不是按需加载。 |
 
 监控其他 Claude 配置目录：

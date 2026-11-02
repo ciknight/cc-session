@@ -34,7 +34,7 @@ from .orphans import OrphanWatcher
 
 
 class Monitor:
-    def __init__(self, stale_after, webhook=None, permission_timeout=300):
+    def __init__(self, stale_after, webhook=None, permission_timeout=1800):
         # 以文件路径为键：同一 session id 可能出现在多个项目目录（恢复/移动过），
         # 若按 id 键控，两个文件的读取 offset 会互相干扰导致重复计数
         self.sessions = {}           # str(path) -> Session

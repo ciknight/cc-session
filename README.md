@@ -111,7 +111,7 @@ uv run monitor.py --claude-args "--model sonnet"
 | `--claude-bin` | `claude` | Path to the Claude Code CLI. |
 | `--claude-args` | empty | Extra arguments passed to Claude child processes. |
 | `--msg-timeout` | `600` | Maximum execution time for a one-shot message, in seconds. |
-| `--permission-timeout` | `300` | Seconds to wait for hosted approval before denying; `0` waits indefinitely. |
+| `--permission-timeout` | `1800` | Seconds to wait for hosted approval before denying; `0` waits indefinitely. |
 | `--scan-subagents` | off | Scan all subagent transcripts at startup instead of loading them on demand. |
 
 To monitor a different Claude configuration directory:

@@ -189,7 +189,10 @@ button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 /* 会话视图：聊天窗口布局——头部固定、消息区滚动、发送区沉底。
    convview 由 renderMain 在进入/离开会话视图时显式切换，不依赖 :has()（旧引擎也能布局） */
 main.convview{display:flex;flex-direction:column;overflow:hidden;padding:0}
-.conv-top{flex:none;padding:10px 18px 4px;border-bottom:1px solid var(--bd)}
+/* 顶部区（标题/概览/待审批）整体限高滚动：main 是 overflow:hidden，
+   待审批卡片很高时若让 conv-top 无限增高，卡片底部按钮会被裁掉 */
+.conv-top{flex:0 1 auto;min-height:0;padding:10px 18px 4px;border-bottom:1px solid var(--bd);
+  max-height:60vh;overflow-y:auto;overscroll-behavior:contain}
 .conv-head{display:flex;align-items:center;gap:8px}
 .conv-head h2{font-size:16px;margin:8px 0 4px;flex:1;min-width:0;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}

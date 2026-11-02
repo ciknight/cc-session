@@ -45,7 +45,7 @@ hook 子命令（由托管进程的内联 --settings 调用，不面向用户）
   GET /hosted                  托管进程列表（状态、是否忙、排队数、审批模式、轮数）
   DELETE /hosted/<hid>         正常退出（做完当前一轮）；加 ?kill=1 立即终止
   托管进程带 --permission-prompt-tool stdio：ask 模式在网页审批，auto 交给 CLI（默认模式），
-  full 自动放行；超时（--permission-timeout，默认 300 秒）自动拒绝。
+  full 自动放行；超时（--permission-timeout，默认 1800 秒）自动拒绝。
   ExitPlanMode 显示计划卡片；AskUserQuestion 通过 PreToolUse hook 在网页回答。
   注意: 要托管已有会话，先在终端里把它退出，避免两个进程同时写一个会话。
 
@@ -96,7 +96,7 @@ def main():
     ap.add_argument("--claude-args", default="",
                     help='发消息时附加给 claude 的参数，例如 "--permission-mode acceptEdits --model sonnet"')
     ap.add_argument("--msg-timeout", type=int, default=600, help="单条远程消息最长执行秒数")
-    ap.add_argument("--permission-timeout", type=int, default=300,
+    ap.add_argument("--permission-timeout", type=int, default=1800,
                     help="托管会话审批等待秒数，0 表示无限等待")
     ap.add_argument("--scan-subagents", action="store_true",
                     help="启动时扫描子代理转录（默认懒加载，仅在显式请求时读取）")

@@ -124,7 +124,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
   列表按 `last_input_ts` 排序、回退 `last_event_ts`。
 - **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `full`（服务自动放行）**，持久化在
   `~/.claude/claude-sessions/approvals.json`；已有明确保存的模式优先。`ask` 等待网页响应
-  （`--permission-timeout` 默认 300 秒，超时自动拒绝），`auto` 交给 CLI 权限模式。
+  （`--permission-timeout` 默认 1800 秒，超时自动拒绝），`auto` 交给 CLI 权限模式。
 - **思考档位（effort）**：仅托管会话；`POST /sessions/<id>/effort` 在线切换
   （control `apply_flag_settings` 的 `effortLevel`，`default` 传 null 回落模型默认），
   档位持久化在 `~/.claude/claude-sessions/efforts.json`，重托管 spawn 带 `--effort`（有档位时
@@ -203,7 +203,8 @@ markdown/DOMPurify 只处理新增或变化的组（无 DOM 原语的环境退�
 对话视图是聊天窗口布局（`main.convview` 纵向 flex，类由 `renderMain` 进入/离开会话视图时
 显式切换，不依赖 `:has()`）：固定头部单行（返回与标题同行，
 cwd 与「对话 N/M」计数并入概览折叠 `overviewHtml`——summary 一行摘要、展开完整统计），待审批
-卡片在其下；`#conv` 滚动区按旧→新渲染消息，
+卡片在其下；顶部区 `.conv-top` 限高 `60vh` 内部滚动（`main` 是 `overflow:hidden`，
+不限高会让长审批卡片的底部按钮被裁掉），`#conv` 滚动区按旧→新渲染消息，
 发送区固定底部。进入会话滚到底部；增量刷新贴底时自动跟底、翻看历史时不打扰；加载更早
 按高度补偿保持视野。置顶/归档/别名不在会话页显示，只在外层列表卡片操作（别名暂无前端入口，
 后端 API 保留）。发送队列摘要内联为模型选择行右侧的 chip（`#queue`）：无执行/等待且无错误/通知时隐藏，
