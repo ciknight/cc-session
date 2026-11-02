@@ -178,7 +178,14 @@ h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-tra
   font:inherit;font-size:13px;cursor:pointer}
 .cmd-hint.selected{background:var(--accbg)}
 .composer-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:6px}
-.composer-status{white-space:pre-wrap;margin-top:4px}
+/* 发送状态：输入区上方的浮动胶囊，不占布局高度（旧版在输入框下方占一行，
+   文案一出现就把发送区顶高，压缩对话区） */
+.composer-status{position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);
+  width:max-content;max-width:min(90%,560px);margin:0;padding:3px 12px;z-index:5;
+  background:var(--card);border:1px solid var(--bd);border-radius:999px;
+  box-shadow:0 2px 10px rgba(0,0,0,.12);font-size:12px;line-height:1.5;color:var(--mut);
+  white-space:pre-wrap;overflow-wrap:anywhere;text-align:center;pointer-events:none}
+.composer-status:empty{display:none}
 .config-path{overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:12px;margin:3px 0}
 button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 .metadata-actions{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:8px}
@@ -292,6 +299,7 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
 <script>
 const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
 const SEND_POLL_TIMEOUT_MS = 30 * 60 * 1000;   // 发送后跟踪 /jobs 的最长时间
+const SEND_DONE_HIDE_MS = 4000;                // “已完成/已取消”浮动提示的保留时长
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATE_ZH = {working: "工作中", idle: "空闲", stale: "无活动"};
 // <details> 的展开状态跨 innerHTML 重建保留；key 必须由内容派生且稳定
@@ -2075,12 +2083,19 @@ function reconcileJob(sid, job, expectedToken){
   if(["done", "failed", "cancelled"].includes(latest.status)) return;
   const token = latest.token;
   Object.assign(latest, {status: job.status, result: job.result, error: job.error});
+  if(job.status === "done" || job.status === "cancelled") latest.finishedAt = Date.now();
   if(terminal){
     if(job.status === "failed") markEchoFailed(sid, token);
     else settleEcho(sid, token);
     latest.token = submissionToken = Math.max(submissionToken, Number(token) || 0) + 1;
   }
   updateSendSt(sid);
+  // 到点重算一次状态，让“已完成/已取消”胶囊按时消失（平时没有刷新时也能收掉）
+  if(job.status === "done" || job.status === "cancelled"){
+    const finished = latest;
+    setTimeout(() => { if(sendJobs[sid] === finished) updateSendSt(sid); },
+      SEND_DONE_HIDE_MS + 50);
+  }
 }
 function discardEchoPredecessor(sid, jobId){
   for(let echo = pendingEcho[sid]; echo?.previous; ){
@@ -2128,8 +2143,11 @@ function sendJobText(id){
   if(j.status === "sending") return cmd ? `${cmd} 发送中…` : "发送中…";
   if(j.status === "queued") return cmd ? `${cmd} 排队中…` : "排队中…";
   if(j.status === "running") return cmd ? `正在执行${cmd}…` : "Claude 正在处理…";
-  if(j.status === "done") return "已完成，回复见下方对话";
-  if(j.status === "cancelled") return "已取消";
+  // 完成提示只在输入区上方短暂浮现，不占用发送区高度
+  if(j.status === "done")
+    return j.finishedAt && Date.now() - j.finishedAt < SEND_DONE_HIDE_MS ? "已完成" : "";
+  if(j.status === "cancelled")
+    return j.finishedAt && Date.now() - j.finishedAt < SEND_DONE_HIDE_MS ? "已取消" : "";
   if(j.status === "unknown") return j.error || "状态查询未知，任务可能仍在执行";
   if(j.status === "failed") return "失败: " + (j.error || "未知错误");
   return "";

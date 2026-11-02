@@ -963,6 +963,21 @@ test('sendJobText 对斜杠命令显示命令文案', () => {
   assert.equal(b.run(`sendJobText("s1")`), "Claude 正在处理…");
 });
 
+test('已完成/已取消提示只短暂显示，不长期占据发送区', () => {
+  const b = boot();
+  b.run('sendJobs["s1"] = {status:"done", finishedAt:Date.now()}');
+  assert.equal(b.run(`sendJobText("s1")`), "已完成");
+  b.run(`sendJobs["s1"].finishedAt = Date.now() - SEND_DONE_HIDE_MS - 1`);
+  assert.equal(b.run(`sendJobText("s1")`), "");
+  b.run('sendJobs["s2"] = {status:"cancelled", finishedAt:Date.now()}');
+  assert.equal(b.run(`sendJobText("s2")`), "已取消");
+  b.run(`sendJobs["s2"].finishedAt = Date.now() - SEND_DONE_HIDE_MS - 1`);
+  assert.equal(b.run(`sendJobText("s2")`), "");
+  // 失败有行动价值，保持显示
+  b.run('sendJobs["s3"] = {status:"failed", error:"boom", finishedAt:1}');
+  assert.equal(b.run(`sendJobText("s3")`), "失败: boom");
+});
+
 test('202 后保留 sendJobs 原文，命令状态文案不中断', async () => {
   // bindSendBox 全流程：POST 返回 202 后重建 sendJobs，若丢 text 字段，
   // 斜杠命令的状态文案会回落成普通"排队中/Claude 正在处理"
