@@ -41,7 +41,8 @@ hook 子命令（由托管进程的内联 --settings 调用，不面向用户）
                                "text": "第一条消息", "force": false,
                                "approval": "ask|auto|full"}
                                之后给该会话 POST /sessions/<id>/message 会自动走常驻进程，
-                               模型忙时消息排队，一轮结束再发下一条
+                               消息立即写入常驻进程 stdin；模型忙时由 CLI 排队，
+                               并在工具轮之间把新消息折叠进当前回合
   GET /hosted                  托管进程列表（状态、是否忙、排队数、审批模式、轮数）
   DELETE /hosted/<hid>         正常退出（做完当前一轮）；加 ?kill=1 立即终止
   托管进程带 --permission-prompt-tool stdio：ask 模式在网页审批，auto 交给 CLI（默认模式），

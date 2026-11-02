@@ -256,7 +256,7 @@ def make_handler(mon, refresh_interval):
                 d["hosted_id"] = h.hid if h else None
                 d["hosted_busy"] = bool(h and h.alive()
                                         and (h.current or h.pending or h.processing))
-                d["hosted_queued"] = len(h.pending) if h and h.alive() else 0
+                d["hosted_queued"] = h.queued_count() if h and h.alive() else 0
                 d["hosted_stream_text"] = h.stream_text if h and h.alive() else ""
                 d["hosted_streaming"] = bool(h and h.alive() and h.stream_job is not None)
                 return self._json(d)

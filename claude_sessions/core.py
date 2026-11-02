@@ -536,7 +536,10 @@ class Monitor:
         result = {"session": sid, "running": [], "queued": [], "recent": []}
         for owner, jobs in groups.items():
             with owner.ready if owner else self.lock:
-                pending = owner.pending if owner else self.remote_queues.get(sid, ())
+                pending = list(owner.pending) if owner else self.remote_queues.get(sid, ())
+                # 托管队列里包含正在执行的当前 job，排队序号只数它后面的消息
+                if owner:
+                    pending = [item for item in pending if item[1] is not owner.current]
                 positions = {item[1 if owner else 0]["id"]: n
                              for n, item in enumerate(pending, 1)}
                 for job in jobs:
@@ -561,17 +564,20 @@ class Monitor:
         if job is None:
             return 404, {"error": "job not found"}
         owner = job.get("_owner")
-        with owner.ready if owner else self.lock:
+        if owner is not None:
+            # 托管消息可能已经写进 CLI 的命令队列，取消要经 control 请求撤回
+            return owner.cancel_queued(job, sid)
+        with self.lock:
             if job["session"] != sid:
                 return 404, {"error": "job not found"}
             if job["status"] == "cancelled":
                 return 200, self._job_summary(job)
-            pending = owner.pending if owner else self.remote_queues.get(sid, ())
-            item = next((item for item in pending if item[1 if owner else 0] is job), None)
+            pending = self.remote_queues.get(sid, ())
+            item = next((item for item in pending if item[0] is job), None)
             if job["status"] != "queued" or item is None:
                 return 409, {"error": "job is already claimed or finished"}
             pending.remove(item)
-            if not owner and not pending:
+            if not pending:
                 self.remote_queues.pop(sid, None)
             self._terminal_job_locked(job, "cancelled")
             summary = self._job_summary(job)

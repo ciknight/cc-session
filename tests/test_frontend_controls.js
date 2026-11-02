@@ -1002,6 +1002,21 @@ test('202 后保留 sendJobs 原文，命令状态文案不中断', async () => 
   assert.ok(!texts.includes('排队中…'), '202 后不应丢失命令前缀，实际: ' + JSON.stringify(texts));
 });
 
+test('设备时钟偏差不影响回显对账（不再比较 submittedAt 与转录 ts）', () => {
+  const b = boot();
+  // 浏览器时钟比转录时间快：真实 user 消息的 ts 早于 submittedAt
+  b.run('convState={id:"a",start:0,cursor:2,msgs:[{role:"user",parts:[{type:"text",text:"same"}]},{role:"assistant",parts:[]}],total:2};'
+      + 'pendingEcho.a={text:"same",token:1,after:2,submittedAt:10000}; renderConvList()');
+  assert.equal(b.run('pendingEcho.a.text'),'same');
+  b.run('convState.msgs.push({role:"user",ts:9500,parts:[{type:"text",text:"same"}]}); convState.total=3; renderConvList()');
+  assert.equal(b.run('pendingEcho.a'),undefined,'时钟偏差时也应在真实消息出现后清除回显');
+  // 新会话首条（提交前没有历史，noHistory）同样不能因时钟偏差而重复显示
+  b.run('convState={id:"b",start:0,cursor:0,total:0,msgs:[]};'
+      + 'pendingEcho.b={text:"hi",token:2,after:0,noHistory:true,submittedAt:10000}; renderConvList()');
+  b.run('convState.msgs.push({role:"user",ts:9000,parts:[{type:"text",text:"hi"}]}); convState.total=1; renderConvList()');
+  assert.equal(b.run('pendingEcho.b'),undefined,'新会话首条也不受时钟偏差影响');
+});
+
 test('echoVisible 按文本对账', () => {
   const b = boot();
   assert.equal(b.run(`echoVisible([], {text:" hi "})`), true);
@@ -1709,6 +1724,40 @@ test('托管列表：精确route、按项目分组、进入会话与空态', asy
  assert.match(b.node('main').innerHTML,/暂无托管会话/); assert.equal(b.node('hostedbadge').style.display,'none');
 });
 
+
+test('配置类瞬时提示几秒后回落为任务状态', () => {
+ const b=boot();
+ const timers=[];
+ b.context.setTimeout=(fn,ms)=>{ timers.push(fn); return timers.length; };
+ b.run('curPanel={type:"conv",key:"a"}; sendJobs.a={status:"done",finishedAt:Date.now()};'
+     + 'flashSendSt("a","审批模式已更新")');
+ assert.equal(b.node('sendst').textContent,'审批模式已更新');
+ timers[0]();
+ assert.equal(b.node('sendst').textContent,'已完成');
+});
+
+test('CSS 防回归：顶部区限高滚动、发送状态浮动不占布局', () => {
+ assert.match(html, /\.conv-top\{[^}]*max-height:60vh[^}]*overflow-y:auto/);
+ assert.match(html, /\.composer-status\{[^}]*position:absolute[^}]*bottom:calc\(100% \+ 8px\)/);
+ assert.match(html, /\.composer-status:empty\{display:none\}/);
+});
+
+test('队列浮层只能点击 chip 展开，悬停/聚焦不再自动打开', () => {
+ const b=boot();
+ b.run('view={project:"/p",session:"a",new:false}; curPanel={type:"conv",key:"a"};'
+     + 'queueState("a").snapshot={session:"a",running:[{id:"r",status:"running",text:"x"}],queued:[],recent:[]};'
+     + 'renderQueue("a")');
+ const main=b.node('main');
+ assert.equal((main.listeners.mouseover||[]).length,0,'不应再监听 mouseover');
+ assert.equal((main.listeners.mouseout||[]).length,0,'不应再监听 mouseout');
+ assert.equal((main.listeners.focusin||[]).length,0,'不应再监听 focusin');
+ const event={type:'click',target:{closest:sel=>sel==='.queue-chip'?b.node('queue'):null},
+              preventDefault(){},stopPropagation(){}};
+ main.dispatchEvent(event);
+ assert.equal(b.node('queuepop').hidden,false,'点击 chip 应展开');
+ main.dispatchEvent(event);
+ assert.equal(b.node('queuepop').hidden,true,'再次点击应收起');
+});
 
 test('队列：独立容器事实快照、FIFO/待派发、取消权限、最近折叠与GET失败保留', async () => {
  let mode='ok'; const b=boot(async url=>{

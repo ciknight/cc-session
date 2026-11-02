@@ -18,9 +18,12 @@ from .interactions import Interaction
 class Hosted:
     """服务自己启动并长期持有的 claude 进程（stream-json 双向通信）。
 
-    消息写进同一个进程的 stdin；一轮结束（收到 result 事件）后再发下一条，
-    模型忙的时候新消息先在这里排队。会话照常写 ~/.claude/projects 的转录文件，
-    所以原有的监听逻辑无需改动。
+    消息到达后立即写进进程 stdin，不等待上一轮结束：CLI 自己维护命令队列，
+    会在工具轮之间把新消息折叠进当前回合（absorbed_mid_turn），必要时还能
+    抢占刚开始、尚未输出的回合。因此网页连续发送时不必等整轮跑完。
+    `self.pending` 是“尚未终态”的消息（含已写入 CLI 队列的），
+    `_claimed` 表示发送线程已领取、`_written` 表示已交给 CLI。
+    会话照常写 ~/.claude/projects 的转录文件，所以原有的监听逻辑无需改动。
     """
 
     def __init__(self, mon, cwd, resume_id=None, selected_model=None, approval=None,
@@ -58,6 +61,11 @@ class Hosted:
         self.interrupting = False
         self.interrupt_target = None   # 被中断的 job；只取消这一轮，不误伤后续消息
         self.lifecycle_seen = False
+        # 已在本地收尾、随后可能仍会收到 command_lifecycle 的 uuid（中断/取消排队项）。
+        # 只为过滤“外部回合”噪声，容量有限，收到对应终态帧即移除。
+        self.resolved_commands = deque()
+        self.resolved_command_set = set()
+        self.max_resolved_commands = 128
         self.last_api_retry = None     # 最近一次上游重试，用于诊断 5xx/限流
         self.stream_text = ""          # 当前 job 的流式文本聚合
         self.stream_job = None
@@ -140,7 +148,7 @@ class Hosted:
             if self.status == "exited" or self.stopping or self.control_failed:
                 self.mon._terminal_job_locked(job, "failed", error="hosted process is stopping")
                 code, response = 409, {"error": job["error"]}
-            elif len(self.pending) >= self.max_queued:
+            elif sum(1 for item in self.pending if item[1] is not self.current) >= self.max_queued:
                 self.mon._terminal_job_locked(job, "failed", error="hosted send queue is full")
                 code, response = 429, {"error": "hosted send queue is full"}
             else:
@@ -161,7 +169,7 @@ class Hosted:
                 # 归入 BrokenPipe 路径，避免逃过 _send_loop 的异常处理
                 raise BrokenPipeError(str(e)) from e
 
-    def _control(self, subtype, **params):
+    def _control(self, subtype, timeout=None, **params):
         with self.lock:
             self.control_seq += 1
             request_id = f"monitor-{self.hid}-{self.control_seq}"
@@ -174,7 +182,7 @@ class Hosted:
             with self.lock:
                 self.control_waiters.pop(request_id, None)
             raise RuntimeError(f"控制请求写入失败: {e}") from e
-        if not event.wait(self.control_timeout):
+        if not event.wait(self.control_timeout if timeout is None else timeout):
             with self.lock:
                 self.control_waiters.pop(request_id, None)
             raise TimeoutError(f"控制请求超时: {subtype}")
@@ -186,21 +194,51 @@ class Hosted:
 
     def _send_loop(self):
         try:
-            self._control("initialize", hooks=None)
+            # rapidFollowupPreempt：回合还没输出内容时，新消息可让 CLI 直接接管
+            # 当前回合（system/turn_preempted），网页端等待更短。
+            try:
+                self._control("initialize", hooks=None, rapidFollowupPreempt=True)
+            except RuntimeError:
+                # 旧版 CLI 明确拒绝未知字段时退回基础 initialize
+                self._control("initialize", hooks=None)
             self.initialized = True
             while True:
                 with self.ready:
-                    while not self.pending and not self.stopping and self.status != "exited":
+                    item = self._next_unsent_locked()
+                    while item is None and not self.stopping and self.status != "exited":
                         self.ready.wait()
+                        item = self._next_unsent_locked()
                     if self.stopping or self.status == "exited":
                         break
-                    text, job, model = self.pending.popleft()
-                    self.current = job
-                    job["status"] = "running"
+                    text, job, model = item
+                    target = (model if model is not None
+                              else default_model(self.mon.claude_args))
+                    # 忙时切模型会连带改变正在跑或排在 CLI 队列里的回合：这条消息要等
+                    # 当前回合结束、且自己成为队首（前面的消息都已处理完）后再切。
+                    # 模型相同的普通追发不受影响，仍然立即写入 CLI 队列。
+                    if target != self.process_model and (
+                            self.current is not None
+                            or (self.pending and self.pending[0][1] is not job)):
+                        self.ready.wait_for(
+                            lambda: self.stopping or self.status == "exited"
+                            or job.get("finished_at") is not None
+                            or not self._pending_has_locked(job)
+                            or (self.current is None and self.pending
+                                and self.pending[0][1] is job))
+                        continue
+                    if job.get("finished_at") is not None or not self._pending_has_locked(job):
+                        continue
+                    # 领取即视为当前回合：cancel_job 对已领取项返回 409，
+                    # 与旧的“popleft 即 running”语义一致。
+                    job["_claimed"] = True
+                    job["_writing"] = True
+                    if self.current is None:
+                        self.current = job
+                        job["status"] = "running"
+                        self.stream_text = ""
+                        self.stream_job = job
+                        self.last_delta_emit = 0.0
                     self.processing = True
-                    self.stream_text = ""
-                    self.stream_job = job
-                    self.last_delta_emit = 0.0
                 self.mon.queue_changed(job["session"])
                 try:
                     target = model if model is not None else default_model(self.mon.claude_args)
@@ -208,19 +246,36 @@ class Hosted:
                         self._control("set_model", model=target)
                         self.process_model = target
                     with self.ready:
-                        cancelled = (self.interrupt_target is job or self.stopping
+                        # 领取后可能已被 interrupt/cancel 收尾，不能再写给 CLI
+                        cancelled = (job.get("finished_at") is not None
+                                     or not self._pending_has_locked(job)
+                                     or self.interrupt_target is job or self.stopping
                                      or self.status == "exited")
                     if cancelled:
-                        self._finish_job(job, "cancelled")
+                        if job.get("finished_at") is None:
+                            self._finish_job(job, "cancelled")
                         continue
                     self._write({"type": "user", "uuid": job.get("command_uuid"),
                                  "message": {"role": "user", "content": text}})
+                    with self.ready:
+                        job["_writing"] = False
+                        job["_written"] = True
+                        # 写入与 cancel/interrupt 撞车：job 已被收尾时把命令从 CLI 队列撤回
+                        raced = job.get("finished_at") is not None
+                    if raced:
+                        try:
+                            self._control("cancel_async_message", timeout=10,
+                                          message_uuid=job.get("command_uuid"))
+                        except (RuntimeError, TimeoutError, BrokenPipeError, OSError):
+                            pass
                 except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
                     with self.ready:
                         self.mon._terminal_job_locked(job, "failed", error=str(e))
+                        job["_writing"] = False
+                        self.pending = deque(it for it in self.pending if it[1] is not job)
                         if self.current is job:
                             self.current = None
-                        self.processing = False
+                            self.processing = False
                         self.control_failed = isinstance(e, (TimeoutError, BrokenPipeError, OSError)) or "控制" in str(e)
                         if self.control_failed:
                             self.stopping = True
@@ -229,11 +284,7 @@ class Hosted:
                     if self.control_failed:
                         break
                     continue
-                with self.ready:
-                    # 不要在 stopping 时清 current：让 result/lifecycle 或进程退出
-                    # 给当前 job 收尾，否则它会永远停在 running
-                    self.ready.wait_for(lambda: self.current is not job or self.stopping
-                                        or self.status == "exited")
+                # 不再等待上一轮结束：继续把后面的消息写进 CLI 队列
         except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
             self.control_failed = True
             self.stopping = True
@@ -241,13 +292,58 @@ class Hosted:
         finally:
             with self.ready:
                 self.processing = False
-                for _, job, _ in self.pending:
-                    self.mon._terminal_job_locked(job, "failed", error="托管进程无法安全发送后续消息")
-                self.pending.clear()
+                if self.control_failed:
+                    for _, job, _ in self.pending:
+                        self.mon._terminal_job_locked(
+                            job, "failed", error="托管进程无法安全发送后续消息")
+                    self.pending.clear()
+                    self.current = None
                 self.ready.notify_all()
             self.mon.queue_changed(self.session_id)
             if self.control_failed and self.proc and self.proc.poll() is None:
                 self.proc.terminate()
+
+    def _next_unsent_locked(self):
+        """下一个还没领取的消息；调用者持有 ready。"""
+        for item in self.pending:
+            if not item[1].get("_claimed"):
+                return item
+        return None
+
+    def _pending_has_locked(self, job):
+        return any(item[1] is job for item in self.pending)
+
+    def _job_by_uuid_locked(self, command_uuid):
+        if not command_uuid:
+            return None
+        for _, job, _ in self.pending:
+            if job.get("command_uuid") == command_uuid:
+                return job
+        return None
+
+    def _remember_resolved_locked(self, job):
+        """记录已在本地收尾的 command uuid，过滤随后到达的 lifecycle 噪声。"""
+        cu = job.get("command_uuid")
+        if not cu or cu in self.resolved_command_set:
+            return
+        self.resolved_command_set.add(cu)
+        self.resolved_commands.append(cu)
+        while len(self.resolved_commands) > self.max_resolved_commands:
+            self.resolved_command_set.discard(self.resolved_commands.popleft())
+
+    def _consume_resolved_locked(self, command_uuid):
+        if not command_uuid or command_uuid not in self.resolved_command_set:
+            return False
+        self.resolved_command_set.discard(command_uuid)
+        try:
+            self.resolved_commands.remove(command_uuid)
+        except ValueError:
+            pass
+        return True
+
+    def queued_count(self):
+        with self.ready:
+            return sum(1 for _, job, _ in self.pending if job is not self.current)
 
     def _read_out(self):
         for raw in self.proc.stdout:
@@ -289,6 +385,8 @@ class Hosted:
                     self.last_api_retry = retry
                 self._emit_session_event("hosted_api_retry",
                                          {"hosted": self.hid, **retry})
+            elif typ == "system" and obj.get("subtype") == "turn_preempted":
+                self._on_turn_preempted(obj)
             elif typ == "command_lifecycle":
                 self._on_lifecycle(obj)
             elif typ == "stream_event":
@@ -315,7 +413,10 @@ class Hosted:
             self.interrupt_target = None
             self.stream_text = ""
             self.stream_job = None
-            dead = ([self.current] if self.current else []) + [j for _, j, _ in self.pending]
+            dead = []
+            for job in ([self.current] if self.current else []) + [j for _, j, _ in self.pending]:
+                if all(job is not seen for seen in dead):
+                    dead.append(job)
             self.current = None
             self.pending.clear()
             tail = " | ".join(list(self.stderr_tail)[-3:])
@@ -405,35 +506,129 @@ class Hosted:
         state = obj.get("state")
         cu = obj.get("command_uuid")
         self.lifecycle_seen = True
+        with self.ready:
+            job = self._job_by_uuid_locked(cu)
+            resolved = job is None and cu in self.resolved_command_set
+            if resolved and state in self.LIFECYCLE_TERMINAL:
+                self._consume_resolved_locked(cu)
+        if resolved:
+            # 已在本地取消/中断并收尾的消息，不再冒充“外部回合”
+            return
         if state not in self.LIFECYCLE_TERMINAL:
             # queued / started / running / released ... 仍在这一轮内
-            with self.ready:
-                job = self.current
-                if job and job.get("command_uuid") == cu:
-                    job["status"] = "running"
+            if job is not None and state in ("started", "running"):
+                with self.ready:
+                    if job.get("finished_at") is None:
+                        job["status"] = "running"
+                        if self.current is None:
+                            # 上一轮已结束，CLI 开始处理队列里的下一条
+                            self.current = job
+                            self.processing = True
+                            self.stream_text = ""
+                            self.stream_job = job
+                            self.last_delta_emit = 0.0
             return
-        with self.ready:
-            job = self.current if self.current and self.current.get("command_uuid") == cu else None
-            if job:
-                job["_terminal_state"] = state
         if job is None:
             self._emit_session_event("hosted_foreign_turn",
                                      {"hosted": self.hid, "state": state})
             return
+        with self.ready:
+            job["_terminal_state"] = state
+            owner = job is self.current
         if state == "completed":
             if job.get("_result_seen"):
-                self._finish_job(job, "completed")
+                self._finish_job(job, "completed", notify=owner)
             else:
                 # result 可能稍后才到，留 3 秒收集回复内容
-                threading.Timer(3.0, lambda: self._finish_job(job, "completed")).start()
+                threading.Timer(
+                    3.0, lambda: self._finish_job(job, "completed", notify=owner)).start()
         else:
-            self._finish_job(job, state)
+            self._finish_job(job, state, notify=owner)
 
-    def _finish_job(self, job, terminal_state):
+    def _on_turn_preempted(self, obj):
+        """CLI 为让新消息立刻执行而停掉了当前回合：标记被接管的 job，
+        让随后到达的 cancelled 生命周期按“已被后续消息接管”收尾，而不是报中断失败。"""
+        uuids = obj.get("preempted_message_uuids")
+        if not isinstance(uuids, list):
+            uuids = []
+        with self.ready:
+            for cu in uuids:
+                job = self._job_by_uuid_locked(cu)
+                if job is not None:
+                    job["_preempted"] = True
+            if self.current is not None:
+                self.current["_preempted"] = True
+
+    def _on_result(self, obj):
+        uuid_list = obj.get("user_message_uuids")
+        has_list = isinstance(uuid_list, list)
+        single = obj.get("user_message_uuid")
+        with self.ready:
+            jobs = []
+            if has_list:
+                for cu in uuid_list:
+                    job = self._job_by_uuid_locked(cu)
+                    if job is not None and not any(job is seen for seen in jobs):
+                        jobs.append(job)
+            elif isinstance(single, str):
+                job = self._job_by_uuid_locked(single)
+                if job is not None:
+                    jobs.append(job)
+                if self.current is not None \
+                        and not any(self.current is job for job in jobs):
+                    # 批量消息的旧字段只带最后一个 uuid，当前回合（首条）也要收尾
+                    jobs.insert(0, self.current)
+            if not jobs:
+                if has_list:
+                    # 空 uuid 列表：明确没有可归属成员时只收当前回合，
+                    # 不能把这一轮的结果错加给后面排队的新消息
+                    if not uuid_list and self.current is not None:
+                        jobs = [self.current]
+                elif isinstance(single, str):
+                    if self.current is not None:
+                        jobs = [self.current]
+                else:
+                    # 极旧 CLI 的 result 完全不带 uuid：按提交顺序认领
+                    # 下一个还没收到结果的 job（连续发送时不能只认 current）
+                    nxt = next((j for _, j, _ in self.pending
+                                if not j.get("_result_seen")), None)
+                    if nxt is not None:
+                        jobs = [nxt]
+            owner = self.current if any(self.current is job for job in jobs) else None
+            if owner is None and isinstance(single, str):
+                owner = next((job for job in jobs
+                              if job.get("command_uuid") == single), None)
+            if owner is None and jobs:
+                owner = jobs[-1]
+            for job in jobs:
+                job["result"] = obj.get("result")
+                job["result_session_id"] = obj.get("session_id")
+                job["cost_usd"] = obj.get("total_cost_usd")
+                job["result_is_error"] = bool(obj.get("is_error"))
+                job["_result_seen"] = True
+                if obj.get("is_error"):
+                    job["error"] = clip(obj.get("result") or obj.get("subtype") or "error", 500)
+            snapshot = [(job, job.get("_terminal_state"), job is owner,
+                     bool(job.get("_preempted"))) for job in jobs]
+        for job, terminal, is_owner, preempted in snapshot:
+            if terminal:
+                self._finish_job(job, terminal, notify=is_owner)
+            else:
+                # 被后续消息接管的回合即使只收到 result，也按取消路径收尾（显示为已接管）
+                fallback = "cancelled" if preempted else "completed"
+                threading.Timer(
+                    3.0, lambda j=job, n=is_owner, s=fallback: self._finish_job(
+                        j, s, notify=n)).start()
+
+    def _finish_job(self, job, terminal_state, notify=True):
         with self.ready:
             if job.get("finished_at"):
                 return
-            if terminal_state == "completed":
+            if job.get("_preempted") and terminal_state in ("completed", "cancelled"):
+                # 被后续消息接管：不是用户取消，也不是失败
+                status, error = "done", None
+                job["result"] = job.get("result") or "已被后续消息接管"
+            elif terminal_state == "completed":
                 status = "failed" if job.get("result_is_error") else "done"
                 error = job.get("error")
             elif terminal_state == "cancelled":
@@ -441,6 +636,7 @@ class Hosted:
             else:
                 status, error = "failed", job.get("error") or f"command {terminal_state}"
             self.mon._terminal_job_locked(job, status, error=error)
+            self.pending = deque(item for item in self.pending if item[1] is not job)
             if self.interrupt_target is job:
                 self.interrupt_target = None
                 self.interrupting = False
@@ -453,8 +649,11 @@ class Hosted:
                 self.stream_text = ""
                 self.stream_job = None
             self.ready.notify_all()
-            self.turns += 1
+            if notify:
+                self.turns += 1
         self.mon.queue_changed(job["session"])
+        if not notify:
+            return
         print(f"[hosted] {self.hid} 第 {self.turns} 轮 {status} job={job.get('id')}"
               + (" 失败: " + error if error else ""), flush=True)
         if final_text:
@@ -490,25 +689,6 @@ class Hosted:
             self._emit_session_event("turn_delta", {
                 "hosted": self.hid, "job": job.get("id"), "text": text},
                 transient=True)
-
-    def _on_result(self, obj):
-        with self.ready:
-            job = self.current
-            if job is None:
-                return
-            job["result"] = obj.get("result")
-            job["result_session_id"] = obj.get("session_id")
-            job["cost_usd"] = obj.get("total_cost_usd")
-            job["result_is_error"] = bool(obj.get("is_error"))
-            job["_result_seen"] = True
-            if obj.get("is_error"):
-                job["error"] = clip(obj.get("result") or obj.get("subtype") or "error", 500)
-            terminal = job.get("_terminal_state")
-        if terminal:
-            self._finish_job(job, terminal)
-        else:
-            # 旧版 CLI 或测试 fake 可能不发 command_lifecycle
-            threading.Timer(3.0, lambda: self._finish_job(job, "completed")).start()
 
     # ---------- 权限审批 ----------
     def _on_can_use_tool(self, obj):
@@ -587,15 +767,51 @@ class Hosted:
             self.process_effort = level
         self.effort = level
 
+    def cancel_queued(self, job, sid=None):
+        """取消一条尚未开始执行的托管消息（可能已写进 CLI 的命令队列）。"""
+        with self.ready:
+            if sid is not None and job.get("session") != sid:
+                return 404, {"error": "job not found"}
+            if job.get("finished_at") is not None:
+                return 200, self.mon._job_summary(job)
+            if (job is self.current or job.get("_writing") or job.get("status") != "queued"
+                    or not self._pending_has_locked(job)):
+                return 409, {"error": "job is already claimed or finished"}
+            written = bool(job.get("_written"))
+        if written:
+            # 已经交给 CLI，必须让它把命令从自己的队列里撤掉
+            try:
+                resp = self._control("cancel_async_message", timeout=10,
+                                     message_uuid=job.get("command_uuid"))
+            except (RuntimeError, TimeoutError, BrokenPipeError, OSError) as e:
+                return 500, {"error": f"取消失败: {e}"}
+            if not resp.get("cancelled"):
+                return 409, {"error": "job is already claimed or finished"}
+        with self.ready:
+            if job.get("finished_at") is not None:
+                return 200, self.mon._job_summary(job)
+            if job is self.current or not self._pending_has_locked(job):
+                return 409, {"error": "job is already claimed or finished"}
+            # 取消排队项不是回合结束：不计轮数、不发 turn_done
+            self._remember_resolved_locked(job)
+            self._finish_job(job, "cancelled", notify=False)
+            summary = self.mon._job_summary(job)
+        self.mon.queue_changed(job["session"])
+        return 200, summary
+
     def interrupt(self):
         if not self.alive():
             return 409, {"error": "hosted process is not running"}
         with self.ready:
-            queued_count = len(self.pending)
-            for _, queued_job, _ in self.pending:
-                self.mon._terminal_job_locked(queued_job, "cancelled", error="已中断")
-            self.pending.clear()
             job = self.current
+            # 当前回合走 CLI 的中断；其余尚未终态的消息（含已写入 CLI 队列的）直接取消
+            queued = [j for _, j, _ in self.pending if j is not job]
+            queued_count = len(queued)
+            for queued_job in queued:
+                self._remember_resolved_locked(queued_job)
+                self.mon._terminal_job_locked(queued_job, "cancelled", error="已中断")
+            self.pending = deque(item for item in self.pending if item[1] is job) \
+                if job else deque()
             self.interrupt_target = job
             self.interrupting = job is not None
             self.ready.notify_all()
@@ -603,7 +819,7 @@ class Hosted:
         try:
             self._write({"type": "control_request",
                          "request_id": f"monitor-int-{self.hid}-{int(time.time() * 1000)}",
-                         "request": {"subtype": "interrupt"}})
+                         "request": {"subtype": "interrupt", "cancel_queued": True}})
         except (OSError, ValueError) as exc:
             with self.ready:
                 self.interrupt_target = None
@@ -636,9 +852,12 @@ class Hosted:
         with self.ready:
             self.stopping = True
             self.ready.notify_all()
+            # 当前回合仍让它正常收尾；其余（含已写入 CLI 队列但未开始的）直接作废
             for _, job, _ in self.pending:
-                self.mon._terminal_job_locked(job, "failed", error="托管进程退出中，消息未发送")
-            self.pending.clear()
+                if job is not self.current:
+                    self.mon._terminal_job_locked(
+                        job, "failed", error="托管进程退出中，消息未发送")
+            self.pending = deque(item for item in self.pending if item[1] is self.current)
         self.mon.queue_changed(self.session_id)
         try:
             if kill:
@@ -657,8 +876,8 @@ class Hosted:
     def info(self):
         with self.ready:
             current = self.current
-            busy = current is not None or self.processing
-            queued = len(self.pending)
+            busy = current is not None or self.processing or bool(self.pending)
+            queued = sum(1 for _, job, _ in self.pending if job is not current)
             approval = self.approval
             interrupting = self.interrupting
             turns = self.turns

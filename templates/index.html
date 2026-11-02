@@ -210,10 +210,11 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   font:inherit;font-size:13px;cursor:pointer}
 .load-earlier:hover{color:var(--fg);border-color:var(--acc)}
 .conv-overview>summary{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* 队列摘要内联在模型选择行右侧：只有 chip 文字可 hover/点击；详情浮层挂在 body 顶层、
-   固定定位随 chip 计算，不随 main 的 overflow 裁剪，也不被侧栏/抽屉遮挡 */
+/* 队列摘要内联在模型选择行右侧：只有 chip 文字可点击（不做悬停预览）；
+   详情浮层挂在 body 顶层、固定定位随 chip 计算，不随 main 的 overflow 裁剪，
+   也不被侧栏/抽屉遮挡 */
 .queue-chip{display:inline-block;position:relative;font-size:12px;color:var(--mut);
-  cursor:default;padding:2px 0}
+  cursor:pointer;padding:2px 0}
 #queuepop{position:fixed;z-index:200;width:min(80vw,480px);max-height:45vh;overflow-y:auto;
   background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:8px 12px;
   box-shadow:0 8px 24px rgba(0,0,0,.16);text-align:left}
@@ -2004,13 +2005,18 @@ function positionQueuePop(){
   pop.style.left = Math.round(left) + "px";
   pop.style.top = Math.round(top) + "px";
 }
-function showQueuePop(sid, mode){   // mode: "peek"（悬停/聚焦临时看）| "pinned"（点击固定）
+function showQueuePop(sid, mode){   // 目前只有 "pinned"（点击展开）
   queueState(sid).pop = mode;
   refreshQueuePop(sid);
 }
 function closeQueuePop(sid){
   if(queueStates.has(sid)) queueState(sid).pop = null;
   hideQueuePop();
+}
+function toggleQueuePop(sid){
+  if(!sid) return;
+  if(queueState(sid).pop) closeQueuePop(sid);
+  else showQueuePop(sid, "pinned");
 }
 function refreshQueuePop(sid){
   const pop = document.getElementById("queuepop"), chip = document.getElementById("queue");
@@ -2027,7 +2033,7 @@ function renderQueue(sid){
   const state = queueState(sid), data = state.snapshot;
   const running = data?.running || [], queued = data?.queued || [];
   // 无执行/等待且无错误/通知时不占发送区的空间；摘要行常驻在模型选择行，
-  // 详情浮层挂 body 顶层（悬停浏览、点击固定，触屏无 hover 用点击）
+  // 详情浮层挂 body 顶层，只能点击 chip 展开/收起
   const show = running.length || queued.length || state.error || state.notice;
   el.hidden = !show;
   if(!show){ state.pop = null; hideQueuePop(); return; }
@@ -2117,9 +2123,14 @@ function moveSubmission(source, target, token){
 }
 function submissionEcho(key, text, token, jobId, images = []){
   // after 是提交前的消息末尾；分页前插时同步 shift，不匹配历史同文。
-  const after = convState.id === key ? Math.max(convState.total || 0, convState.cursor || 0) : 0;
+  // noHistory 表示提交时面板里还没有任何消息，此时任何匹配文本的新消息都只能是本次发送。
+  const known = convState.id === key
+    ? Math.max(convState.total || 0, convState.cursor || 0,
+               (convState.msgs || []).length) : 0;
+  const after = known;
   const previous = pendingEcho[key];
-  return {text, images, token, jobId, after, submittedAt: Date.now() / 1000,
+  return {text, images, token, jobId, after, noHistory: !known,
+    submittedAt: Date.now() / 1000,
     previous: previous && !previous.failed && previous.text.trim() === text.trim()
       && echoVisible(convState.id === key ? convState.msgs : [], previous) ? previous : null};
 }
@@ -2164,7 +2175,10 @@ function echoVisible(messages, echo){
     let found = false;
     for(let i = Math.max(next, first); i < messages.length; i++){
       const m = messages[i];
-      if(e.submittedAt && m.ts && m.ts < e.submittedAt) continue;
+      // 有水位（after）时只按位置对账；仅当提交前没有任何消息可作参照时，
+      // 才用 submittedAt 排除更早的同文历史。手机时钟偏差会让真实消息 ts 早于
+      // submittedAt，不能在所有情况下都拿两者比较，否则回显会与消息重复显示。
+      if(!e.after && !e.noHistory && e.submittedAt && m.ts && m.ts < e.submittedAt) continue;
       const matches = (m.parts || []).some(p =>
         p.type === "command" && (p.command + (p.args ? " " + p.args : "")) === e.text.trim()
         || m.role === "user" && p.type === "text" && (p.text || "").trim() === e.text.trim()
@@ -2219,6 +2233,21 @@ function updateSendSt(id){
   const newPanel = curPanel && curPanel.type === "new";
   if(btn) btn.disabled = images.pending > 0 || !!j && (j.status === "sending"
     || (newPanel && ["queued", "running"].includes(j.status)));
+}
+let sendStFlashTimer = null;
+function flashSendSt(id, text, ms = 4000){
+  // 配置类瞬时提示（审批/思考档位已保存）也走浮动胶囊，几秒后回落任务状态，
+  // 避免提示一直悬在对话底部；只清理自己写入的文本，不覆盖后续发送状态。
+  const st = document.getElementById("sendst");
+  if(!st) return;
+  st.textContent = text;
+  clearTimeout(sendStFlashTimer);
+  sendStFlashTimer = setTimeout(() => {
+    const el = document.getElementById("sendst");
+    if(!el || el.textContent !== text) return;
+    const images = imageDraft(id);
+    el.textContent = images.pending ? "图片读取中…" : (images.error || sendJobText(id));
+  }, ms);
 }
 
 /* ---------- 新建会话（不依赖已有历史；可选托管常驻进程或每次独立运行） ---------- */
@@ -2432,8 +2461,8 @@ function bindSendBox(id, d){
         body: JSON.stringify({approval: approvalSel.value}),
       });
       const j = await r.json();
-      document.getElementById("sendst").textContent =
-        r.ok ? "审批模式已更新" : ("失败: " + (j.error || r.status));
+      if(r.ok) flashSendSt(id, "审批模式已更新");
+      else document.getElementById("sendst").textContent = "失败: " + (j.error || r.status);
     }catch(e){
       document.getElementById("sendst").textContent = "审批模式保存失败: " + e;
     }
@@ -2446,9 +2475,10 @@ function bindSendBox(id, d){
         body: JSON.stringify({effort: effortSel.value}),
       });
       const j = await r.json();
-      document.getElementById("sendst").textContent =
-        r.ok ? (j.warning ? ("思考档位已保存（" + j.warning + "）") : "思考档位已更新")
-             : ("思考档位失败: " + (j.error || r.status));
+      if(r.ok)
+        flashSendSt(id, j.warning ? ("思考档位已保存（" + j.warning + "）") : "思考档位已更新");
+      else
+        document.getElementById("sendst").textContent = "思考档位失败: " + (j.error || r.status);
     }catch(e){
       document.getElementById("sendst").textContent = "思考档位保存失败: " + e;
     }
@@ -2657,11 +2687,10 @@ document.getElementById("projs").addEventListener("click", e => {
   navigate({project: item.dataset.cwd, session: null, new: false});
 });
 document.getElementById("main").addEventListener("click", e => {
-  // 队列摘要 chip 点击固定/收起详情浮层（触屏没有 hover）；只有文字本身是热区
+  // 队列摘要 chip 点击展开/收起详情浮层；只有文字本身是热区
   const chip = e.target.closest && e.target.closest(".queue-chip");
   if(chip){
-    const sid = view.session;
-    if(sid) queueState(sid).pop ? closeQueuePop(sid) : showQueuePop(sid, "pinned");
+    toggleQueuePop(view.session);
     return;
   }
   // 窄屏 ⚙ 浮层开合（次要控件收纳，桌面不显示该按钮）
@@ -2688,25 +2717,16 @@ document.getElementById("main").addEventListener("click", e => {
   navigate({project: target?.project || target?.cwd || view.project, session: card.dataset.id, new: false});
 });
 
-// 队列详情浮层：悬停/聚焦临时浏览（peek），点击固定（pinned），外点或 Esc 收起
+// 队列详情浮层：只能点击 chip 展开/收起（不做悬停/聚焦预览），外点或 Esc 收起
 (function(){
-  const main = document.getElementById("main");
   const chipFrom = t => t && t.closest && t.closest(".queue-chip");
-  main.addEventListener("mouseover", e => {
-    if(chipFrom(e.target) && view.session && !queueState(view.session).pop)
-      showQueuePop(view.session, "peek");
-  });
-  main.addEventListener("mouseout", e => {
-    if(!view.session || queueState(view.session).pop !== "peek") return;
-    if(chipFrom(e.target) && !chipFrom(e.relatedTarget)) closeQueuePop(view.session);
-  });
-  main.addEventListener("focusin", e => {
-    if(chipFrom(e.target) && view.session && !queueState(view.session).pop)
-      showQueuePop(view.session, "peek");
-  });
-  main.addEventListener("focusout", e => {
-    if(view.session && queueState(view.session).pop === "peek" && chipFrom(e.target))
-      closeQueuePop(view.session);
+  const main = document.getElementById("main");
+  // 键盘等价于点击（悬浮/聚焦不再自动展开）
+  main.addEventListener("keydown", e => {
+    if((e.key === "Enter" || e.key === " ") && chipFrom(e.target) && view.session){
+      e.preventDefault?.();
+      toggleQueuePop(view.session);
+    }
   });
   const pop = document.getElementById("queuepop");
   pop.addEventListener("click", e => {

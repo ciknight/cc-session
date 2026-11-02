@@ -79,9 +79,10 @@ uv run monitor.py --host 0.0.0.0 --port 8765
 | --- | --- | --- |
 | **Monitor** | Watching sessions already running in terminals | Incrementally reads Claude Code transcript files without changing them. |
 | **One-shot messaging** | Occasional browser follow-ups | Runs one `claude -p --resume` turn per message, with per-session queuing. |
-| **Hosted session** | Long-running, interactive work | Keeps a persistent Claude process alive for streaming, queued messages, approvals, and live control. |
+| **Hosted session** | Long-running, interactive work | Keeps a persistent Claude process alive for streaming, queued messages, approvals, and live control; follow-ups sent while busy go straight to the CLI and are absorbed between tool rounds. |
 
 When hosting an existing session, exit its terminal process first so two processes do not write to the same conversation.
+Mid-turn absorption of follow-ups relies on a recent Claude Code CLI; older versions fall back to the CLI's own queue and still work.
 
 Hosted sessions default to the **`full`** approval mode, which automatically approves permission requests. Switch to **`ask`** in the session view when you want to review each request, or **`auto`** to use Claude Code's own permission mode.
 

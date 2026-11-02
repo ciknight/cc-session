@@ -82,8 +82,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
 `GET /system` 带 `orphans` 列表，`POST /system/orphans/end` 按 pid 或 all 发送 terminate。
 4. **远程发消息/托管**（`send_message` + `Hosted`）：`POST /sessions/<id>/message` 用
    `claude -p --resume` 跑一轮（异步 job，`GET /jobs/<id>` 查询）；`POST /hosted` 启动
-   stream-json 双向的常驻 claude 进程，消息写 stdin、忙时排队，已托管会话的
-   message 请求自动路由到常驻进程。托管进程带 `--permission-prompt-tool stdio`，
+   stream-json 双向的常驻 claude 进程，消息立即写 stdin（忙时由 CLI 排队并在工具轮之间
+   吸收），已托管会话的 message 请求自动路由到常驻进程。托管进程带 `--permission-prompt-tool stdio`，
    权限请求经 `/interactions` 审批；`POST /sessions/<id>/interrupt` 中断当前回合。
    接口无鉴权，不要暴露到不可信网络。
 
@@ -135,14 +135,24 @@ uv run monitor.py --webhook http://localhost:3000/hook
   进程，提示目录来自 `GET /commands?cwd=`（`scan_slash_commands` 扫描用户级
   `<claude_dir>/commands` 与项目级 `<cwd>/.claude/commands` 的 `*.md`，子目录映射
   `name/sub`；内置命令要等进程 init 广播，不在扫描范围内），前端按 cwd 缓存。
-- **工作时发送**：托管会话在 `working` 时消息进入 `Hosted.pending` 队列；非托管一次性消息
-  进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动派发下一条（每会话上限 32）。
+- **工作时发送**：非托管一次性消息进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动
+  派发下一条（每会话上限 32）。托管会话的消息**立即写入常驻进程 stdin**，不再等服务端等上一轮
+  结束：CLI 自己维护命令队列，并在工具轮之间把新消息折叠进当前回合（absorbed_mid_turn）。
+  initialize 声明 `rapidFollowupPreempt`，回合还没输出内容时新消息可直接接管当前回合
+  （`system/turn_preempted`；被接管的 job 记为 done「已被后续消息接管」，不报中断失败）。
+  模型相同的追发完全并发；请求模型与进程当前模型不同且正忙时，这条消息等服务端切模型，
+  避免改掉正在跑的回合的模型。`Hosted.pending` 同时容纳已写入 CLI 的消息，
+  `_claimed` 表示发送线程已领取、`_writing` 表示正在写 stdin（此窗口取消返回 409）、
+  `_written` 表示已交给 CLI。
   网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“工作状态下也发送”与
   “托管（常驻进程）”默认勾选，前者以 `force` 绕过 working 检查。新建会话的托管模式也会把
   对话框里的审批选择作为首轮 `/hosted` 的 `approval` 提交。
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有
-  `completed/cancelled/discarded/refused/dropped` 结束回合。
+  `completed/cancelled/discarded/refused/dropped` 结束回合。`result.user_message_uuids`
+  列出该回合消费的全部消息，用于批量收尾；同一回合只发一次 `hosted_turn_done`。
+  这些字段属于 CLI 的 `@internal` 协议：initialize 被旧版明确拒绝时退回基础 initialize；
+  没有 uuid 列表时按提交顺序认领 result；旧版 CLI 只会退化为 CLI 内部排队，发送仍可用。
 - **图片消息**：`/message`、`/new`、`/hosted` 接受可选
   `images: [{"media_type", "data"}]`（纯 base64），`message_content` 统一校验并生成
   文字在前、图片在后的 content blocks；托管直接写数组，一次性消息为此切到双向
@@ -150,8 +160,11 @@ uv run monitor.py --webhook http://localhost:3000/hook
   支持 PNG/JPEG/GIF/WebP，每次最多 8 张、单张原始数据 3.75 MiB、合计 20 MiB，
   job/队列只保留文字与图片数量摘要，不复制 base64。网页支持选择/粘贴、缩略图和纯图片发送，
   附件读取按会话串行并在 pending 时禁发；202 后按提交项身份清理，保留后续新增附件。
-- **队列查询与单项取消**：`GET /sessions/<sid>/jobs` 投影执行、等待及最近终态；取消接口只在
-  owner 锁内移除真实等待成员，已领取（包括切模型）返回 409，不能调用会增加 turns 的回合收尾。
+- **队列查询与单项取消**：`GET /sessions/<sid>/jobs` 投影执行、等待及最近终态；取消只对
+  尚未开始的消息生效——还没写入的从本地队列移除，已写入 CLI 队列的用
+  `cancel_async_message`（`message_uuid` = job 的 `command_uuid`）撤回，CLI 回答
+  `cancelled:false` 或 job 已被领取/正在执行时返回 409；取消排队项不计 turns、不发 turn_done。
+  中断发送 `interrupt` 时带 `cancel_queued:true`，同时清空本地未终态消息。
   非托管 job/队列归 `Monitor.lock`，托管归 `Hosted.ready`；注册表与终态历史归 Monitor，
   嵌套锁仅允许 Hosted → Monitor。全部活动 job 保留，全局只保留最近 100 个首次终态，
   每会话最多返回其中 20 条；`started_at` 保持提交时间语义。队列和历史不跨服务重启恢复。
@@ -208,10 +221,10 @@ cwd 与「对话 N/M」计数并入概览折叠 `overviewHtml`——summary 一�
 发送区固定底部。进入会话滚到底部；增量刷新贴底时自动跟底、翻看历史时不打扰；加载更早
 按高度补偿保持视野。置顶/归档/别名不在会话页显示，只在外层列表卡片操作（别名暂无前端入口，
 后端 API 保留）。发送队列摘要内联为模型选择行右侧的 chip（`#queue`）：无执行/等待且无错误/通知时隐藏，
-仅 chip 文字可 hover/聚焦/点击，详情浮层是 body 顶层的 `#queuepop`（`position:fixed` 按
-chip 矩形定位并夹紧视口，滚动/ resize 重定位）：不随 `main` 的 overflow 裁剪、也不被侧栏
-遮挡；悬停/聚焦临时浏览（peek）、点击固定（pinned），外点或 Esc 收起，取消按钮、最近结束
-折叠在浮层内（点击兼容触屏）。
+仅 chip 文字可点击（不做悬停/聚焦自动展开，键盘 Enter/空格等价于点击），详情浮层是 body
+顶层的 `#queuepop`（`position:fixed` 按 chip 矩形定位并夹紧视口，滚动/ resize 重定位）：
+不随 `main` 的 overflow 裁剪、也不被侧栏遮挡；点击展开/收起，外点或 Esc 收起，
+取消按钮、最近结束折叠在浮层内（点击兼容触屏）。
 窄屏（≤768px）发送区次要控件（审批/思考/发送选项/托管）收进 ⚙ 浮层——`composer-extra`
 桌面 `display:contents` 原样展开、控件 DOM 不移动，textarea 压两行，头部隐藏 cwd。
 所有设备的会话页发送框均常驻底部，滚动消息时不隐藏、不回弹，也不因滚动停止强制顶底。

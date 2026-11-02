@@ -202,6 +202,131 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(active['status'], 'queued')
         self.assertNotIn('_owner', copy)
 
+    def _host_with_fake_stdin(self, host):
+        """启动发送线程但不接真实进程；返回 (sender, written, stop)。"""
+        written = []
+        def write(obj):
+            written.append(obj)
+
+        patchers = [patch.object(host, "_control", return_value={}),
+                    patch.object(host, "_write", side_effect=write)]
+        for p in patchers:
+            p.start()
+        sender = threading.Thread(target=host._send_loop, daemon=True)
+        sender.start()
+
+        def stop():
+            with host.ready:
+                host.stopping = True
+                host.ready.notify_all()
+            sender.join(2)
+            for p in patchers:
+                p.stop()
+        return sender, written, stop
+
+    def test_host_delivers_followup_without_waiting_for_turn_end(self):
+        host = monitor.Hosted(self.mon, str(self.root), 'existing')
+        host.status = 'running'
+        events = []
+        host._emit_session_event = lambda kind, data, transient=False: events.append((kind, data))
+        sender, written, stop = self._host_with_fake_stdin(host)
+        try:
+            _, first = host.send('first', None)
+            _, second = host.send('second', None)
+            deadline = time.time() + 2
+            while (sum(1 for w in written if w.get('type') == 'user') < 2
+                   and time.time() < deadline):
+                time.sleep(0.01)
+            self.assertEqual(
+                sum(1 for w in written if w.get('type') == 'user'), 2,
+                '两条消息都应立即写入 stdin，而不是等上一条结束')
+            self.assertEqual(self.mon.jobs[second['job_id']]['status'], 'queued')
+            cu1 = self.mon.jobs[first['job_id']]['command_uuid']
+            cu2 = self.mon.jobs[second['job_id']]['command_uuid']
+            host._on_lifecycle({'command_uuid': cu1, 'state': 'started'})
+            host._on_lifecycle({'command_uuid': cu2, 'state': 'started'})   # 工具轮之间被吸收
+            host._on_result({'result': 'answer', 'session_id': 'fake-session',
+                             'user_message_uuids': [cu1, cu2]})
+            host._on_lifecycle({'command_uuid': cu1, 'state': 'completed'})
+            host._on_lifecycle({'command_uuid': cu2, 'state': 'completed'})
+        finally:
+            stop()
+        self.assertEqual(self.mon.jobs[first['job_id']]['status'], 'done')
+        self.assertEqual(self.mon.jobs[second['job_id']]['status'], 'done')
+        self.assertEqual([e for e in events if e[0] == 'hosted_turn_done'].__len__(), 1,
+                         '同一回合吸收多条消息只应通知一次')
+        self.assertEqual(host.turns, 1)
+
+    def test_result_without_uuid_finishes_queued_jobs_in_order(self):
+        host = monitor.Hosted(self.mon, str(self.root), 'existing')
+        host.status = 'running'
+        host._emit_session_event = lambda kind, data, transient=False: None
+        _, first = host.send('one', None)
+        _, second = host.send('two', None)
+        first_job = self.mon.jobs[first['job_id']]
+        second_job = self.mon.jobs[second['job_id']]
+        with host.ready:
+            for _, job, _ in host.pending:
+                job['_claimed'] = True
+                job['_written'] = True
+            host.current = first_job
+            first_job['status'] = 'running'
+        # 极旧 CLI：result 不带 uuid；两轮结果应按提交顺序分别落位
+        host._on_result({'result': 'r1'})
+        self.assertTrue(first_job['_result_seen'])
+        self.assertFalse(second_job.get('_result_seen'))
+        host._finish_job(first_job, 'completed', notify=True)
+        host._on_result({'result': 'r2'})
+        self.assertTrue(second_job['_result_seen'])
+        self.assertEqual(second_job['result'], 'r2')
+
+    def test_host_cancel_delivered_queued_job_uses_control_request(self):
+        host = monitor.Hosted(self.mon, str(self.root), 'existing')
+        host.status = 'running'
+        sender, written, stop = self._host_with_fake_stdin(host)
+        try:
+            _, first = host.send('first', None)
+            _, second = host.send('second', None)
+            deadline = time.time() + 2
+            while time.time() < deadline and not (
+                    sum(1 for w in written if w.get('type') == 'user') >= 2
+                    and self.mon.jobs[second['job_id']].get('_written')):
+                time.sleep(0.01)
+            cu2 = self.mon.jobs[second['job_id']]['command_uuid']
+            with patch.object(host, '_control', return_value={'cancelled': False}):
+                self.assertEqual(self.mon.cancel_job('existing', second['job_id'])[0], 409)
+            with patch.object(host, '_control', return_value={'cancelled': True}) as control:
+                code, summary = self.mon.cancel_job('existing', second['job_id'])
+            self.assertEqual(code, 200)
+            self.assertEqual(summary['status'], 'cancelled')
+            control.assert_called_once_with('cancel_async_message', timeout=10, message_uuid=cu2)
+            self.assertIs(host.current, self.mon.jobs[first['job_id']])
+            events = []
+            host._emit_session_event = lambda kind, data, transient=False: events.append((kind, data))
+            host._on_lifecycle({'command_uuid': cu2, 'state': 'cancelled'})
+            self.assertFalse([e for e in events if e[0] == 'hosted_foreign_turn'],
+                             '本地取消的消息不应再被当成外部回合')
+        finally:
+            stop()
+
+    def test_turn_preempted_is_reported_as_superseded_not_failed(self):
+        host = monitor.Hosted(self.mon, str(self.root), 'existing')
+        host.status = 'running'
+        events = []
+        host._emit_session_event = lambda kind, data, transient=False: events.append((kind, data))
+        _, first = host.send('first', None)
+        job = self.mon.jobs[first['job_id']]
+        with host.ready:
+            host.current = job
+            job['status'] = 'running'
+        host._on_turn_preempted({'preempted_message_uuids': [job['command_uuid']],
+                                 'preempted_by_uuid': 'follow-up'})
+        host._on_lifecycle({'command_uuid': job['command_uuid'], 'state': 'cancelled'})
+        self.assertEqual(job['status'], 'done')
+        self.assertEqual(job['result'], '已被后续消息接管')
+        done = [e for e in events if e[0] == 'hosted_turn_done']
+        self.assertEqual(done[0][1]['status'], 'done')
+
     def test_host_cancel_does_not_finish_current_turn_or_clear_stream(self):
         host = monitor.Hosted(self.mon, str(self.root), 'existing')
         host.status = 'running'
