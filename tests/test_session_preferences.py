@@ -322,6 +322,8 @@ class EffortPreferenceTests(unittest.TestCase):
     def test_validate_effort(self):
         self.assertEqual(prefs.validate_effort("low"), "low")
         self.assertEqual(prefs.validate_effort("high"), "high")
+        self.assertEqual(prefs.validate_effort("xhigh"), "xhigh")
+        self.assertEqual(prefs.validate_effort("max"), "max")
         self.assertIsNone(prefs.validate_effort("default"))
         for level in ("", "default ", "high ", "ultra", None, 1, [], {}):
             with self.subTest(level=level), self.assertRaises(ValueError):

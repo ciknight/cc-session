@@ -810,9 +810,9 @@ function composerHtml(mode, d){
             <option value="low">low</option>
             <option value="medium">medium</option>
             <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
           </select></label>
-        ${isNew ? "" : `<label class="ctl" title="会话显示 working 时也允许发送；非托管会话可能与终端进程并发写入">
-          <input type="checkbox" id="forcecb" checked> 工作状态下也发送</label>`}
         <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
           <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : "checked"}> 托管（常驻进程，后续消息不再重启）</label>
         ${!isNew && d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
@@ -2169,11 +2169,15 @@ function echoVisible(messages, echo){
   // 同文连续提交需要不同的新消息确认；前一条未对账时，不能借它的转录清除后一条。
   const waiting = [];
   for(let e = echo; e; e = e.previous) if(!e.failed && e.text.trim() === echo.text.trim()) waiting.unshift(e);
-  let next = Math.max(0, messages.length - Math.max(20, waiting.length));
+  // 有提交水位（after）时必须以水位为扫描下界。繁忙回合两次刷新之间很容易追加
+  // 20 条以上助手消息，若再用“末尾 20 条”截断，真实 user 消息会落在窗口外，
+  // 回显永远停在“发送中…”。末尾窗口只兜底没有水位的旧数据。
+  const tail = Math.max(0, messages.length - Math.max(20, waiting.length));
+  let next = 0;
   for(const e of waiting){
     const first = e.after == null ? 0 : Math.max(0, e.after - (convState.start || 0));
     let found = false;
-    for(let i = Math.max(next, first); i < messages.length; i++){
+    for(let i = Math.max(next, first, e.after == null ? tail : 0); i < messages.length; i++){
       const m = messages[i];
       // 有水位（after）时只按位置对账；仅当提交前没有任何消息可作参照时，
       // 才用 submittedAt 排除更早的同文历史。手机时钟偏差会让真实消息 ts 早于
@@ -2488,7 +2492,8 @@ function bindSendBox(id, d){
     const submitted = captureMessageDraft(id), text = submitted.rawText.trim();
     const submittedImages = captureImageDraft(id), images = submittedImages.images;
     if(!text && !images.length) return;
-    const force = document.getElementById("forcecb").checked;
+    // 网页发送是用户明确点击，始终绕过会话 working 的 409 守卫
+    const force = true;
     const selectedModel = modelSnapshot(id);
     if(selectedModel === undefined) return;
     // 已托管的会话 /sessions/<id>/message 会自动路由到常驻进程，无需再 POST /hosted

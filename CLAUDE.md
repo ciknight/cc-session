@@ -70,7 +70,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
    `/sessions/<id>/messages` 支持 `limit`（默认 100）、`before`、`from` 分页。
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
-   设置托管思考档位（low/medium/high/default）。
+   设置托管思考档位（low/medium/high/xhigh/max/default）。
    `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲），
 `POST /system/sleep-timer` 定时睡眠（服务端 `threading.Timer` 内存态，minutes 0-720、0 取消，
 `GET /system` 的 `sleep_timer_remaining` 随轮询返回剩余秒）。
@@ -144,8 +144,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
   避免改掉正在跑的回合的模型。`Hosted.pending` 同时容纳已写入 CLI 的消息，
   `_claimed` 表示发送线程已领取、`_writing` 表示正在写 stdin（此窗口取消返回 409）、
   `_written` 表示已交给 CLI。
-  网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“工作状态下也发送”与
-  “托管（常驻进程）”默认勾选，前者以 `force` 绕过 working 检查。新建会话的托管模式也会把
+  网页发送按钮只在 POST 进行中防重复点击，运行/排队中仍可继续发送；“托管（常驻进程）”
+  默认勾选，网页发送始终以 `force` 绕过 working 检查（不再提供勾选框）。新建会话的托管模式也会把
   对话框里的审批选择作为首轮 `/hosted` 的 `approval` 提交。
   回合生命周期以 `command_lifecycle` 为准，`result` 作为旧版兜底；
   `queued/started/running/released` 是非终态，只有

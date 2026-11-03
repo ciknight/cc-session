@@ -11,7 +11,7 @@ UNSET = object()
 
 APPROVAL_MODES = ("ask", "auto", "full")
 
-EFFORT_LEVELS = ("low", "medium", "high")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
 def validate_model(model):
@@ -56,11 +56,11 @@ def model_args(args, model):
 
 
 def validate_effort(level):
-    """effort 接口值：low / medium / high；default 规范化为 None（模型默认）。"""
+    """effort 接口值：low / medium / high / xhigh / max；default 规范化为 None（模型默认）。"""
     if level == "default":
         return None
     if level not in EFFORT_LEVELS:
-        raise ValueError("effort 必须是 low / medium / high / default")
+        raise ValueError("effort 必须是 low / medium / high / xhigh / max / default")
     return level
 
 
@@ -284,7 +284,7 @@ class EffortPreferences(_MapPreferences):
     @staticmethod
     def _validate(level):
         if level is not None and level not in EFFORT_LEVELS:
-            raise ValueError("思考档位必须是 low / medium / high，或 null")
+            raise ValueError("思考档位必须是 low / medium / high / xhigh / max，或 null")
         return level
 
 

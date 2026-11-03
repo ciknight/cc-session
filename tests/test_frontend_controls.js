@@ -85,10 +85,12 @@ test('现有会话 Enter 发送一次，Shift 与 IME Enter 不发送', async ()
   assert.equal(newEnter.defaultPrevented,true);
   assert.equal(fresh.node('sendbtn').clickCount,1);
 });
-test('默认审批为全部允许，工作状态下发送默认勾选', () => {
+test('默认审批为全部允许，不再提供工作状态发送开关', () => {
   assert.match(html, /value="full" selected>全部允许/);
   assert.ok(html.indexOf('value="auto"') < html.indexOf('value="ask"'));
-  assert.match(html, /id="forcecb" checked/);
+  assert.doesNotMatch(html, /forcecb|工作状态下也发送/);
+  assert.match(html, /value="xhigh">xhigh/);
+  assert.match(html, /value="max">max/);
 });
 test('刷新时保留已展开的工具与信息折叠状态', () => {
   const b = boot();
@@ -131,7 +133,7 @@ test('新建会话与对话复用同一个 composer', () => {
     assert.match(markup, /id="hostcb"/);
   }
   assert.match(fresh, /创建并发送/);
-  assert.match(conv, /工作状态下也发送/);
+  assert.doesNotMatch(conv, /forcecb/);
 });
 test('新建会话托管时把审批模式提交给 /hosted', async () => {
   const requests=[];
@@ -1015,6 +1017,25 @@ test('设备时钟偏差不影响回显对账（不再比较 submittedAt 与转�
       + 'pendingEcho.b={text:"hi",token:2,after:0,noHistory:true,submittedAt:10000}; renderConvList()');
   b.run('convState.msgs.push({role:"user",ts:9000,parts:[{type:"text",text:"hi"}]}); convState.total=1; renderConvList()');
   assert.equal(b.run('pendingEcho.b'),undefined,'新会话首条也不受时钟偏差影响');
+});
+
+test('繁忙回合追加超过 20 条消息后回显仍按水位对账', () => {
+  // 助手工具调用每步一条消息：两次刷新之间可能追加 20+ 条，
+  // 回显不能用“末尾 20 条”窗口把水位处的真实 user 消息挡在外面。
+  const b = boot();
+  b.run('convState={id:"a",start:0,cursor:1,total:1,msgs:[{role:"assistant",parts:[]}]};'
+      + 'pendingEcho.a={text:"follow-up",token:1,after:1,submittedAt:1};');
+  b.run('convState.msgs.push({role:"user",ts:2,parts:[{type:"text",text:"follow-up"}]});'
+      + 'for(let i=0;i<25;i++) convState.msgs.push({role:"assistant",parts:[]});'
+      + 'convState.total=27; convState.cursor=27; renderConvList()');
+  assert.equal(b.run('pendingEcho.a'), undefined, '水位消息在末尾窗口之外也要能被对账清除');
+  // 新会话首条（after=0、noHistory）同理：它的位置是窗口开头的 0 号消息
+  b.run('convState={id:"b",start:0,cursor:0,total:0,msgs:[]};'
+      + 'pendingEcho.b={text:"first",token:2,after:0,noHistory:true};');
+  b.run('convState.msgs=[{role:"user",ts:2,parts:[{type:"text",text:"first"}]}];'
+      + 'for(let i=0;i<25;i++) convState.msgs.push({role:"assistant",parts:[]});'
+      + 'convState.total=26; convState.cursor=26; renderConvList()');
+  assert.equal(b.run('pendingEcho.b'), undefined, '新会话首条也不能被窗口挤掉');
 });
 
 test('echoVisible 按文本对账', () => {
