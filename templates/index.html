@@ -14,6 +14,7 @@ html,body{height:100%;margin:0}
 body{font:14px/1.55 system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
 header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--bd);flex:none}
 h1{font-size:16px;margin:0}
+.hdr-label-short,.hdr-break{display:none}
 .ctl{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--mut)}
 select{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:2px 6px}
 /* 开关 */
@@ -209,7 +210,7 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   border:1px dashed var(--bd);border-radius:999px;background:var(--card);color:var(--mut);
   font:inherit;font-size:13px;cursor:pointer}
 .load-earlier:hover{color:var(--fg);border-color:var(--acc)}
-.conv-overview>summary{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv-overview>summary{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-transform:none}
 /* 队列摘要内联在模型选择行右侧：只有 chip 文字可点击（不做悬停预览）；
    详情浮层挂在 body 顶层、固定定位随 chip 计算，不随 main 的 overflow 裁剪，
    也不被侧栏/抽屉遮挡 */
@@ -241,11 +242,26 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
 @media(max-width:768px){
   #app{grid-template-columns:1fr}
   #menu{display:inline-block}
-  header{padding:8px 10px;gap:10px}
+  /* 顶部栏压成两行：标题行只留开关/间隔/系统图标，徽章与通知落到第二行；
+     隐藏“自动刷新/间隔/系统”文字和更新时间，保留 aria-label/title */
+  header{padding:6px 8px;gap:6px;row-gap:6px}
+  header h1{font-size:15px;white-space:nowrap;min-width:0;flex:1 1 auto;
+    overflow:hidden;text-overflow:ellipsis}
+  header .hdr-label,#updated{display:none}
+  header .hdr-label-short{display:inline}
+  header .hdr-break{display:block;flex-basis:100%;height:0;margin:0}
+  header .back{padding:2px 8px;font-size:12px}
+  header .ctl{font-size:12px;gap:4px}
+  #sysbtn{padding:2px 7px}
   main{padding:8px 10px}
-  .conv-top{padding:8px 10px 4px}
+  .conv-top{padding:6px 10px 2px}
   .conv-cwd{display:none}
-  .conv-head h2{font-size:14px;margin:4px 0}
+  .conv-head{gap:6px}
+  .conv-head .back-label,.conv-head .chip-label{display:none}
+  .conv-head h2{font-size:14px;margin:2px 0}
+  /* 概览摘要只保留对话数、子代理与任务；模型/分支/token 进展开面板看 */
+  .conv-overview>summary .ov-model,.conv-overview>summary .ov-branch,
+  .conv-overview>summary .ov-output,.conv-overview>summary .ov-ctx{display:none}
   #conv{padding:4px 10px 12px}
   main.convview .composer{margin:8px 10px}
   .composer-cog{display:inline-block}
@@ -254,7 +270,20 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
     z-index:30;flex-direction:column;align-items:flex-start;gap:8px;background:var(--bg);
     border:1px solid var(--bd);border-radius:8px;padding:10px 12px;
     box-shadow:0 8px 24px rgba(0,0,0,.16);max-height:60vh;overflow-y:auto}
-  .composer textarea{height:4.6em}
+  /* 模型选择行保持单行：隐藏“模型选择”文字、控件可收缩、队列摘要靠右 */
+  .composer .model-controls{flex-wrap:nowrap;gap:6px;margin:4px 0;min-width:0}
+  .composer .model-controls>label.ctl{gap:4px;flex:0 1 auto;min-width:0}
+  .composer .ctl-label{display:none}
+  #modelsel{min-width:0;max-width:46vw;flex:0 1 auto;font-size:12px}
+  #modelcustom{min-width:0;max-width:38vw;flex:1 1 70px}
+  #modelst{flex:0 1 auto;min-width:0;max-width:30vw;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;font-size:11px}
+  .queue-chip{flex:none;margin-left:auto;max-width:36vw;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+  /* 按钮行：收紧内边距与间距，发送/图片/中断/⚙ 始终同一行 */
+  .composer-actions{flex-wrap:nowrap;gap:6px;margin-top:5px}
+  .composer-actions>.back{flex:none;padding:3px 8px;font-size:12px;white-space:nowrap}
+  .composer textarea{height:4.1em}
   .ubody{max-width:92%}
   aside{position:fixed;top:0;bottom:0;left:0;width:min(75vw,300px);z-index:20;background:var(--bg);
         transform:translateX(-100%);transition:transform .2s ease}
@@ -269,11 +298,12 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
 <header>
   <button id="menu" class="back" aria-label="项目列表">☰</button>
   <h1>Claude Sessions <span class="mut" id="total"></span></h1>
-  <label class="ctl">
-    <span class="sw"><input type="checkbox" id="auto" checked><i></i></span> 自动刷新
+  <label class="ctl" title="自动刷新">
+    <span class="sw"><input type="checkbox" id="auto" checked aria-label="自动刷新"><i></i></span>
+    <span class="hdr-label">自动刷新</span><span class="hdr-label-short">自动</span>
   </label>
-  <label class="ctl">间隔
-    <select id="ival">
+  <label class="ctl" title="刷新间隔"><span class="hdr-label">间隔</span>
+    <select id="ival" aria-label="刷新间隔">
       <option value="2000">2s</option>
       <option value="3000">3s</option>
       <option value="5000">5s</option>
@@ -281,13 +311,15 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
     </select>
   </label>
   <span class="ctl" id="updated"></span>
+  <span class="hdr-break" aria-hidden="true"></span>
   <button id="hostedbadge" class="back" style="display:none"
           title="当前托管（常驻进程）的会话数，点击查看列表">托管 0</button>
   <button id="pendingbadge" class="back"
           title="有权限请求等待审批，点击跳转">待审批 0</button>
   <span id="err"></span>
   <button id="notifybtn" class="back" title="开启浏览器通知">🔕</button>
-  <button id="sysbtn" class="back" style="margin-left:auto" title="系统状态与电源操作">🖥 系统</button>
+  <button id="sysbtn" class="back" style="margin-left:auto" aria-label="系统状态与电源操作"
+          title="系统状态与电源操作">🖥<span class="hdr-label"> 系统</span></button>
 </header>
 <div id="app">
   <aside id="projs"></aside>
@@ -712,7 +744,7 @@ function modelChoiceFor(key, model){
   return index < 0 ? customModelChoice : profileModelChoice(index);
 }
 function modelControlsHtml(){
-  return `<div class="model-controls"><label class="ctl">模型选择
+  return `<div class="model-controls"><label class="ctl"><span class="ctl-label">模型选择</span>
     <select id="modelsel" aria-label="模型选择"><option value="default" data-kind="default">默认（清除 Web 覆盖）</option>
       <option value="custom" data-kind="custom">自定义 ID</option></select></label>
     <input id="modelcustom" aria-label="自定义模型 ID" placeholder="完整或自定义模型 ID" maxlength="256" hidden>
@@ -793,7 +825,7 @@ function composerHtml(mode, d){
     <div id="cmdhints" hidden></div>
     <div class="composer-actions">
       <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
-      <button class="back" id="imagebtn" type="button" title="选择图片，也可以直接粘贴到输入框">📎 图片</button>
+      <button class="back" id="imagebtn" type="button" title="选择图片，也可以直接粘贴到输入框">图片</button>
       ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断并清空队列</button>`}
       <button class="back composer-cog" id="cogbtn" aria-label="发送选项"
               title="审批 / 思考 / 发送选项">⚙</button>
@@ -891,7 +923,7 @@ async function loadModelOptions(key, cwd){
 function updateModelSt(key){
   if(!panelMatch(key)) return;
   const el = document.getElementById("modelst");
-  if(el) el.textContent = modelDraft(key).status;
+  if(el){ el.textContent = modelDraft(key).status; el.title = el.textContent; }
 }
 async function saveModel(key){
   const s = modelDraft(key);
@@ -1415,19 +1447,25 @@ function infoHtml(d){
 function overviewSummary(d){
   const t = d.tokens || {};
   const run = (d.subagents || []).filter(a => a.state === "running").length;
-  return [
-    d.model || "",
-    d.git_branch ? "⎇ " + d.git_branch : "",
-    `消息 ${d.user_msgs || 0}/${d.assistant_msgs || 0}`,
-    t.output ? `输出 ${fmtTok(t.output)} tok` : "",
-    d.context_tokens ? `上下文 ${fmtTok(d.context_tokens)}` : "",
-    (d.subagents || []).length ? `${d.subagents.length} 子代理${run ? ` · ${run} 运行中` : ""}` : "",
-    d.tasks_total ? `任务 ${d.tasks_completed || 0}/${d.tasks_total}` : "",
-  ].filter(Boolean).map(esc).join(" · ") || "暂无统计";
+  // 每项带 key：窄屏按类名隐藏模型/分支/token，保留对话数与任务/子代理计数。
+  // 分隔符放在各项内部，隐藏某项时不会留下悬空的“·”。
+  const items = [
+    ["model", d.model || ""],
+    ["branch", d.git_branch ? "⎇ " + d.git_branch : ""],
+    ["msgs", `消息 ${d.user_msgs || 0}/${d.assistant_msgs || 0}`],
+    ["output", t.output ? `输出 ${fmtTok(t.output)} tok` : ""],
+    ["ctx", d.context_tokens ? `上下文 ${fmtTok(d.context_tokens)}` : ""],
+    ["agents", (d.subagents || []).length ? `${d.subagents.length} 子代理${run ? ` · ${run} 运行中` : ""}` : ""],
+    ["tasks", d.tasks_total ? `任务 ${d.tasks_completed || 0}/${d.tasks_total}` : ""],
+  ].filter(([, text]) => text);
+  return items.map(([key, text], i) =>
+    `<span class="ov-item ov-${key}">${i ? '<span class="ov-sep"> · </span>' : ""}${esc(text)}</span>`
+  ).join("") || "暂无统计";
 }
 function overviewHtml(d){
   return `<details class="fold conv-overview"${detailsAttrs(`info:${d.id || ""}:overview`)}>` +
-    `<summary>概览 · <span id="convcount"></span>${overviewSummary(d)}</summary><div id="infopanel">${infoHtml(d)}</div></details>`;
+    `<summary>概览 · <span id="convcount"></span><span class="ov-stats"> · ${overviewSummary(d)}</span></summary>` +
+    `<div id="infopanel">${infoHtml(d)}</div></details>`;
 }
 
 function diffHtml(text){
@@ -1862,10 +1900,11 @@ async function renderConversation(id, force){
         main.innerHTML = `
           <div class="conv-top">
             <div class="conv-head">
-              <button class="back" id="back">← 返回</button>
+              <button class="back" id="back" aria-label="返回项目列表"
+                      title="返回项目列表">←<span class="back-label"> 返回</span></button>
               <h2>
                 <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
-                ${d.hosted ? '<span class="chip">⚙ 托管中</span>' : ""}
+                ${d.hosted ? '<span class="chip" title="该会话由常驻进程托管">⚙<span class="chip-label"> 托管中</span></span>' : ""}
                 <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
                 <span class="mut conv-cwd">${esc(d.cwd || "")}</span></h2>
             </div>
