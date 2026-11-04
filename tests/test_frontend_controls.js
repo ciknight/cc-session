@@ -2325,3 +2325,226 @@ for(const [device, narrow, navigator] of [
     assert.equal(timers.length, 0, '滚动不安排回弹定时器');
   });
 }
+
+test('工具卡按类型显示摘要、状态与 diff 统计', () => {
+  const b = boot();
+  b.run('convState.detail={state:"working",subagents:[]}');
+  const edit = b.run(`toolPartHtml({type:"tool",tool_use_id:"t1",name:"Edit",
+    input_data:{file_path:"src/a.py"},
+    result:{kind:"diff",text:"+a",stats:{added:1,removed:1}}})`);
+  assert.match(edit, /src\/a\.py/);
+  assert.match(edit, /\+1/);
+  assert.match(edit, /-1/);
+  assert.match(edit, /完成/);
+  assert.match(edit, /data-dkey="tool:t1"/);
+
+  const read = b.run(`toolPartHtml({type:"tool",tool_use_id:"t2",name:"Read",
+    input_data:{file_path:"a.py"},result:{kind:"text",text:"secret"}})`);
+  assert.match(read, /a\.py/);
+  assert.match(read, /tool-result-fold/);
+  assert.doesNotMatch(read, /tool-result-fold[^>]* open/, '成功的 Read 结果默认不展开');
+  assert.match(read, /secret/);
+
+  const running = b.run(`toolPartHtml({type:"tool",tool_use_id:"t3",name:"Bash",
+    input_data:{command:"sleep 1"}})`);
+  assert.match(running, /运行中/);
+  assert.match(running, /sleep 1/);
+});
+
+test('连续同名工具折叠成一组，并汇总增删行数', () => {
+  const b = boot();
+  const html = b.run(`convGroupHtml({role:"assistant",ts:0,parts:[
+    {type:"tool",tool_use_id:"a",name:"Read",input_data:{file_path:"a.py"}},
+    {type:"tool",tool_use_id:"b",name:"Read",input_data:{file_path:"b.py"}},
+    {type:"tool",tool_use_id:"c",name:"Edit",input_data:{file_path:"c.py"},
+     result:{kind:"diff",text:"+x",stats:{added:1,removed:0}}}
+  ]})`);
+  assert.match(html, /tool-group/);
+  assert.match(html, /×2/);
+  assert.match(html, /a\.py, b\.py/);
+  assert.match(html, /c\.py/);
+});
+
+test('压缩边界、压缩摘要与思考过程折叠渲染', () => {
+  const b = boot();
+  const compact = b.run(`convGroupHtml({role:"system",ts:0,parts:[
+    {type:"compact",trigger:"manual",pre_tokens:1000,duration_ms:2000,text:"Conversation compacted"},
+    {type:"compact_summary",text:"压缩后的摘要"}
+  ]})`);
+  assert.match(compact, /上下文已压缩/);
+  assert.match(compact, /压缩前 1\.0k tok/);
+  assert.match(compact, /压缩摘要/);
+
+  const thinking = b.run(`convGroupHtml({role:"assistant",ts:0,parts:[
+    {type:"thinking",text:"先看目录"}, {type:"text",text:"开始处理"}
+  ]})`);
+  assert.match(thinking, /思考过程/);
+  assert.match(thinking, /先看目录/);
+  assert.match(thinking, /开始处理/);
+});
+
+test('子代理卡片与后台任务条使用 detail 中已有的运行状态', () => {
+  const b = boot();
+  b.run('convState.id="parent"; convState.detail={state:"working",subagents:[' +
+    '{tid:"t1",type:"Explore",description:"scan",state:"running",async:true,agent_id:"abc"}]}');
+  const card = b.run(`convGroupHtml({role:"assistant",ts:0,parts:[
+    {type:"tool",tool_use_id:"t1",name:"Agent",input_data:{description:"scan"}}]})`);
+  assert.match(card, /Explore/);
+  assert.match(card, /运行中/);
+  assert.match(card, /后台/);
+  assert.match(card, /data-open-subagent="parent::agent-abc"/);
+
+  b.run('renderBgStrip()');
+  assert.equal(b.node('bgstrip').hidden, false);
+  assert.match(b.node('bgstrip').innerHTML, /后台任务/);
+  assert.match(b.node('bgstrip').innerHTML, /Explore/);
+  b.run('convState.detail={state:"idle",subagents:[{tid:"t1",state:"done"}]}; renderBgStrip()');
+  assert.equal(b.node('bgstrip').hidden, true);
+});
+
+test('上下文 token chip 随详情更新，消息区有复制按钮', () => {
+  const b = boot();
+  b.run('convState.detail={state:"idle",subagents:[]}');
+  b.run('applySessionDetail({id:"sid",state:"idle",context_tokens:12000,' +
+    'tokens:{input:100,output:200,cache_read:50},subagents:[],tasks:[]})');
+  assert.equal(b.node('tokchip').hidden, false);
+  assert.match(b.node('tokchip').textContent, /12\.0k/);
+  const group = b.run('convGroupHtml({role:"assistant",ts:0,parts:[{type:"text",text:"hi"}]})');
+  assert.match(group, /data-copy/);
+});
+
+test('连接中断时显示连接徽章', () => {
+  const b = boot();
+  b.run('view={project:"/p",session:"sid",new:false}; sseDown={global:false,session:true}; updateConnBadge()');
+  assert.equal(b.node('connbadge').hidden, false);
+  b.run('sseDown.session=false; updateConnBadge()');
+  assert.equal(b.node('connbadge').hidden, true);
+});
+
+test('工具/子代理状态变化会进入分组签名，缓存节点不会停在运行中', () => {
+  const b = boot();
+  const group = '{role:"assistant",ts:0,parts:[{type:"tool",tool_use_id:"t1",name:"Agent"}]}';
+  b.run('convState.detail={state:"working",subagents:[{tid:"t1",state:"running"}]}');
+  const running = b.run('convGroupSig(' + group + ')');
+  b.run('convState.detail={state:"idle",subagents:[{tid:"t1",state:"done"}]}');
+  const done = b.run('convGroupSig(' + group + ')');
+  assert.notEqual(running, done);
+
+  const textGroup = '{role:"assistant",ts:0,parts:[{type:"text",text:"hi"}]}';
+  const before = b.run('convGroupSig(' + textGroup + ')');
+  b.run('convState.detail={state:"idle",subagents:[{tid:"t2",state:"done"}]}');
+  assert.equal(b.run('convGroupSig(' + textGroup + ')'), before, '无状态依赖的文本组不因详情变化重绘');
+});
+
+test('分叉状态不会被轮询的 updateSendSt 清空，并在查询失败时标为未知', async () => {
+  const b = boot(async (url) => {
+    if(url === '/sessions/sid/fork')
+      return {ok:true, status:202, json:async()=>({job_id:'fj', status:'running'})};
+    if(url === '/jobs/fj') throw Error('network down');
+    throw Error('unexpected fetch ' + url);
+  });
+  b.context.setTimeout = (fn) => { fn(); return 1; };
+  b.run('view={project:"/p",session:"sid",new:false}; curPanel={type:"conv",key:"sid"}');
+  b.node('msgbox').value = 'fork text';
+  b.run('modelDraft("sid", null)');
+  const running = b.run('forkSession("sid")');
+  b.run('updateSendSt("sid")');
+  assert.match(b.node('sendst').textContent, /正在分叉/);
+  assert.equal(b.node('sendbtn').disabled, true);
+  assert.equal(b.node('forkbtn').disabled, true);
+  await running;
+  assert.match(b.node('sendst').textContent, /状态查询失败/);
+  assert.doesNotMatch(b.node('sendst').textContent, /^分叉失败/);
+  assert.equal(b.run('forkBusy("sid")'), true);
+});
+
+test('visualViewport 只在未缩放且差值足够大时才缩短 body', () => {
+  const b = boot();
+  const writes = [];
+  b.context.document.documentElement = {
+    style: {setProperty(name, value){ writes.push([name, value]); }},
+  };
+  b.context.window.innerHeight = 800;
+  b.context.window.visualViewport = {scale:1, height:500, addEventListener(){}};
+  b.run('trackVisualViewport()');
+  assert.deepEqual(writes[writes.length - 1], ['--keyboard-height', '300px']);
+
+  b.context.window.visualViewport.scale = 2;
+  b.run('trackVisualViewport()');
+  assert.deepEqual(writes[writes.length - 1], ['--keyboard-height', '0px'], '缩放不算键盘');
+
+  b.context.window.visualViewport.scale = 1;
+  b.context.window.visualViewport.height = 760;
+  b.run('trackVisualViewport()');
+  assert.deepEqual(writes[writes.length - 1], ['--keyboard-height', '0px'], '地址栏小差值不缩短');
+
+  b.context.window.visualViewport.height = 0;
+  b.run('trackVisualViewport()');
+  assert.deepEqual(writes[writes.length - 1], ['--keyboard-height', '0px'], '瞬时 0 高度不缩短');
+});
+
+test('图片灯箱与消息复制基础数据齐全', () => {
+  const b = boot();
+  const image = b.run('imageHtml({media_type:"image/png",data:"aW1hZ2U="})');
+  assert.match(image, /data-lightbox="1"/);
+  const group = b.run('convGroupHtml({role:"assistant",ts:0,parts:[{type:"text",text:"hi"}]})');
+  assert.match(group, /data-copy/);
+  assert.equal(b.run('groupCopyText({parts:[{type:"text",text:"a"},{type:"tool"},{type:"text",text:"b"}]})'), 'a\n\nb');
+
+  const box = b.node('lightbox'), img = b.node('lightboximg');
+  box.querySelector = () => img;
+  b.run('openLightbox("data:image/png;base64,abc", "alt")');
+  assert.equal(box.hidden, false);
+  assert.equal(img.src, 'data:image/png;base64,abc');
+  b.run('closeLightbox()');
+  assert.equal(box.hidden, true);
+});
+
+test('detail 状态未变化时不重绘消息，变化时才触发', () => {
+  const b = boot();
+  b.run('view={project:"/p",session:"sid",new:false}; curPanel={type:"conv",key:"sid"}');
+  const first = b.run('applySessionDetail({id:"sid",state:"working",subagents:[{tid:"t",state:"running"}],tokens:{},tool_uses:{},tasks:[]})');
+  const same = b.run('applySessionDetail({id:"sid",state:"working",subagents:[{tid:"t",state:"running"}],tokens:{},tool_uses:{},tasks:[]})');
+  const changed = b.run('applySessionDetail({id:"sid",state:"idle",subagents:[{tid:"t",state:"done"}],tokens:{},tool_uses:{},tasks:[]})');
+  assert.equal(first, true);
+  assert.equal(same, false);
+  assert.equal(changed, true);
+});
+
+test('异步 Agent 启动回执无论 async 标记如何都不展示', () => {
+  const b = boot();
+  const html = b.run(`convGroupHtml({role:"assistant",ts:0,parts:[
+    {type:"tool",tool_use_id:"t1",name:"Agent",input_data:{description:"scan"},
+     result:{kind:"text",text:"Async agent launched successfully. (This tool result is internal metadata)"}}
+  ]})`);
+  assert.match(html, /Agent/);
+  assert.doesNotMatch(html, /Async agent launched/);
+  assert.doesNotMatch(html, /internal metadata/);
+});
+
+test('snapshot 中的 detail 变化会立即重绘消息状态', () => {
+  const b = boot();
+  b.run('view={project:"/p",session:"sid",new:false}; curPanel={type:"conv",key:"sid"}');
+  b.run('convState={id:"sid",msgs:[{role:"assistant",ts:0,parts:[{type:"text",text:"hi"}]}],total:1,cursor:1,start:0,size:1,hasMore:false,loadingEarlier:false,detail:null,detailKey:null}');
+  b.run('let renderCalls=0; renderConvList=()=>{renderCalls++;}');
+  b.run('handleSseMessage({type:"snapshot",session:"sid",data:{session:{id:"sid",state:"idle",subagents:[{tid:"t",state:"done"}],tokens:{},tool_uses:{},tasks:[]}}})');
+  assert.equal(b.run('renderCalls'), 1);
+});
+
+test('分叉完成但扫描未就绪时留在父会话并提示刷新', async () => {
+  const b = boot(async (url) => {
+    if(url === '/sessions/sid/fork')
+      return {ok:true, status:202, json:async()=>({job_id:'fj'})};
+    if(url === '/jobs/fj')
+      return response({status:'done', result_session_id:'new-sid', session:'new-sid'});
+    throw Error('unexpected fetch ' + url);
+  });
+  b.context.setTimeout = (fn) => { fn(); return 1; };
+  b.run('view={project:"/p",session:"sid",new:false}; curPanel={type:"conv",key:"sid"}; waitForSession=async () => false');
+  b.node('msgbox').value = 'fork text';
+  b.run('modelDraft("sid", null)');
+  await b.run('forkSession("sid")');
+  assert.equal(b.run('view.session'), 'sid', '不跳转到尚未扫描的会话');
+  assert.match(b.node('sendst').textContent, /扫描尚未完成/);
+  assert.equal(b.run('forkBusy("sid")'), false);
+});

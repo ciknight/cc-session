@@ -81,6 +81,26 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(self.sess.path.read_bytes(), original)
         self.assertEqual(json.load(self.request('/sessions/sid-1/messages'))['total'], 1)
 
+    def test_fork_route_returns_job_and_new_session(self):
+        def fake_exec(self, job, cmd, cwd, text):
+            job["result"] = "ok"
+            job["result_session_id"] = "forked-sid"
+            job["session"] = "forked-sid"
+            job["status"] = "done"
+            job["finished_at"] = monitor.now_ts()
+        with patch.object(monitor.Monitor, "_exec", fake_exec):
+            result = json.load(self.request(
+                '/sessions/sid-1/fork', {'text': 'continue'},
+                {'Content-Type': 'application/json'}))
+            self.assertEqual(result['fork_of'], 'sid-1')
+            for _ in range(100):
+                job = json.load(self.request('/jobs/' + result['job_id']))
+                if job['status'] == 'done':
+                    break
+                time.sleep(0.01)
+        self.assertEqual(job['result_session_id'], 'forked-sid')
+        self.assertEqual(job['session'], 'forked-sid')
+
     def test_management_write_validation_and_queue_without_transcript(self):
         host = monitor.Hosted(self.mon, str(self.project), 'unscanned')
         host.status = 'running'

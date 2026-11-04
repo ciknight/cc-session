@@ -481,6 +481,16 @@ def make_handler(mon, refresh_interval):
                                              body.get("images"))
                 return self._json(resp, code)
             parts = u.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "fork":
+                body = self._read_body(config.HTTP_IMAGE_BODY_LIMIT)
+                if not isinstance(body, dict):
+                    return self._json({"error": "invalid JSON body"}, 400)
+                text = body.get("text", "")
+                if not isinstance(text, str):
+                    return self._json({"error": '"text" 必须是字符串'}, 400)
+                code, resp = mon.fork_session(parts[1], text, body.get("model", UNSET),
+                                              body.get("images"))
+                return self._json(resp, code)
             if len(parts) == 5 and parts[0] == "sessions" and parts[2] == "jobs" and parts[4] == "cancel":
                 if self._read_body() != {}:
                     return self._json({"error": "body must be {}"}, 400)

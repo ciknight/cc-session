@@ -22,6 +22,60 @@ COMMAND_NAME_RE = re.compile(r"<command-name>\s*([^<]+?)\s*</command-name>")
 TASK_TOOL_USE_ID_RE = re.compile(r"<tool-use-id>\s*([^<]+?)\s*</tool-use-id>")
 COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 LOCAL_STDOUT_RE = re.compile(r"^<local-command-stdout>\s*(.*?)\s*</local-command-stdout>$", re.S)
+# 异步 Agent 的启动回执里带 agentId，用于把工具卡片链到子代理转录
+AGENT_ID_RE = re.compile(r"\bagentId\s*[:=]\s*([A-Za-z0-9_-]+)")
+
+# 工具输入只挑展示需要的字段，避免把大段 prompt / 文件内容塞进消息 payload
+TOOL_INPUT_FIELDS = (
+    ("command", 500), ("description", 300), ("file_path", 400), ("path", 400),
+    ("pattern", 300), ("glob", 300), ("query", 300), ("url", 500),
+    ("prompt", 2000), ("plan", 2000), ("subagent_type", 80), ("model", 120),
+    ("skill", 120), ("subject", 200), ("taskId", 80), ("status", 40),
+)
+
+
+def _tool_input_data(inp):
+    """提取工具输入的结构化展示字段；未知工具也能给出可读摘要。"""
+    if not isinstance(inp, dict):
+        return {}
+    data = {}
+    for key, limit in TOOL_INPUT_FIELDS:
+        value = inp.get(key)
+        if isinstance(value, str):
+            if value:
+                data[key] = clip(value, limit)
+        elif isinstance(value, (int, float, bool)):
+            data[key] = value
+    return data
+
+
+def _tool_summary(inp):
+    """一行工具摘要：Bash 取命令、Edit/Read 取路径、Grep 取 pattern 等。"""
+    if not isinstance(inp, dict):
+        return ""
+    # Agent 的 prompt 很长，优先用 description；其余工具取最具体的字段
+    keys = ("command", "file_path", "path", "pattern", "glob", "query", "url",
+            "description", "subject", "skill", "plan", "prompt")
+    for key in keys:
+        value = inp.get(key)
+        if isinstance(value, str) and value.strip():
+            return clip(" ".join(value.split()), 160)
+    return ""
+
+
+def _diff_stats(patch):
+    """统计 structuredPatch 的增删行数，供前端显示 +X -Y。"""
+    added = removed = 0
+    for hunk in patch or []:
+        if not isinstance(hunk, dict):
+            continue
+        for line in hunk.get("lines") or []:
+            text = str(line)
+            if text.startswith("+") and not text.startswith("+++"):
+                added += 1
+            elif text.startswith("-") and not text.startswith("---"):
+                removed += 1
+    return {"added": added, "removed": removed}
 
 
 def classify_user_line(o, blocks):
@@ -101,10 +155,17 @@ def parse_tool_result(o, block):
         kind = "image"
         if not text:
             text = "图片"
+    stats = None
+    file_path = None
     if isinstance(tur, dict):
+        f = tur.get("file") if isinstance(tur.get("file"), dict) else {}
+        candidate = tur.get("path") or tur.get("filePath") or f.get("filePath")
+        if isinstance(candidate, str) and candidate:
+            file_path = candidate
         patch = tur.get("structuredPatch")
         if isinstance(patch, list) and patch:
             kind, text = "diff", _patch_text(patch)
+            stats = _diff_stats(patch)
         elif "stdout" in tur or "stderr" in tur:
             chunks = []
             if tur.get("stdout"):
@@ -119,14 +180,24 @@ def parse_tool_result(o, block):
             path = tur.get("path") or tur.get("filePath") or f.get("filePath")
             if path:
                 text = str(path)
+                file_path = str(path)
             elif not text:
                 text = "图片"
         elif isinstance(tur.get("file"), dict):
             f = tur["file"]
             text = f"{f.get('filePath', '')} ({f.get('numLines', '?')} 行)"
+            if isinstance(f.get("filePath"), str) and f["filePath"]:
+                file_path = f["filePath"]
     result = {"type": "tool_result", "tool_use_id": block.get("tool_use_id"),
               "is_error": bool(block.get("is_error")), "kind": kind,
               "text": clip(text, 8000)}
+    if stats is not None:
+        result["stats"] = stats
+    if isinstance(file_path, str) and file_path:
+        result["file_path"] = clip(file_path, 400)
+    agent_match = AGENT_ID_RE.search(text) if isinstance(text, str) else None
+    if agent_match:
+        result["agent_id"] = agent_match.group(1)
     if images:
         result["images"] = images
     return result
@@ -214,7 +285,8 @@ def parse_msg_line(ln, clip_len=8000):
     """把一行转录解析为一条消息；无内容返回 None。
 
     返回 {role: user/assistant/tool/system, ts, parts: [...]}。
-    parts 类型：text / tool / tool_result / tool_note / command / command_output。
+    parts 类型：text / thinking / tool / tool_result / tool_note / command /
+    command_output / compact / compact_summary。
     """
     if isinstance(ln, bytes):
         ln = ln.decode("utf-8", "replace")
@@ -227,6 +299,24 @@ def parse_msg_line(ln, clip_len=8000):
     if o.get("isSidechain"):
         return None
     typ = o.get("type")
+    if typ == "system":
+        # 压缩边界是上下文重置的唯一持久化标记；保留给对话视图，
+        # 让长会话在什么时候压缩、压缩前多大一目了然。
+        if o.get("subtype") != "compact_boundary":
+            return None
+        meta = o.get("compactMetadata")
+        meta = meta if isinstance(meta, dict) else {}
+        ts = _parse_iso(o.get("timestamp"))
+        pre_tokens = meta.get("preTokens")
+        duration_ms = meta.get("durationMs")
+        return {"role": "system", "ts": ts, "parts": [{
+            "type": "compact",
+            "trigger": meta.get("trigger") if isinstance(meta.get("trigger"), str) else "",
+            "pre_tokens": pre_tokens if isinstance(pre_tokens, int) and not isinstance(pre_tokens, bool) else 0,
+            "duration_ms": duration_ms if isinstance(duration_ms, int) and not isinstance(duration_ms, bool) else 0,
+            "text": clip(o.get("content") or "Conversation compacted", 200),
+            "ts": ts,
+        }]}
     if typ not in ("user", "assistant"):
         return None
     content = (o.get("message") or {}).get("content")
@@ -244,6 +334,10 @@ def parse_msg_line(ln, clip_len=8000):
         if bt == "text" and (b.get("text") or "").strip():
             text = b["text"]
             stripped = text.lstrip()
+            # 压缩摘要单独成卡，前端折叠展示，避免把整段摘要塞进普通系统消息
+            if kind == "system" and o.get("isCompactSummary"):
+                parts.append({"type": "compact_summary", "text": clip(text, 8000)})
+                continue
             if kind == "system" and stripped.startswith("<command-name>"):
                 m = COMMAND_NAME_RE.search(text)
                 if m:
@@ -270,9 +364,20 @@ def parse_msg_line(ln, clip_len=8000):
             image = _image_part(b)
             if image:
                 parts.append(image)
+        elif bt == "thinking":
+            thought = b.get("thinking") or b.get("text") or ""
+            if isinstance(thought, str) and thought.strip():
+                parts.append({"type": "thinking", "text": clip(thought, 8000)})
         elif bt == "tool_use":
-            parts.append({"type": "tool", "tool_use_id": b.get("id"),
-                          "name": b.get("name"), "input": clip(b.get("input") or {}, 500)})
+            inp = b.get("input") or {}
+            part = {"type": "tool", "tool_use_id": b.get("id"),
+                    "name": b.get("name"), "input": clip(inp, 500)}
+            if isinstance(inp, dict):
+                part["input_data"] = _tool_input_data(inp)
+                summary = _tool_summary(inp)
+                if summary:
+                    part["summary"] = summary
+            parts.append(part)
         elif bt == "tool_result":
             parts.append(parse_tool_result(o, b))
     if parts:

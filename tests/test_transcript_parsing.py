@@ -68,6 +68,76 @@ class ParseMessageTests(unittest.TestCase):
         part = monitor.parse_msg_line(line(obj))["parts"][0]
         self.assertEqual(part["tool_use_id"], "t1")
 
+    def test_tool_use_part_carries_structured_input_and_summary(self):
+        obj = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Edit",
+             "input": {"file_path": "a.py", "old_string": "old", "new_string": "new"}},
+            {"type": "tool_use", "id": "t2", "name": "Bash",
+             "input": {"command": "pytest -q", "description": "run tests"}}]}}
+        edit, bash = monitor.parse_msg_line(line(obj))["parts"]
+        self.assertEqual(edit["input_data"]["file_path"], "a.py")
+        self.assertEqual(edit["summary"], "a.py")
+        # 大字段不进入展示 payload
+        self.assertNotIn("old_string", edit["input_data"])
+        self.assertEqual(bash["input_data"]["command"], "pytest -q")
+        self.assertEqual(bash["summary"], "pytest -q")
+
+    def test_diff_result_reports_stats_and_path(self):
+        obj = {
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                     "content": "File updated"}]},
+            "toolUseResult": {"filePath": "src/a.py", "structuredPatch": [
+                {"oldStart": 1, "oldLines": 2, "newStart": 1, "newLines": 3,
+                 "lines": ["-old", "+new", "+extra"]}]},
+        }
+        part = monitor.parse_msg_line(line(obj))["parts"][0]
+        self.assertEqual(part["stats"], {"added": 2, "removed": 1})
+        self.assertEqual(part["file_path"], "src/a.py")
+
+    def test_async_agent_result_reports_agent_id(self):
+        obj = {
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                     "content": "Async agent launched successfully.\n"
+                                                "agentId: a2109fb7412787143"}]},
+            "toolUseResult": {"isAsync": True},
+        }
+        part = monitor.parse_msg_line(line(obj))["parts"][0]
+        self.assertEqual(part["agent_id"], "a2109fb7412787143")
+
+    def test_thinking_block_is_preserved(self):
+        obj = {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "先确认目录结构"},
+            {"type": "text", "text": "开始处理"}]}}
+        parts = monitor.parse_msg_line(line(obj))["parts"]
+        self.assertEqual(parts[0]["type"], "thinking")
+        self.assertEqual(parts[0]["text"], "先确认目录结构")
+        self.assertEqual(parts[1]["type"], "text")
+
+    def test_compact_boundary_and_summary_are_parsed(self):
+        boundary = {
+            "type": "system", "subtype": "compact_boundary",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "content": "Conversation compacted",
+            "compactMetadata": {"trigger": "manual", "preTokens": 511375,
+                                "durationMs": 158241},
+        }
+        msg = monitor.parse_msg_line(line(boundary))
+        self.assertEqual(msg["role"], "system")
+        part = msg["parts"][0]
+        self.assertEqual(part["type"], "compact")
+        self.assertEqual(part["trigger"], "manual")
+        self.assertEqual(part["pre_tokens"], 511375)
+        self.assertEqual(part["duration_ms"], 158241)
+
+        summary = monitor.parse_msg_line(line({
+            "type": "user", "isCompactSummary": True,
+            "message": {"content": [{"type": "text", "text": "压缩后的摘要"}]},
+        }))
+        self.assertEqual(summary["parts"][0]["type"], "compact_summary")
+        self.assertEqual(summary["parts"][0]["text"], "压缩后的摘要")
+
     def test_command_line_parses_to_command_part(self):
         obj = {
             "type": "user",

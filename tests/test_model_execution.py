@@ -70,6 +70,66 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotIn("--model=haiku", cmd)
         self.assertEqual(self.mon.preferences.get("existing"), "vendor-model-7")
 
+    def test_fork_uses_fork_session_and_returns_new_sid(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, json.dumps({"result": "ok", "session_id": "forked-sid"}), "")
+        with patch.object(core.subprocess, "run", return_value=completed) as run:
+            code, response = self.mon.fork_session("existing", "continue from here")
+            self.assertEqual(code, 202)
+            job = self.wait_done(response["job_id"])
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["result_session_id"], "forked-sid")
+        self.assertEqual(job["session"], "forked-sid")
+        cmd = run.call_args.args[0]
+        self.assertIn("--resume", cmd)
+        self.assertIn("existing", cmd)
+        self.assertIn("--fork-session", cmd)
+
+    def test_fork_rejects_running_session(self):
+        self.sess.state = "working"
+        code, response = self.mon.fork_session("existing", "continue")
+        self.assertEqual(code, 409)
+        self.assertIn("正在执行", response["error"])
+
+    def test_fork_binds_selected_model_to_new_session(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, json.dumps({"result": "ok", "session_id": "forked-sid"}), "")
+        with patch.object(core.subprocess, "run", return_value=completed):
+            code, response = self.mon.fork_session("existing", "continue",
+                                                   model="vendor-model-7")
+            self.assertEqual(code, 202)
+            job = self.wait_done(response["job_id"])
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(self.mon.preferences.get("forked-sid"), "vendor-model-7")
+
+    def test_fork_is_serialized_and_blocks_send(self):
+        started, release = threading.Event(), threading.Event()
+
+        def fake_exec(self, job, cmd, cwd, text):
+            started.set()
+            release.wait(5)
+            job["result"] = "ok"
+            job["result_session_id"] = "forked-sid"
+            job["session"] = "forked-sid"
+            job["status"] = "done"
+            job["finished_at"] = monitor.now_ts()
+
+        with patch.object(monitor.Monitor, "_exec", fake_exec):
+            code, first = self.mon.fork_session("existing", "first")
+            self.assertEqual(code, 202)
+            self.assertTrue(started.wait(2))
+            code, _ = self.mon.fork_session("existing", "second")
+            self.assertEqual(code, 409)
+            code, _ = self.mon.send_message("existing", "send while forking")
+            self.assertEqual(code, 409)
+            release.set()
+            self.wait_done(first["job_id"])
+        for _ in range(100):
+            if "existing" not in self.mon.forking:
+                break
+            time.sleep(0.01)
+        self.assertNotIn("existing", self.mon.forking)
+
     def test_oneshot_messages_queue_while_running(self):
         started = threading.Event()
         release = threading.Event()

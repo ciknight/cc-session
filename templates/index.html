@@ -2,16 +2,16 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
 <title>Claude Sessions 监控</title>
 <script src="/static/marked.min.js"></script>
 <script src="/static/purify.min.js"></script>
 <style>
-:root{--bg:#fff;--fg:#1a1a1a;--card:#f6f6f4;--card2:#efefec;--mut:#777;--bd:#e2e2de;--acc:#2563eb;--accbg:#dbeafe}
+:root{--bg:#fff;--fg:#1a1a1a;--card:#f6f6f4;--card2:#efefec;--mut:#777;--bd:#e2e2de;--acc:#2563eb;--accbg:#dbeafe;--keyboard-height:0px}
 @media(prefers-color-scheme:dark){:root{--bg:#1b1b1a;--fg:#eee;--card:#262625;--card2:#2e2d2c;--mut:#999;--bd:#3a3a38;--acc:#60a5fa;--accbg:#1e3a5f}}
 *{box-sizing:border-box}
-html,body{height:100%;margin:0}
-body{font:14px/1.55 system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
+html{height:100%;margin:0}
+body{height:calc(100% - var(--keyboard-height,0px));margin:0;font:14px/1.55 system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column}
 header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--bd);flex:none}
 h1{font-size:16px;margin:0}
 .hdr-label-short,.hdr-break{display:none}
@@ -97,6 +97,68 @@ h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-tra
   font:12px ui-monospace,monospace}
 .diff-add{color:#16a34a}.diff-del{color:#dc2626}.diff-hunk{color:var(--acc)}
 .cmd{background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:4px 10px;font-size:12.5px;display:inline-block;margin:2px 0}
+/* 工具卡：按工具类型给出颜色、状态与摘要 */
+.tool-details>summary{display:flex;align-items:center;gap:6px}
+.tool-kind{flex:none;font-weight:600;color:var(--fg)}
+.tool-value{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mut)}
+.tool-stats{flex:none;font-size:11px;color:#16a34a}
+.tool-stats .del{color:#dc2626}
+.tool-status{flex:none;font-size:10px;border-radius:4px;padding:0 5px;border:1px solid var(--bd);color:var(--mut)}
+.tool-status.running{color:#2563eb;border-color:rgba(37,99,235,.4);background:rgba(37,99,235,.08)}
+.tool-status.done{color:#16a34a;border-color:rgba(22,163,74,.35);background:rgba(22,163,74,.08)}
+.tool-status.error{color:#dc2626;border-color:rgba(220,38,38,.4);background:rgba(220,38,38,.08)}
+.tool-status.stale{color:var(--mut);border-style:dashed}
+.tool-cat-bash>summary{border-left:3px solid #16a34a}
+.tool-cat-edit>summary{border-left:3px solid #d97706}
+.tool-cat-search>summary{border-left:3px solid #64748b}
+.tool-cat-agent>summary{border-left:3px solid #a855f7}
+.tool-cat-task>summary{border-left:3px solid #8b5cf6}
+.tool-cat-web>summary{border-left:3px solid #0ea5e9}
+.tool-group{margin:4px 0}
+.tool-group>summary{cursor:pointer;font:12px ui-monospace,monospace;color:var(--mut);
+  background:var(--card2);border:1px solid var(--bd);border-radius:6px;padding:3px 8px;
+  display:flex;align-items:center;gap:6px;overflow:hidden}
+.tool-group>summary .tool-count{flex:none;border:1px solid var(--bd);border-radius:8px;padding:0 5px;font-size:10px}
+.tool-group-body{padding-left:10px;border-left:1px dashed var(--bd);margin:2px 0 4px 4px}
+/* 子代理卡片 */
+.agent-card{margin:5px 0;border:1px solid var(--bd);border-left:3px solid #a855f7;border-radius:8px;background:var(--card);padding:6px 9px}
+.agent-card>summary{cursor:pointer;display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:var(--mut);font-size:12px}
+.agent-name{font-weight:600;color:var(--fg)}
+.agent-desc{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-badge{flex:none;font-size:10px;border:1px solid var(--bd);border-radius:8px;padding:0 5px}
+.agent-body{margin-top:5px;font-size:12px}
+.agent-prompt{white-space:pre-wrap;max-height:160px;overflow:auto;background:var(--card2);border-radius:6px;padding:5px 7px;margin:4px 0}
+.agent-actions{display:flex;gap:8px;margin-top:4px}
+.agent-actions .back{font-size:11px;padding:1px 8px}
+/* 后台任务条 */
+#bgstrip{flex:none;margin:0 18px;padding:4px 0;display:flex;gap:6px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--bd)}
+#bgstrip[hidden]{display:none}
+.bgchip{font:inherit;font-size:11px;border:1px solid rgba(168,85,247,.35);background:rgba(168,85,247,.08);
+  border-radius:10px;padding:1px 7px;color:var(--mut);cursor:pointer;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bgchip b{color:var(--fg);font-weight:600}
+/* 压缩 / 思考 */
+.compact-card{margin:6px 0;border:1px solid var(--bd);border-left:3px solid #64748b;border-radius:6px;
+  background:var(--card2);padding:3px 8px;font:12px ui-monospace,monospace;color:var(--mut)}
+.compact-card b{color:var(--fg)}
+.compact-summary{margin:2px 0 6px}
+.thinking{margin:3px 0;font-size:12px}
+.thinking>summary{cursor:pointer;color:var(--mut)}
+.think-body{white-space:pre-wrap;border-left:2px solid var(--bd);padding:3px 8px;margin:3px 0;color:var(--mut);max-height:240px;overflow:auto}
+/* 消息复制 / 图片灯箱 / 连接状态 / token chip */
+.mhead{display:flex;align-items:center;gap:8px}
+.msg.user .mhead{justify-content:flex-end}
+.copybtn{background:none;border:none;color:var(--mut);cursor:pointer;font:inherit;padding:0 3px;opacity:.55}
+.copybtn:hover{opacity:1;color:var(--acc)}
+.msg.user .mhead .copybtn{order:-1}
+#lightbox{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center}
+#lightbox[hidden]{display:none}
+#lightbox img{max-width:92vw;max-height:90vh;object-fit:contain;border-radius:6px}
+#lightbox button{position:absolute;right:18px;top:14px;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:50%;width:34px;height:34px;font-size:20px;cursor:pointer}
+img.msg-image{cursor:zoom-in}
+#connbadge{display:none}
+.tok-chip{flex:none;border:1px solid var(--bd);border-radius:10px;padding:0 7px;font-size:12px;color:var(--mut);cursor:pointer;background:var(--card)}
+.tok-chip:hover{border-color:var(--acc)}
+.tok-chip[hidden]{display:none}
 /* 待审批卡片：权限 / 计划 / 问答共用 */
 .inter-card{background:var(--card);border:1px solid var(--bd);border-left:3px solid #d97706;
   border-radius:8px;padding:10px 14px;margin:10px 0}
@@ -160,7 +222,7 @@ h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-tra
 .model-controls input{min-width:180px;max-width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px}
 .model-controls input[hidden]{display:none}
 .composer{position:relative}
-.composer textarea{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit}
+.composer textarea{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;resize:vertical;font:inherit;max-height:40vh;overflow-y:auto}
 .msg-image{display:block;max-width:min(420px,100%);max-height:420px;object-fit:contain;
   border:1px solid var(--bd);border-radius:8px;margin:6px 0;background:var(--card2)}
 #imageinput{display:none}
@@ -263,7 +325,9 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   .conv-overview>summary .ov-model,.conv-overview>summary .ov-branch,
   .conv-overview>summary .ov-output,.conv-overview>summary .ov-ctx{display:none}
   #conv{padding:4px 10px 12px}
-  main.convview .composer{margin:8px 10px}
+  main.convview .composer{margin:8px 10px calc(8px + env(safe-area-inset-bottom,0px))}
+  #bgstrip{margin:0 10px}
+  .composer textarea{resize:none}
   .composer-cog{display:inline-block}
   .composer-extra{display:none}
   .composer.open .composer-extra{display:flex;position:absolute;right:0;bottom:calc(100% + 6px);
@@ -278,11 +342,13 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   #modelcustom{min-width:0;max-width:38vw;flex:1 1 70px}
   #modelst{flex:0 1 auto;min-width:0;max-width:30vw;overflow:hidden;text-overflow:ellipsis;
     white-space:nowrap;font-size:11px}
+  .tok-chip{flex:0 1 auto;max-width:24vw;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;font-size:11px}
   .queue-chip{flex:none;margin-left:auto;max-width:36vw;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap;font-size:11px}
   /* 按钮行：收紧内边距与间距，发送/图片/中断/⚙ 始终同一行 */
   .composer-actions{flex-wrap:nowrap;gap:6px;margin-top:5px}
-  .composer-actions>.back{flex:none;padding:3px 8px;font-size:12px;white-space:nowrap}
+  .composer-actions>.back{flex:none;padding:5px 9px;min-height:32px;font-size:12px;white-space:nowrap}
   .composer textarea{height:4.1em}
   .ubody{max-width:92%}
   aside{position:fixed;top:0;bottom:0;left:0;width:min(75vw,300px);z-index:20;background:var(--bg);
@@ -316,6 +382,7 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
           title="当前托管（常驻进程）的会话数，点击查看列表">托管 0</button>
   <button id="pendingbadge" class="back"
           title="有权限请求等待审批，点击跳转">待审批 0</button>
+  <span id="connbadge" class="chip pending" role="status" aria-live="polite" hidden>连接断开，重连中…</span>
   <span id="err"></span>
   <button id="notifybtn" class="back" title="开启浏览器通知">🔕</button>
   <button id="sysbtn" class="back" style="margin-left:auto" aria-label="系统状态与电源操作"
@@ -328,12 +395,22 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
 <div id="mask"></div>
 <div id="queuepop" hidden></div>
 <div id="syspop" hidden></div>
+<div id="lightbox" hidden role="dialog" aria-modal="true" aria-label="图片预览">
+  <button type="button" id="lightboxclose" aria-label="关闭图片预览">×</button>
+  <img alt="">
+</div>
 
 <script>
 const DEFAULT_IVAL = {{ refresh_interval | round(3) }} * 1000;
 const SEND_POLL_TIMEOUT_MS = 30 * 60 * 1000;   // 发送后跟踪 /jobs 的最长时间
 const SEND_DONE_HIDE_MS = 4000;                // “已完成/已取消”浮动提示的保留时长
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+// 内容派生的稳定 key：思考/压缩卡跨刷新保留展开状态
+function hashText(s){
+  let h = 5381;
+  for(let i = 0; i < String(s || "").length; i++) h = ((h << 5) + h + String(s).charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
 const STATE_ZH = {working: "工作中", idle: "空闲", stale: "无活动"};
 // <details> 的展开状态跨 innerHTML 重建保留；key 必须由内容派生且稳定
 const detailsOpen = (() => {
@@ -359,7 +436,7 @@ let curPanel = null;               // main 里已渲染的面板 {type:"list"|"c
                                    // 自动刷新只更新数据区域、不重建输入区，避免失焦/丢草稿
 let convCache = {id: null, size: -1};        // 对话缓存标记，避免重复渲染
 let convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
-                 hasMore: false, loadingEarlier: false};
+                 hasMore: false, loadingEarlier: false, detail: null};
 let lastSidebarSig = "", lastListSig = "";
 let esGlobal = null, esSession = null, globalSeq = 0, sessionSeq = 0;
 let listTimer = null, convTimer = null;
@@ -368,6 +445,7 @@ let liveText = "", liveRaf = null;
 let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
                                    // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
+const forkJobs = new Map();        // sid -> {jobId, status, error, newSid} 分叉任务状态
 let pendingEcho = {};              // sid -> {text, failed} 发送后未落盘的本地回显
 const turnEndHighWater = new Map(), displayedTurnEnd = new Map(), unreadSessions = new Set();
 let sessionsVersion = 0, displayedSession = null;
@@ -431,6 +509,7 @@ function bindMessageDraft(key){
   box.dataset.draftKey = key;
   box.dataset.draftVersion = String(draft.version);
   box.value = draft.text;
+  autosizeComposer(box);
   box.oninput = () => {
     box.dataset.draftVersion = String(saveMessageDraft(key, box.value, true).version);
   };
@@ -469,7 +548,7 @@ function imageDraft(key){
 function imageUrl(image){ return `data:${image.media_type};base64,${image.data}`; }
 function imageHtml(image, alt = "图片"){
   if(!image || !IMAGE_TYPES.has(image.media_type) || typeof image.data !== "string") return "";
-  return `<img class="msg-image" loading="lazy" alt="${esc(alt)}" src="${esc(imageUrl(image))}">`;
+  return `<img class="msg-image" loading="lazy" data-lightbox="1" alt="${esc(alt)}" src="${esc(imageUrl(image))}">`;
 }
 function renderImageDraft(key){
   const box = document.getElementById("msgbox"), root = document.getElementById("imagedrafts");
@@ -749,6 +828,8 @@ function modelControlsHtml(){
       <option value="custom" data-kind="custom">自定义 ID</option></select></label>
     <input id="modelcustom" aria-label="自定义模型 ID" placeholder="完整或自定义模型 ID" maxlength="256" hidden>
     <span class="mut" id="modelst" role="status"></span>
+    <span class="tok-chip" id="tokchip" hidden role="button" tabindex="0"
+          title="查看上下文与 token 明细"></span>
     <span class="queue-chip" id="queue" hidden tabindex="0" role="button"
           title="移入或点击查看队列详情"></span></div>`;
 }
@@ -854,9 +935,57 @@ function composerHtml(mode, d){
     <div class="mut composer-status" id="sendst"></div>
   </div>`;
 }
+function autosizeComposer(box){
+  // 按内容增高到上限，避免长指令在固定高度的小框里来回滚动
+  if(!box || !box.style) return;
+  box.style.height = "auto";
+  const max = Math.max(72, Math.round((window.innerHeight || 800) * 0.4));
+  const height = Math.min(box.scrollHeight || 0, max);
+  if(height > 0) box.style.height = height + "px";
+}
+function trackVisualViewport(){
+  // iOS Safari 的键盘覆盖在 layout viewport 上；用 visualViewport 的差值
+  // 缩短 body，发送区就不会被键盘挡住（Android 由 interactive-widget 处理）。
+  // 注意：双指缩放时 scale != 1，地址栏变化也会造成差值，不能当成键盘。
+  const vv = window.visualViewport;
+  const root = document.documentElement;
+  if(!vv || !root || !root.style || !vv.addEventListener) return;
+  const update = () => {
+    const scale = Number(vv.scale) || 1;
+    const viewportHeight = Number(vv.height) || 0;
+    const innerHeight = Number(window.innerHeight) || 0;
+    let keyboard = 0;
+    if(scale === 1 && viewportHeight > 0 && innerHeight > 0){
+      const diff = innerHeight - viewportHeight;
+      // 键盘通常远高于地址栏/工具栏的差值；低于阈值一律视为 0，
+      // 并限制不超过可视高度的 60%，避免异常高度把 body 压扁。
+      if(diff >= 100) keyboard = Math.min(diff, Math.round(innerHeight * 0.6));
+    }
+    root.style.setProperty("--keyboard-height", Math.round(keyboard) + "px");
+  };
+  vv.addEventListener("resize", update);
+  if(window.addEventListener) window.addEventListener("resize", update);
+  update();
+}
+function showTokenOverview(){
+  const wrap = document.getElementById("overviewwrap");
+  const details = wrap && wrap.querySelector ? wrap.querySelector("details") : null;
+  if(!details) return;
+  details.open = true;
+  if(details.scrollIntoView) details.scrollIntoView({behavior: "smooth", block: "start"});
+}
 function bindComposerKeys(){
   const btn = document.getElementById("sendbtn"), box = document.getElementById("msgbox");
   if(!btn || !box) return;
+  box.addEventListener("input", () => autosizeComposer(box));
+  autosizeComposer(box);
+  const tok = document.getElementById("tokchip");
+  if(tok){
+    tok.onclick = showTokenOverview;
+    tok.onkeydown = event => {
+      if(event.key === "Enter" || event.key === " "){ event.preventDefault(); showTokenOverview(); }
+    };
+  }
   box.addEventListener("keydown", event => {
     if(event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229){
       // 指令提示面板展开时 Enter 先补全（由 wireCommandHints 处理），这里不发送
@@ -1064,7 +1193,8 @@ const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_
   "task_updated", "context_compacted", "api_error", "hosted_turn_done",
   "hosted_api_retry", "hosted_foreign_turn", "interaction_pending",
   "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
-  "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed"];
+  "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed",
+  "session_fork_started", "session_forked"];
 const raf = window.requestAnimationFrame || (fn => setTimeout(fn, 16));
 
 function listGap(){ return +ival.value || DEFAULT_IVAL; }
@@ -1106,7 +1236,9 @@ function handleSseMessage(msg){
       applySessions(msg.data.sessions);
     }
     if(msg.data.session && view.session === msg.session){
-      applySessionDetail(msg.data.session);
+      const detailChanged = applySessionDetail(msg.data.session);
+      if(detailChanged && convState.id === msg.session && (convState.msgs || []).length)
+        renderConvList();
       if(msg.data.live && msg.data.live.text) updateLiveBubble(msg.data.live.text);
       scheduleConvRefresh(msg.session);
     }
@@ -1116,6 +1248,26 @@ function handleSseMessage(msg){
     if(view.session === msg.session) updateLiveBubble(msg.data.text || "");
     return;
   }
+  if(msg.type === "session_forked" && msg.session){
+    const state = forkJobs.get(msg.session);
+    // 迟到的旧 job 事件不能覆盖用户随后发起的新分叉
+    if(state && (!state.jobId || !msg.data || !msg.data.job || state.jobId === msg.data.job)){
+      const done = !!(msg.data && msg.data.status === "done" && msg.data.session);
+      state.status = done ? "done" : "failed";
+      state.newSid = (msg.data && msg.data.session) || state.newSid;
+      state.error = done ? "" : ((msg.data && msg.data.error) || "分叉失败");
+      updateSendSt(msg.session);
+      if(done){
+        const target = msg.session;
+        setTimeout(() => {
+          if(forkJobs.get(target) === state && state.status === "done"){
+            forkJobs.delete(target);
+            updateSendSt(target);
+          }
+        }, 5000);
+      }
+    }
+  }
   if(["turn_finished", "hosted_turn_done", "interaction_pending",
       "turn_interrupted"].includes(msg.type) && view.session === msg.session){
     clearLiveBubble();
@@ -1123,6 +1275,14 @@ function handleSseMessage(msg){
   scheduleListRefresh();
   if(msg.session) scheduleConvRefresh(msg.session);
   maybeNotify(msg);
+}
+let sseDown = {global: false, session: false};
+function updateConnBadge(){
+  const badge = document.getElementById("connbadge");
+  if(!badge) return;
+  const down = sseDown.global || (view.session && sseDown.session);
+  badge.hidden = !down;
+  badge.style.display = down ? "inline-block" : "none";
 }
 function connectGlobalSse(){
   if(!window.EventSource) return;
@@ -1134,6 +1294,7 @@ function connectGlobalSse(){
   let opened = false;
   esGlobal.onopen = () => {
     lastGlobalSseActivity = Date.now();
+    sseDown.global = false; updateConnBadge();
     if(opened){
       globalSeq = 0;
       load();
@@ -1141,6 +1302,7 @@ function connectGlobalSse(){
     }
     opened = true;
   };
+  esGlobal.onerror = () => { sseDown.global = true; updateConnBadge(); };
 }
 function connectSessionSse(id){
   if(!window.EventSource) return;
@@ -1152,13 +1314,17 @@ function connectSessionSse(id){
   let opened = false;
   esSession.onopen = () => {
     lastSessionSseActivity = Date.now();
+    sseDown.session = false; updateConnBadge();
     sessionSeq = 0;
     if(opened && view.session === id) renderConversation(id, true);
     opened = true;
   };
+  esSession.onerror = () => { sseDown.session = true; updateConnBadge(); };
 }
 function disconnectSessionSse(){
   if(esSession){ esSession.close(); esSession = null; }
+  sseDown.session = false;
+  updateConnBadge();
 }
 
 /* ---------- 浏览器通知 / 标题待办 / SSE 看门狗 ---------- */
@@ -1226,22 +1392,49 @@ let lastGlobalSseActivity = 0, lastSessionSseActivity = 0;
 function reconnectStaleSse(threshold){
   if(!window.EventSource) return;
   const now = Date.now();
-  if(esGlobal && now - lastGlobalSseActivity > threshold) connectGlobalSse();
-  if(esSession && view.session && now - lastSessionSseActivity > threshold) connectSessionSse(view.session);
+  if(esGlobal && now - lastGlobalSseActivity > threshold){
+    sseDown.global = true; updateConnBadge(); connectGlobalSse();
+  }
+  if(esSession && view.session && now - lastSessionSseActivity > threshold){
+    sseDown.session = true; updateConnBadge(); connectSessionSse(view.session);
+  }
 }
 setInterval(() => { if(!document.hidden) reconnectStaleSse(90000); }, 30000);
 
+function detailRenderKey(d){
+  // 只有会影响工具/子代理卡片的字段进入这个 key；普通轮询不能触发全量重绘。
+  return JSON.stringify([
+    d && d.state || "",
+    (d && d.subagents || []).map(s => [s && s.tid || "", s && s.state || "",
+                                       !!(s && s.async), s && s.agent_id || ""]),
+  ]);
+}
 function applySessionDetail(d){
-  if(!d) return;
+  if(!d) return false;
   d = mergeMetadata(d);
+  const previousKey = convState.detailKey;
+  convState.detail = d;
+  convState.detailKey = detailRenderKey(d);
+  const detailChanged = previousKey !== convState.detailKey;
   detailMetadata.set(d.id, d);
   updateMetadataControls(d);
   const badge = document.getElementById("statebadge");
   if(badge){ badge.className = "b " + d.state; badge.textContent = STATE_ZH[d.state] || d.state; }
   const overview = document.getElementById("overviewwrap");
   if(overview) overview.innerHTML = overviewHtml(d);
+  const tok = document.getElementById("tokchip");
+  if(tok){
+    const ctx = Number(d.context_tokens) || 0, tokens = d.tokens || {};
+    tok.hidden = !ctx;
+    if(ctx){
+      tok.textContent = "上下文 " + fmtTok(ctx);
+      tok.title = `上下文 ${fmtTok(ctx)} · 输入 ${fmtTok(tokens.input)} · 输出 ${fmtTok(tokens.output)} · 缓存读 ${fmtTok(tokens.cache_read)}`;
+    }
+  }
   renderApiError(d.last_api_error);
+  renderBgStrip();
   updateModelSt(d.id || convState.id || "");
+  return detailChanged;
 }
 function renderApiError(err){
   // 上游 503/限流时 CLI 只写 system/api_error，转录里没有助手内容；
@@ -1475,6 +1668,70 @@ function diffHtml(text){
     return `<span class="${cls}">${esc(line)}</span>`;
   }).join("\n");
 }
+function clipText(value, limit){
+  const text = String(value ?? "");
+  return text.length > limit ? text.slice(0, limit) + "…" : text;
+}
+// 工具展示注册表：新增工具只需加一条，不在渲染函数里堆 if/else
+const TOOL_VIEW = {
+  Bash:        {label: "Bash",        value: i => i.command,        cat: "bash"},
+  PowerShell:  {label: "PowerShell",  value: i => i.command,        cat: "bash"},
+  Read:        {label: "Read",        value: i => i.file_path || i.path, cat: "search", hideSuccess: true},
+  Edit:        {label: "Edit",        value: i => i.file_path,      cat: "edit"},
+  Write:       {label: "Write",       value: i => i.file_path,      cat: "edit"},
+  NotebookEdit:{label: "NotebookEdit",value: i => i.file_path,      cat: "edit"},
+  Grep:        {label: "Grep",        value: i => i.pattern,        cat: "search", hideSuccess: true},
+  Glob:        {label: "Glob",        value: i => i.pattern || i.glob, cat: "search", hideSuccess: true},
+  WebSearch:   {label: "搜索",        value: i => i.query,          cat: "web"},
+  WebFetch:    {label: "抓取",        value: i => i.url,            cat: "web"},
+  Agent:       {label: "Agent",       value: i => i.description || i.subagent_type, cat: "agent"},
+  Task:        {label: "Task",        value: i => i.description || i.subagent_type, cat: "agent"},
+  TaskCreate:  {label: "任务",        value: i => i.subject,        cat: "task"},
+  TaskUpdate:  {label: "任务",        value: i => i.subject || i.taskId, cat: "task"},
+  ExitPlanMode:{label: "计划",        value: i => i.plan || "",     cat: "plan"},
+  AskUserQuestion:{label: "问答",     value: i => i.question || "", cat: "question"},
+};
+const TOOL_NO_GROUP = new Set(["Agent", "Task", "AskUserQuestion", "ExitPlanMode"]);
+const TOOL_STATUS_ZH = {running: "运行中", done: "完成", error: "失败", stale: "未完成", pending: "待结果"};
+
+function toolInputData(p){
+  if(p && p.input_data && typeof p.input_data === "object") return p.input_data;
+  if(p && typeof p.input === "string"){
+    try{
+      const parsed = JSON.parse(p.input);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    }catch(e){ return {}; }
+  }
+  return p && p.input && typeof p.input === "object" ? p.input : {};
+}
+function toolView(p){
+  const config = TOOL_VIEW[p.name] || {};
+  const input = toolInputData(p);
+  let value = "";
+  try{ value = config.value ? String(config.value(input) || "") : ""; }catch(e){ value = ""; }
+  if(!value) value = p.summary || (typeof p.input === "string" ? p.input : "");
+  return {label: config.label || p.name || "工具", value,
+          cat: config.cat || "default", hideSuccess: !!config.hideSuccess};
+}
+function toolStatus(p){
+  if(p.result && (p.result.is_error || p.result.kind === "error")) return "error";
+  if(p.result) return "done";
+  const detail = convState.detail;
+  if(detail && detail.state === "working") return "running";
+  if(detail && detail.state === "stale") return "stale";
+  return "pending";
+}
+function toolStatusHtml(p){
+  const status = toolStatus(p);
+  return `<span class="tool-status ${status}">${TOOL_STATUS_ZH[status] || status}</span>`;
+}
+function diffStatsHtml(stats){
+  if(!stats) return "";
+  const added = Number(stats.added) || 0, removed = Number(stats.removed) || 0;
+  if(!added && !removed) return "";
+  return `<span class="tool-stats">${added ? "+" + added : ""}` +
+    `${added && removed ? " " : ""}${removed ? '<span class="del">-' + removed + "</span>" : ""}</span>`;
+}
 function toolResultHtml(p){
   // 已合并到工具卡时结果在 p.result；缓存从中间开始时可能是独立的 tool_result part
   const r = p.result || (p.type === "tool_result" ? p : null);
@@ -1488,15 +1745,80 @@ function toolResultHtml(p){
   if(r.is_error || r.kind === "error") return `<div class="terror">✗ ${esc(r.text || "")}</div>`;
   return `<pre class="tool-out">${esc(r.text || "")}</pre>`;
 }
+function agentCardHtml(p){
+  const input = toolInputData(p);
+  const detail = convState.detail || {};
+  const sub = (detail.subagents || []).find(x => x && x.tid && x.tid === p.tool_use_id) || {};
+  const state = sub.state || (p.result ? (p.result.is_error ? "error" : "done") : "running");
+  const label = sub.type || input.subagent_type || "Agent";
+  const description = sub.description || input.description || "";
+  const prompt = sub.prompt || input.prompt || "";
+  const model = sub.model || input.model || "";
+  const async = !!(sub.async || (p.result && p.result.agent_id));
+  const agentId = sub.agent_id || (p.result && p.result.agent_id) || "";
+  const launchAck = /Async agent launched/i.test(String(p.result && p.result.text || ""));
+  const resultText = p.result && p.result.text && p.result.text !== "图片" && !launchAck
+    ? `<div class="agent-body">${esc(clipText(p.result.text, 2000))}</div>` : "";
+  const link = agentId && convState.id
+    ? `<button class="back" data-open-subagent="${esc(convState.id + "::agent-" + agentId)}">查看子代理</button>` : "";
+  const key = p.tool_use_id ? "agent:" + p.tool_use_id : "";
+  return `<details class="agent-card"${key ? detailsAttrs(key) : ""} data-agent-tid="${esc(p.tool_use_id || "")}">` +
+    `<summary><span class="agent-name">${esc(label)}</span>` +
+    (description ? `<span class="agent-desc">${esc(description)}</span>` : "") +
+    (async ? '<span class="agent-badge">后台</span>' : "") +
+    `<span class="tool-status ${state === "running" ? "running" : state === "error" ? "error" : state === "stale" ? "stale" : "done"}">` +
+    `${state === "running" ? "运行中" : state === "error" ? "失败" : state === "stale" ? "未完成" : "完成"}</span>` +
+    `</summary><div class="agent-body">` +
+    (model ? `<div class="mut">模型：${esc(model)}</div>` : "") +
+    (prompt ? `<div class="agent-prompt">${esc(clipText(prompt, 2000))}</div>` : "") +
+    resultText + (link ? `<div class="agent-actions">${link}</div>` : "") +
+    `</div></details>`;
+}
 function toolPartHtml(p){
   if(p.type === "tool_result")
     return `<div class="tool">🔧 工具结果${p.is_error ? " (错误)" : ""}</div>` + toolResultHtml(p);
   if(p.type === "tool_note") return `<div class="sysbody">${esc(p.text)}</div>`;
   if(p.type === "error") return `<div class="terror">✗ ${esc(p.text)}</div>`;
+  if(p.name === "Agent" || p.name === "Task") return agentCardHtml(p);
+  const view = toolView(p);
   const notes = (p.notes || []).map(esc).join("\n");
   const key = p.tool_use_id ? "tool:" + p.tool_use_id : "";
-  return `<details class="tool-details"${key ? detailsAttrs(key) : ""}><summary>🔧 ${esc(p.name)}: ${esc(p.input)}</summary>` +
-    (notes ? `<div class="mut">${esc(notes)}</div>` : "") + toolResultHtml(p) + `</details>`;
+  const result = p.result;
+  const hidden = view.hideSuccess && result && !result.is_error
+    && result.kind !== "error" && result.kind === "text";
+  const category = view.cat && view.cat !== "default" ? " tool-cat-" + view.cat : "";
+  return `<details class="tool-details${category}"${key ? detailsAttrs(key) : ""}>` +
+    `<summary><span class="tool-kind">${esc(view.label)}</span>` +
+    (view.value ? `<code class="tool-value">${esc(view.value)}</code>` : "") +
+    toolStatusHtml(p) + diffStatsHtml(result && result.stats) + `</summary>` +
+    (notes ? `<div class="mut">${esc(notes)}</div>` : "") +
+    (hidden
+      ? `<details class="fold tool-result-fold"${detailsAttrs("toolresult:" + (p.tool_use_id || hashText(p.result.text || "")))}>` +
+        `<summary>结果</summary>${toolResultHtml(p)}</details>`
+      : toolResultHtml(p)) + `</details>`;
+}
+function toolGroupHtml(run){
+  const view = toolView(run[0]);
+  const previews = run.slice(0, 2).map(p => toolView(p).value).filter(Boolean);
+  const extra = run.length - previews.length;
+  const stats = {added: 0, removed: 0};
+  for(const p of run){
+    if(p.result && p.result.stats){
+      stats.added += Number(p.result.stats.added) || 0;
+      stats.removed += Number(p.result.stats.removed) || 0;
+    }
+  }
+  const running = run.filter(p => toolStatus(p) === "running").length;
+  const errors = run.filter(p => toolStatus(p) === "error").length;
+  const key = "toolgroup:" + (run[0].tool_use_id || hashText(view.label + "|" + previews.join("|")));
+  return `<details class="tool-group"${detailsAttrs(key)}>` +
+    `<summary><span class="tool-kind">${esc(view.label)}</span>` +
+    `<span class="tool-count">×${run.length}</span>` +
+    (previews.length ? `<span class="tool-value">${esc(previews.join(", ") + (extra ? `, +${extra} 个` : ""))}</span>` : "") +
+    (running ? `<span class="tool-status running">${running} 运行中</span>` : "") +
+    (errors ? `<span class="tool-status error">${errors} 失败</span>` : "") +
+    diffStatsHtml(stats) + `</summary><div class="tool-group-body">` +
+    run.map(toolPartHtml).join("") + `</div></details>`;
 }
 // 服务端把旧窗口的独立工具结果并入旧块的工具卡后，本地已加载列表里
 // 同名孤儿结果已被吸收：合并时去掉这些 part，避免同一结果展示两次
@@ -1536,24 +1858,70 @@ function convGroups(messages){
   }
   return groups;
 }
+function compactCardHtml(p){
+  const key = "compact:" + (p.ts || "") + ":" + hashText(p.text || "");
+  const meta = [];
+  if(p.trigger) meta.push(p.trigger === "manual" ? "手动" : p.trigger);
+  if(p.pre_tokens) meta.push("压缩前 " + fmtTok(p.pre_tokens) + " tok");
+  if(p.duration_ms) meta.push(Math.round(p.duration_ms / 1000) + "s");
+  return `<details class="compact-card"${detailsAttrs(key)}><summary><b>上下文已压缩</b>` +
+    (meta.length ? " · " + esc(meta.join(" · ")) : "") + `</summary>` +
+    `<div class="mut">${esc(p.text || "")}</div></details>`;
+}
+function compactSummaryHtml(p){
+  return `<details class="fold compact-summary"${detailsAttrs("compactsum:" + hashText(p.text || ""))}>` +
+    `<summary>压缩摘要</summary><div class="sysbody">${esc(p.text || "")}</div></details>`;
+}
+function thinkingHtml(p){
+  return `<details class="thinking"${detailsAttrs("think:" + hashText(p.text || ""))}>` +
+    `<summary>思考过程</summary><div class="think-body">${esc(p.text || "")}</div></details>`;
+}
+function convPartHtml(p, role){
+  if(p.type === "text")
+    return role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
+         : role === "assistant" ? `<div class="abody">${md(p.text)}</div>`
+         : `<div class="sysbody">${esc(p.text)}</div>`;
+  if(p.type === "command")
+    return `<div class="cmd">⌘ <code>${esc(p.command)}</code>${p.args ? " " + esc(p.args) : ""}</div>`;
+  if(p.type === "command_output")
+    // 无独立 id，key 由内容派生，重渲染后展开状态可恢复
+    return `<details class="fold"${detailsAttrs("cmdout:" + p.text)}><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
+  if(p.type === "image") return imageHtml(p);
+  if(p.type === "thinking") return thinkingHtml(p);
+  if(p.type === "compact") return compactCardHtml(p);
+  if(p.type === "compact_summary") return compactSummaryHtml(p);
+  if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
+  return "";
+}
+function renderGroupParts(parts, role){
+  let out = "";
+  for(let i = 0; i < parts.length;){
+    const part = parts[i];
+    // 连续同名工具折叠，Agent/交互类工具保持独立卡片
+    if(part.type === "tool" && !TOOL_NO_GROUP.has(part.name)){
+      let end = i + 1;
+      while(end < parts.length && parts[end].type === "tool" && parts[end].name === part.name) end++;
+      const run = parts.slice(i, end);
+      out += run.length >= 2 ? toolGroupHtml(run) : toolPartHtml(part);
+      i = end;
+      continue;
+    }
+    out += convPartHtml(part, role);
+    i++;
+  }
+  return out;
+}
+function groupCopyText(g){
+  return (g.parts || []).filter(p => p.type === "text")
+    .map(p => p.text || "").join("\n\n").trim();
+}
 function convGroupHtml(g){
-  const body = g.parts.map(p => {
-    if(p.type === "text")
-      return g.role === "user" ? `<div class="ubody">${esc(p.text)}</div>`
-           : g.role === "assistant" ? `<div class="abody">${md(p.text)}</div>`
-           : `<div class="sysbody">${esc(p.text)}</div>`;
-    if(p.type === "command")
-      return `<div class="cmd">⌘ <code>${esc(p.command)}</code>${p.args ? " " + esc(p.args) : ""}</div>`;
-    if(p.type === "command_output")
-      // 无独立 id，key 由内容派生，重渲染后展开状态可恢复
-      return `<details class="fold"${detailsAttrs("cmdout:" + p.text)}><summary>命令输出</summary><pre class="tool-out">${esc(p.text)}</pre></details>`;
-    if(p.type === "image") return imageHtml(p);
-    if(["tool", "tool_result", "tool_note", "error"].includes(p.type)) return toolPartHtml(p);
-    return "";
-  }).join("");
+  const body = renderGroupParts(g.parts, g.role);
   const who = {user: "用户", assistant: "助手", tool: "工具", system: "系统"}[g.role] || g.role;
   const when = g.ts ? new Date(g.ts*1000).toLocaleString() : "";
-  return `<div class="msg ${g.role}"><div class="mhead">${who} · ${when}</div>${body}</div>`;
+  const copy = (g.role === "user" || g.role === "assistant") && groupCopyText(g)
+    ? '<button class="copybtn" data-copy title="复制消息">复制</button>' : "";
+  return `<div class="msg ${g.role}"><div class="mhead">${who} · ${when}${copy}</div>${body}</div>`;
 }
 function convHtml(messages){
   return convGroups(messages).map(convGroupHtml).join("");
@@ -1747,9 +2115,25 @@ function makeNodeFromHtml(html){
   tpl.innerHTML = html;
   return tpl.content.firstElementChild;
 }
+function renderBgStrip(){
+  const el = document.getElementById("bgstrip");
+  if(!el) return;
+  const detail = convState.detail || {};
+  const running = (detail.subagents || []).filter(s => s && s.state === "running");
+  const html = running.length ? '<span class="mut">后台任务</span>' + running.map(s => {
+    const label = s.type || "Agent", desc = s.description || "";
+    return `<button class="bgchip" data-scroll-agent="${esc(s.tid || "")}" ` +
+      `title="${esc(label + (desc ? " · " + desc : ""))}"><b>${esc(label)}</b>` +
+      `${desc ? " · " + esc(desc) : ""}${s.async ? " · 后台" : ""}</button>`;
+  }).join("") : "";
+  el.hidden = !html;
+  // 内容没变就不重写，避免轮询把正在聚焦的后台任务 chip 焦点打掉
+  if(el.__bgHtml !== html){ el.__bgHtml = html; el.innerHTML = html; }
+}
 function renderConvList(){
   const el = document.getElementById("conv");
   if(!el) return;
+  renderBgStrip();
   const echo = pendingEcho[convState.id];
   if(echo && !echoVisible(convState.msgs, echo)) delete pendingEcho[convState.id];
   const echoOut = pendingEcho[convState.id] ? echoHtml(pendingEcho[convState.id]) : "";
@@ -1769,8 +2153,19 @@ function renderConvList(){
     if(live && live.remove) live.remove();
   }
 }
+function groupRenderContext(g){
+  // 工具/子代理卡的状态来自 detail 而不是 parts：把会影响显示的状态并入签名，
+  // 否则 detail 从 working 变成 idle、异步 Agent 收尾时缓存节点不会重绘。
+  const tids = (g.parts || []).filter(p => p.type === "tool" && p.tool_use_id
+    && (p.name === "Agent" || p.name === "Task" || !p.result)).map(p => p.tool_use_id);
+  if(!tids.length) return null;
+  const detail = convState.detail || {};
+  return [detail.state || "", (detail.subagents || [])
+    .filter(s => s && tids.includes(s.tid))
+    .map(s => [s.tid, s.state || "", !!s.async, s.agent_id || ""])];
+}
 function convGroupSig(g){
-  return JSON.stringify([g.role, g.ts, g.parts], function(key, value){
+  return JSON.stringify([g.role, g.ts, g.parts, groupRenderContext(g)], function(key, value){
     // 图片以服务端内容哈希识别；签名和 Map key 不再复制整段 base64。
     return key === "data" && this.image_id ? undefined : value;
   });
@@ -1802,6 +2197,7 @@ function renderConvDom(el, groups, echoStr){
     let node = convDom.nodes.get(sig);
     if(!node){
       node = makeNodeFromHtml(convGroupHtml(g));
+      node.__copyText = groupCopyText(g);
       convDom.nodes.set(sig, node);
     }
     wanted.push(node);
@@ -1895,7 +2291,7 @@ async function renderConversation(id, force){
         convState = {id: mErr ? null : id, msgs: (m && m.messages || []).slice(),
                      total: (m && m.total) || 0, cursor: (m && m.end) || 0,
                      start: (m && m.start) || 0, size: (m && m.size) || 0,
-                     hasMore: !!(m && m.has_more), loadingEarlier: false};
+                     hasMore: !!(m && m.has_more), loadingEarlier: false, detail: null};
       if(isNew){
         main.innerHTML = `
           <div class="conv-top">
@@ -1907,16 +2303,21 @@ async function renderConversation(id, force){
                 ${d.hosted ? '<span class="chip" title="该会话由常驻进程托管">⚙<span class="chip-label"> 托管中</span></span>' : ""}
                 <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
                 <span class="mut conv-cwd">${esc(d.cwd || "")}</span></h2>
+              ${d.is_subagent ? "" : `<button class="back" id="forkbtn" title="以当前会话历史创建新会话，原会话不受影响"
+                      aria-label="分叉会话"><span aria-hidden="true">⑂</span><span class="back-label"> 分叉</span></button>`}
             </div>
             <div id="overviewwrap">${overviewHtml(mergeMetadata(d))}</div>
             <div id="interactions"></div>
             <div id="apierr" class="apierr" style="display:none"></div>
           </div>
+          <div id="bgstrip" hidden></div>
           <div id="conv"></div>
           ${composerHtml("conv", d)}`;
         document.getElementById("back").onclick = () => {
           navigate({project: view.project, session: null, new: false});
         };
+        const forkBtn = document.getElementById("forkbtn");
+        if(forkBtn) forkBtn.onclick = () => forkSession(id);
         // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
         bindSendBox(id, d);
         curPanel = {type: "conv", key: id};
@@ -1928,11 +2329,11 @@ async function renderConversation(id, force){
       const box = document.getElementById("msgbox");
       if(!isNew && (box?.dataset.draftKey !== id
          || Number(box.dataset.draftVersion) !== messageDrafts.get(id)?.version)) bindMessageDraft(id);
-      applySessionDetail(d);
+      const detailChanged = applySessionDetail(d);
       loadQueue(id);
       renderInteractions(d.interactions || []);
       updateHostedControls(d);
-      if(keepOld) return;   // 已渲染的消息原样保留
+      if(keepOld){ if(detailChanged) renderConvList(); return; }   // 消息保留，仅状态变化时重绘
       clearLiveBubble();
       renderConvList();
       if(mErr){   // 消息没取到：框架已在，把失败原因摆在消息区里，而不是整页空白
@@ -1952,7 +2353,7 @@ async function renderConversation(id, force){
     const d = await dRes.json();
     if(!current()) return;
     if(!dRes.ok || d.error) return;
-    applySessionDetail(d);
+    const detailChanged = applySessionDetail(d);
     loadQueue(id);
     renderInteractions(d.interactions || []);
     updateHostedControls(d);
@@ -1971,7 +2372,7 @@ async function renderConversation(id, force){
       convState = {id, msgs: (fresh.messages || []).slice(),
                    total: fresh.total || 0, cursor: fresh.end || 0,
                    start: fresh.start || 0, size: fresh.size || 0,
-                   hasMore: !!fresh.has_more, loadingEarlier: false};
+                   hasMore: !!fresh.has_more, loadingEarlier: false, detail: null};
       renderConvList();
       scrollConvBottom();
     } else if(m.messages && m.messages.length){
@@ -1989,6 +2390,21 @@ async function renderConversation(id, force){
       convState.total = m.total;
       convState.cursor = m.end != null ? m.end : convState.cursor;
       convState.size = m.size;
+      // 只有 detail 状态变化时才重绘：会话从 working 转 idle、异步 Agent 收尾时
+      // 工具/子代理卡的状态来自 detail，而普通轮询不应全量重算签名。
+      if(detailChanged){
+        const convEl = document.getElementById("conv");
+        const oldHeight = convEl ? convEl.scrollHeight : 0;
+        const oldScroll = convEl ? convEl.scrollTop : 0;
+        const nearBottom = !convEl
+          || convEl.scrollHeight - convEl.scrollTop - convEl.clientHeight < 80;
+        renderConvList();
+        if(convEl){
+          // 只换状态不新增消息：贴底时继续贴底，否则按高度差补偿视野
+          convEl.scrollTop = nearBottom ? convEl.scrollHeight
+            : oldScroll + (convEl.scrollHeight - oldHeight);
+        }
+      }
     }
     confirmDisplayedMessages(id, requestEnd);
   }catch(e){
@@ -2182,6 +2598,154 @@ function fetchT(url, opts = {}, ms = 30000){
   return fetch(url, {...opts, signal: c.signal}).finally(() => clearTimeout(t));
 }
 
+async function waitForSession(sid, tries = 60, shouldStop = null){
+  for(let i = 0; i < tries; i++){
+    if(shouldStop && shouldStop()) return false;
+    try{
+      const r = await fetchT("/sessions/" + encodeURIComponent(sid), {}, 10000);
+      if(r.ok) return true;
+    }catch(e){ /* 扫描线程还没发现新文件，稍后重试 */ }
+    if(shouldStop && shouldStop()) return false;
+    await new Promise(f => setTimeout(f, 500));
+  }
+  return false;
+}
+function forkJobState(id){
+  let state = forkJobs.get(id);
+  if(!state){
+    state = {status: "", error: "", jobId: null, newSid: null};
+    forkJobs.set(id, state);
+  }
+  return state;
+}
+function forkBusy(id){
+  const state = forkJobs.get(id);
+  // 已拿到 job id 的 unknown 状态说明服务端任务可能仍在跑，继续锁住；
+  // POST 本身失败（没有 job id）时允许用户重试，后端 forking 仍会兜底串行化。
+  return !!state && (state.status === "running"
+    || (state.status === "unknown" && !!state.jobId));
+}
+function forkJobText(id){
+  const state = forkJobs.get(id);
+  if(!state) return "";
+  if(state.status === "running") return "正在分叉…";
+  if(state.status === "done") return state.newSid ? "分叉完成，新会话已创建" : "分叉完成";
+  if(state.status === "created") return state.error || "分叉完成，新会话已创建，等待扫描…";
+  if(state.status === "unknown") return state.error || "分叉状态未知，任务可能仍在执行";
+  if(state.status === "failed") return "分叉失败：" + (state.error || "未知错误");
+  return "";
+}
+function updateForkBtn(id){
+  const btn = document.getElementById("forkbtn");
+  if(!btn) return;
+  const busy = forkBusy(id);
+  btn.disabled = busy;
+  btn.title = busy ? "正在分叉，请稍候" : "以当前会话历史创建新会话，原会话不受影响";
+}
+function setForkState(id, status, error = ""){
+  const state = forkJobState(id);
+  state.status = status;
+  state.error = error;
+  updateSendSt(id);
+  return state;
+}
+async function forkSession(id){
+  if(forkBusy(id)) return;
+  const box = document.getElementById("msgbox");
+  const text = (box && box.value || "").trim();
+  if(!text){
+    setForkState(id, "failed", "请先在输入框输入分叉后的第一条消息");
+    if(box && box.focus) box.focus();
+    return;
+  }
+  if(view.session !== id) return;
+  const selected = modelSnapshot(id);
+  if(selected === undefined) return;
+  if(window.confirm && !window.confirm("将以当前会话历史创建新会话（复制历史），原会话不受影响。继续？")) return;
+  const state = setForkState(id, "running");
+  state.jobId = null; state.newSid = null;
+  const route = routeGeneration;
+  const stop = () => view.session !== id || route !== routeGeneration;
+  let accepted = false;
+  try{
+    const r = await fetchT("/sessions/" + encodeURIComponent(id) + "/fork", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text, model: selected}),
+    }, 30000);
+    let started = null, parsed = true;
+    try{ started = await r.json(); }catch(e){ parsed = false; }
+    if(!r.ok){
+      setForkState(id, "failed", (started && started.error) || ("HTTP " + r.status));
+      return;
+    }
+    if(!parsed || !started || !started.job_id){
+      setForkState(id, "unknown", "分叉请求已发出但响应无法解析，任务可能仍在执行");
+      return;
+    }
+    accepted = true;
+    state.jobId = started.job_id;
+    updateSendSt(id);
+    const deadline = Date.now() + 10 * 60 * 1000;
+    for(;;){
+      if(stop()) return;
+      if(Date.now() > deadline){
+        setForkState(id, "unknown", "分叉超时，任务可能仍在执行");
+        return;
+      }
+      await new Promise(f => setTimeout(f, 1500));
+      if(stop()) return;
+      let jrRes, job;
+      try{
+        jrRes = await fetchT("/jobs/" + encodeURIComponent(started.job_id), {}, 15000);
+        job = await jrRes.json();
+      }catch(e){
+        setForkState(id, "unknown", "分叉状态查询失败，任务可能仍在执行：" + (e.message || e));
+        return;
+      }
+      if(stop()) return;
+      if(!jrRes.ok || (job.error && !job.status)){
+        setForkState(id, "unknown",
+          "分叉状态查询失败，任务可能仍在执行：" + (job.error || ("HTTP " + jrRes.status)));
+        return;
+      }
+      if(job.status === "failed"){
+        setForkState(id, "failed", job.error || "分叉失败");
+        return;
+      }
+      if(job.status !== "done") continue;
+      const newSid = job.result_session_id || job.session;
+      if(!newSid){
+        setForkState(id, "failed", "分叉完成但没有返回新会话 id");
+        return;
+      }
+      state.newSid = newSid;
+      const found = await waitForSession(newSid, 60, stop);
+      if(stop()) return;
+      // 分叉的首条消息已经提交，清掉父会话草稿；只消费仍等于提交文本的版本
+      const draft = messageDrafts.get(id);
+      if(draft && draft.text === text){
+        const cleared = saveMessageDraft(id, "");
+        if(box && box.dataset.draftKey === id && box.value === text){
+          box.value = ""; box.dataset.draftVersion = String(cleared.version);
+          autosizeComposer(box);
+        }
+      }
+      if(!found){
+        setForkState(id, "created",
+          "分叉完成，新会话已创建（" + newSid + "），扫描尚未完成，请稍后刷新列表");
+        return;
+      }
+      const finishedState = setForkState(id, "done", "");
+      navigate({project: view.project, session: newSid, new: false}, {replace: true});
+      if(forkJobs.get(id) === finishedState) forkJobs.delete(id);
+      return;
+    }
+  }catch(e){
+    // 即使已经离开父会话也记录状态，用户返回时能看到失败/未知原因
+    setForkState(id, "unknown",
+      (accepted ? "分叉状态查询失败" : "分叉请求状态未知") + "，任务可能仍在执行：" + (e.message || e));
+  }
+}
 function sendJobText(id){
   // 状态从模块级 sendJobs 读取，而不是闭包里的 DOM 引用——
   // 自动刷新会整体重渲染对话视图，旧引用会指向已替换的节点导致界面停在"发送中…"
@@ -2268,14 +2832,17 @@ function updateSendSt(id){
   if(!panelMatch(id)) return;
   const st = document.getElementById("sendst");
   const images = imageDraft(id);
-  if(st) st.textContent = images.pending ? "图片读取中…" : (images.error || sendJobText(id));
+  const forkBusyNow = forkBusy(id);
+  if(st) st.textContent = images.pending ? "图片读取中…"
+    : (images.error || (forkBusyNow ? forkJobText(id) : (sendJobText(id) || forkJobText(id))));
   const btn = document.getElementById("sendbtn");
   const j = sendJobs[id];
   // 对话视图里 running/queued 仍可继续发送：托管会话会排队；新建会话必须先拿到 sid，
-  // 否则连点会创建多个新会话，所以新建面板继续锁住。
+  // 否则连点会创建多个新会话，所以新建面板继续锁住。分叉进行中也不允许发送。
   const newPanel = curPanel && curPanel.type === "new";
-  if(btn) btn.disabled = images.pending > 0 || !!j && (j.status === "sending"
+  if(btn) btn.disabled = images.pending > 0 || forkBusyNow || !!j && (j.status === "sending"
     || (newPanel && ["queued", "running"].includes(j.status)));
+  updateForkBtn(id);
 }
 let sendStFlashTimer = null;
 function flashSendSt(id, text, ms = 4000){
@@ -2617,7 +3184,7 @@ function clearSessionView(){
   clearLiveBubble();
   convCache = {id: null, size: -1};
   convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
-               hasMore: false, loadingEarlier: false};
+               hasMore: false, loadingEarlier: false, detail: null};
 }
 function navigate(next, opts){
   saveComposerDraft();   // 此时路由尚未改变；以旧输入框所属 key 保存，不能依赖 curPanel。
@@ -3047,6 +3614,86 @@ document.addEventListener("scroll", () => { if(sysPop.timer) positionSysPop(); }
 if(typeof window !== "undefined" && window.addEventListener)
   window.addEventListener("resize", () => { if(sysPop.timer) positionSysPop(); });
 
+/* ---------- 对话内的复制 / 图片灯箱 / 子代理跳转 ---------- */
+function copyToClipboard(text, button){
+  const done = () => {
+    if(!button) return;
+    const old = button.textContent;
+    button.textContent = "已复制";
+    setTimeout(() => { button.textContent = old; }, 1500);
+  };
+  const fallback = () => {
+    try{
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove();
+      done();
+    }catch(e){ /* 无剪贴板权限时保持按钮原状 */ }
+  };
+  try{
+    if(window.navigator && navigator.clipboard && navigator.clipboard.writeText)
+      navigator.clipboard.writeText(text).then(done, fallback);
+    else fallback();
+  }catch(e){ fallback(); }
+}
+function openLightbox(src, alt){
+  const box = document.getElementById("lightbox");
+  const image = box && box.querySelector ? box.querySelector("img") : null;
+  if(!box || !image) return;
+  image.src = src || ""; image.alt = alt || "图片";
+  box.hidden = false;
+}
+function closeLightbox(){
+  const box = document.getElementById("lightbox");
+  const image = box && box.querySelector ? box.querySelector("img") : null;
+  if(box){ box.hidden = true; }
+  if(image){ image.removeAttribute ? image.removeAttribute("src") : image.src = ""; image.alt = ""; }
+}
+function scrollToAgent(tid){
+  if(!tid || !document.querySelectorAll) return;
+  const nodes = document.querySelectorAll("[data-agent-tid]");
+  for(const node of nodes){
+    if(node.dataset && node.dataset.agentTid === tid){
+      if(node.scrollIntoView) node.scrollIntoView({behavior: "smooth", block: "center"});
+      return;
+    }
+  }
+}
+function handleConvClick(event){
+  const target = event.target;
+  const closest = sel => target && target.closest ? target.closest(sel) : null;
+  const copyBtn = closest("[data-copy]");
+  if(copyBtn){
+    const msg = copyBtn.closest ? copyBtn.closest(".msg") : null;
+    let text = msg && msg.__copyText;
+    if(!text && msg && msg.querySelectorAll){
+      text = [...msg.querySelectorAll(".abody,.ubody")].map(el => el.textContent || "").join("\n\n").trim();
+    }
+    if(text) copyToClipboard(text, copyBtn);
+    return;
+  }
+  const image = closest("img[data-lightbox]");
+  if(image){ openLightbox(image.src, image.alt); return; }
+  const subagent = closest("[data-open-subagent]");
+  if(subagent && subagent.dataset){
+    navigate({project: view.project, session: subagent.dataset.openSubagent, new: false});
+    return;
+  }
+  const agentChip = closest("[data-scroll-agent]");
+  if(agentChip && agentChip.dataset) scrollToAgent(agentChip.dataset.scrollAgent);
+}
+if(document.addEventListener){
+  document.addEventListener("click", handleConvClick);
+  document.addEventListener("keydown", event => {
+    const box = document.getElementById("lightbox");
+    if(event.key === "Escape" && box && !box.hidden) closeLightbox();
+  });
+}
+const lightboxClose = document.getElementById("lightboxclose");
+if(lightboxClose) lightboxClose.onclick = closeLightbox;
+const lightboxBox = document.getElementById("lightbox");
+if(lightboxBox) lightboxBox.onclick = event => { if(event.target === lightboxBox) closeLightbox(); };
+
 // toggle 不冒泡，用捕获阶段记录用户手动展开/折叠的 <details>
 if(document.addEventListener){
   document.addEventListener("visibilitychange", () => {
@@ -3081,6 +3728,7 @@ const bootRoute = readRoute();
 if(bootRoute) view = bootRoute;
 if(window.addEventListener) window.addEventListener("popstate", onPopState);
 if(window.marked) marked.setOptions({breaks: true});
+trackVisualViewport();
 connectGlobalSse();
 load();
 resetTimer();

@@ -54,7 +54,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
    工具统计/任务清单/状态等。事件经 `emit` 分发给 SSE 订阅者和可选 webhook
    （webhook 走单 worker 有界队列，容量 1000，满时丢弃新事件并限频记日志）；
    **首次扫描只回放不推送**（`first_scan_done` 标志）。
-   Agent 工具调用的子代理条目带 tid/state（running/done/error），tool_result 回传时翻转
+   Agent/Task 工具调用的子代理条目带 tid/state（running/done/error），tool_result 回传时翻转
    状态并发 `subagent_done`；**后台异步 Agent 例外**：`toolUseResult.isAsync` 的回传只是
    "已启动"确认，条目保持 running（标记 async、不解除 working），完成以后续
    `<task-notification>`（user 消息或新版 `queue-operation` 行的 `content` 字符串）
@@ -71,6 +71,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
    设置托管思考档位（low/medium/high/xhigh/max/default）。
+   `POST /sessions/<id>/fork` 以 `claude -p --resume <id> --fork-session` 创建新会话
+   （复制整段历史，原会话不变；异步 job，完成事件 `session_forked` 带新 sid）。
+   `Monitor.forking` 与普通发送/再次分叉互斥；完成后把所选模型绑定到新 sid。
    `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲），
 `POST /system/sleep-timer` 定时睡眠（服务端 `threading.Timer` 内存态，minutes 0-720、0 取消，
 `GET /system` 的 `sleep_timer_remaining` 随轮询返回剩余秒）。
@@ -106,10 +109,16 @@ uv run monitor.py --webhook http://localhost:3000/hook
   用户与工具结果中的 base64 `image` block 保留为图片 part，并附 SHA-256 `image_id`
   供前端做轻量 DOM 签名；`toolUseResult.file.base64` 只是同图元数据，不重复渲染。
   `isMeta` 分 boilerplate / sourceToolUseID / origin 注入三种语义。
+  工具 part 额外带 `input_data`（白名单字段：command/file_path/pattern/prompt 等）与
+  `summary`，diff 结果带 `stats`（增删行数），异步 Agent 回执提取 `agent_id`；
+  `system/compact_boundary`、`isCompactSummary`、`thinking` block 分别解析为
+  compact / compact_summary / thinking part，前端折叠展示。
 - **子代理会话**：`projects/<proj>/<parent>/subagents/agent-*.jsonl` 默认**不扫描**（懒加载），
   id 为 `<parent>::agent-<hash>`，默认不在 `/sessions` 返回；`?include_subagents=1`
   或请求子代理 id 时才解析，`--scan-subagents` 可在启动时全量扫描。只读、不能发消息或托管。
-  父会话的 `subagent_count` 来自主转录的 Agent 工具调用，不依赖子代理转录。
+  父会话的 `subagent_count` 来自主转录的 Agent/Task 工具调用，不依赖子代理转录。
+  子代理条目记录 `tid/state/async/type/description/prompt/model/agent_id`；前端把 Agent/Task
+  工具调用渲染成子代理卡片，并在对话上方用后台任务条列出运行中的条目。
 - **扫描缓存**：`scan_cache.py` 把每个转录的 offset、末尾 4 KiB 校验值和累计 Session 状态存到
   `CLAUDE_DIR/claude-sessions/scan-cache.json`；重启时校验一致就只读追加字节，截断/重写/缓存损坏
   时回退全量解析。默认只缓存主会话，开启 `--scan-subagents` 时降低落盘频率。
@@ -243,7 +252,14 @@ detail 轮询的 `commands`，仅托管会话有），`<details>` 的展开状�
 自动刷新/整页刷新后恢复（`sessionStorage`）。子代理折叠区与会话卡片显示运行中数量
 （条目带状态圆点，运行中在前）；发送后对话末尾有本地回显气泡（`pendingEcho`，转录出现
 同文本 user 消息或 command part 后退场，失败标红）；斜杠命令渲染为命令气泡（输出折叠），
-状态行显示"正在执行命令 /xxx…"。
+状态行显示"正在执行命令 /xxx…"。工具卡由 `TOOL_VIEW` 注册表驱动（按 Bash/Read/Edit/Grep/
+Agent 等给出摘要、类别色、状态与 diff 统计），连续同名工具折叠成一组；成功的 Read/Grep/Glob
+结果默认不展开。消息头提供复制按钮，图片点击打开全屏灯箱；SSE 断开时 header 的
+`#connbadge` 显示重连提示。模型行内的 `#tokchip` 显示上下文 token，点击展开概览。
+移动端用 `visualViewport` 计算 `--keyboard-height` 收缩 body，输入框按内容自适应高度，
+避免 iOS 键盘遮住发送区。会话头「分叉」按钮把当前输入作为首条消息调用
+`POST /sessions/<id>/fork`；进度/失败走独立的 `forkJobs` 状态，查询失败标为未知而不是
+直接判失败，扫描未就绪时留在父会话提示刷新，轮询到新 sid 后才跳转。
 消息草稿按会话/新建项目隔离，仅存页面内存；发送响应只消费提交时版本，异步回调不能清空
 其他面板或后续编辑的草稿；复用旧会话 DOM 时也要同步过期草稿版本，避免显示内容与待发送内容不一致。
 新回复提示只依赖 `last_turn_end_at` 高水位推进，首次见会话只建基线，不以 `stale` 或工具结束

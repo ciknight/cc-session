@@ -72,6 +72,26 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual(len(finished), 1)
         self.assertEqual(finished[0]["duration"], 42)
 
+    def test_task_tool_is_tracked_as_subagent(self):
+        self.line("assistant", [{
+            "type": "tool_use",
+            "id": "task-call-1",
+            "name": "Task",
+            "input": {"description": "Run a subagent", "prompt": "do work"},
+        }], stop_reason="tool_use")
+        self.line("assistant", [{"type": "text", "text": "waiting"}], stop_reason="end_turn")
+        self.assertEqual(len(self.sess.subagents), 1)
+        entry = self.sess.subagents[0]
+        self.assertEqual(entry["tid"], "task-call-1")
+        self.assertEqual(entry["description"], "Run a subagent")
+        self.assertEqual(entry["prompt"], "do work")
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "working")
+
+        self.line("user", [{"type": "tool_result", "tool_use_id": "task-call-1",
+                            "content": "finished"}])
+        self.line("assistant", [{"type": "text", "text": "All done"}], stop_reason="end_turn")
+        self.assertEqual(entry["state"], "done")
+
     def test_active_agent_keeps_session_working_after_main_turn_ends(self):
         self.start_agent_and_finish_main_turn()
 
