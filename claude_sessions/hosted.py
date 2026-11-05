@@ -1,18 +1,80 @@
 """Hosted：服务自己启动并长期持有的 claude 进程（stream-json 双向通信）。"""
+import atexit
 import json
 import secrets
 import subprocess
 import threading
 import time
 import uuid
+import weakref
 from collections import deque
 
 from session_preferences import (APPROVAL_MODES, EFFORT_LEVELS, default_model,
                                  effort_args, model_args, validate_model)
 
-from . import util
+from . import config, util
 from .util import clip, _arg_present, _arg_index, _merge_hook_settings
 from .interactions import Interaction
+
+
+# 解释器正常退出时兜底回收常驻进程；Windows 被强杀时不保证执行，
+# 残留仍由 OrphanWatcher 观察。弱引用避免阻止 Hosted 被回收。
+_LIVE_HOSTED = weakref.WeakSet()
+
+
+def _terminate_process(proc, grace=5.0, lock=None):
+    """先关 stdin 让 CLI 正常收尾，超时再 terminate/kill。
+
+    grace 取 5 秒：与官方 SDK 一致，给 CLI 足够时间把最后一轮内容刷进转录。
+    lock 为 Hosted.write_lock，避免关闭管道与发送线程并发写撞车。
+    """
+    if proc is None or proc.poll() is not None:
+        return
+
+    def close_stdin():
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    if lock is not None and lock.acquire(timeout=1.0):
+        try:
+            close_stdin()
+        finally:
+            lock.release()
+    else:
+        close_stdin()
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.terminate()
+    except (OSError, ValueError):
+        pass
+    try:
+        proc.wait(timeout=1.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except (OSError, ValueError):
+        pass
+
+
+def _shutdown_hosted():
+    for host in list(_LIVE_HOSTED):
+        try:
+            _terminate_process(getattr(host, "proc", None),
+                               lock=getattr(host, "write_lock", None))
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_hosted)
 
 
 class Hosted:
@@ -67,6 +129,9 @@ class Hosted:
         self.resolved_command_set = set()
         self.max_resolved_commands = 128
         self.last_api_retry = None     # 最近一次上游重试，用于诊断 5xx/限流
+        self.last_rate_limit = None    # 最近一次 rate_limit_event（status/resets_at/utilization）
+        self.last_conversation_reset = None  # /clear 等场景的 conversation_reset
+        self.pending_conversation_reset = None  # 等下一帧 session_id 出现后迁移会话
         self.stream_text = ""          # 当前 job 的流式文本聚合
         self.stream_job = None
         self.last_delta_emit = 0.0
@@ -85,12 +150,13 @@ class Hosted:
                "--include-partial-messages",
                "--permission-prompt-tool", "stdio"]
         if self.resume_id:
-            cmd += ["--resume", self.resume_id]
+            # --resume 的值是可选的，单 token 形式避免 dash 开头的值被当成新参数
+            cmd += [f"--resume={self.resume_id}"]
         else:
             # 预生成 session id，使首轮开始前就能关联审批和事件
             if not self.session_id:
                 self.session_id = str(uuid.uuid4())
-            cmd += ["--session-id", self.session_id]
+            cmd += [f"--session-id={self.session_id}"]
         if self.approval == "auto" and not _arg_present(self.mon.claude_args, "--permission-mode"):
             cmd += ["--permission-mode", "auto"]
             self.added_auto_permission = True
@@ -123,7 +189,9 @@ class Hosted:
                 print("[hosted] --settings 指向文件，跳过 AskUserQuestion hook 注册", flush=True)
         cmd += effort_args(model_args(spawn_args, self.selected_model), self.effort)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, cwd=self.cwd)
+                                     stderr=subprocess.PIPE, cwd=self.cwd,
+                                     env=util.child_env(cwd=self.cwd))
+        _LIVE_HOSTED.add(self)
         self.status = "running"
         self.process_effort = self.effort
         threading.Thread(target=self._read_out, daemon=True).start()
@@ -354,6 +422,7 @@ class Hosted:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            self._maybe_switch_after_reset(obj)
             typ = obj.get("type")
             if typ == "control_response":
                 response = obj.get("response") or {}
@@ -387,6 +456,20 @@ class Hosted:
                                          {"hosted": self.hid, **retry})
             elif typ == "system" and obj.get("subtype") == "turn_preempted":
                 self._on_turn_preempted(obj)
+            elif (config.DEBUG_TASK_FRAMES and typ == "system"
+                  and obj.get("subtype") in (
+                      "task_started", "task_progress", "task_updated",
+                      "task_notification")):
+                # 探针：确认 2.1.312 是否在 stdout 发后台任务帧。task_updated 的
+                # 终态（killed/stopped）不一定伴随 task_notification，验证后再接 UI 收尾。
+                patch = obj.get("patch") if isinstance(obj.get("patch"), dict) else {}
+                print(f"[probe] {self.hid} system/{obj.get('subtype')} "
+                      f"task={obj.get('task_id') or obj.get('tool_use_id')} "
+                      f"status={obj.get('status') or patch.get('status')}", flush=True)
+            elif typ == "rate_limit_event":
+                self._on_rate_limit(obj)
+            elif typ == "conversation_reset":
+                self._on_conversation_reset(obj)
             elif typ == "command_lifecycle":
                 self._on_lifecycle(obj)
             elif typ == "stream_event":
@@ -545,6 +628,84 @@ class Hosted:
         else:
             self._finish_job(job, state, notify=owner)
 
+    def _on_rate_limit(self, obj):
+        info = obj.get("rate_limit_info")
+        if not isinstance(info, dict):
+            info = {}
+        record = {
+            "status": info.get("status"),
+            "resets_at": info.get("resets_at"),
+            "rate_limit_type": info.get("rate_limit_type"),
+            "utilization": info.get("utilization"),
+            "overage_status": info.get("overage_status"),
+            "at": util.now_ts(),
+        }
+        with self.ready:
+            self.last_rate_limit = record
+        self._emit_session_event("hosted_rate_limit", {"hosted": self.hid, **record})
+        print(f"[hosted] {self.hid} rate_limit status={record['status']} "
+              f"resets_at={record['resets_at']}", flush=True)
+
+    def _on_conversation_reset(self, obj):
+        record = {"new_conversation_id": obj.get("new_conversation_id"),
+                  "from": self.session_id,
+                  "resume_from": self.resume_id,
+                  "at": util.now_ts()}
+        with self.ready:
+            self.last_conversation_reset = record
+            # 新会话的 session_id 不在 reset 帧里，等下一帧带 session_id 时迁移
+            self.pending_conversation_reset = record
+        self._emit_session_event("hosted_conversation_reset",
+                                 {"hosted": self.hid, **record})
+        print(f"[hosted] {self.hid} conversation_reset "
+              f"new={record['new_conversation_id']}", flush=True)
+
+    def _maybe_switch_after_reset(self, obj):
+        """conversation_reset 之后，用下一帧真实的 session_id 完成会话迁移。"""
+        with self.ready:
+            pending = self.pending_conversation_reset
+            if not pending:
+                return
+            if obj.get("parent_tool_use_id"):
+                return
+            sid = obj.get("session_id")
+            if not isinstance(sid, str) or not sid or sid == self.session_id:
+                return
+            old, old_resume = self.session_id, self.resume_id
+            self.pending_conversation_reset = None
+            self.session_id = sid
+            self.resume_id = sid
+            self.last_conversation_reset = dict(
+                self.last_conversation_reset or {}, session_id=sid)
+        old_ids = {x for x in (old, old_resume) if x and x != sid}
+        with self.mon.lock:
+            old_sess = self.mon.by_sid(old)
+            self.mon.hosted_by_sid[sid] = self
+            for old_id in old_ids:
+                if self.mon.hosted_by_sid.get(old_id) is self:
+                    self.mon.hosted_by_sid.pop(old_id, None)
+            for inter in self.mon.interactions.values():
+                if inter.hosted_id == self.hid:
+                    inter.session_id = sid
+            for job in self.mon.jobs.values():
+                if job.get("_owner") is self:
+                    job["session"] = sid
+        for binder, value in ((self.mon.preferences, self.selected_model),
+                              (self.mon.efforts, self.effort),
+                              (self.mon.approvals, self.approval)):
+            if value is not None:
+                try:
+                    binder.bind(sid, value)
+                except ValueError:
+                    pass
+        if old_sess:
+            self.mon.emit(old_sess, "hosted_session_switched", {
+                "hosted": self.hid, "from": old, "to": sid,
+                "reason": "conversation_reset"})
+        self.mon.queue_changed(old)
+        self.mon.queue_changed(sid)
+        print(f"[hosted] {self.hid} 会话已重置 {old} -> {sid}", flush=True)
+
     def _on_turn_preempted(self, obj):
         """CLI 为让新消息立刻执行而停掉了当前回合：标记被接管的 job，
         让随后到达的 cancelled 生命周期按“已被后续消息接管”收尾，而不是报中断失败。"""
@@ -605,9 +766,11 @@ class Hosted:
                 job["result_session_id"] = obj.get("session_id")
                 job["cost_usd"] = obj.get("total_cost_usd")
                 job["result_is_error"] = bool(obj.get("is_error"))
+                job["terminal_reason"] = obj.get("terminal_reason")
+                job["api_error_status"] = obj.get("api_error_status")
                 job["_result_seen"] = True
                 if obj.get("is_error"):
-                    job["error"] = clip(obj.get("result") or obj.get("subtype") or "error", 500)
+                    job["error"] = util.result_error_text(obj, "error")
             snapshot = [(job, job.get("_terminal_state"), job is owner,
                      bool(job.get("_preempted"))) for job in jobs]
         for job, terminal, is_owner, preempted in snapshot:
@@ -667,7 +830,9 @@ class Hosted:
             "result_session_id": job.get("result_session_id"),
             "duration": (max(0, job["finished_at"] - job["started_at"])
                          if job.get("finished_at") and job.get("started_at") else None),
-            "is_error": job.get("result_is_error", False)})
+            "is_error": job.get("result_is_error", False),
+            "terminal_reason": job.get("terminal_reason"),
+            "api_error_status": job.get("api_error_status")})
 
     def _on_stream_event(self, obj):
         event = obj.get("event") or {}
@@ -890,6 +1055,8 @@ class Hosted:
                 "current_job": current.get("id") if current else None,
                 "stream_text": stream_text, "streaming": streaming,
                 "last_api_retry": self.last_api_retry,
+                "last_rate_limit": util.active_rate_limit(self.last_rate_limit),
+                "last_conversation_reset": self.last_conversation_reset,
                 "needs_rehost": self.needs_rehost,
                 "turns": turns, "returncode": self.returncode,
                 "started_at": self.started_at, "stderr_tail": list(self.stderr_tail)}

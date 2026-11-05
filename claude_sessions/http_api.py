@@ -116,6 +116,8 @@ def make_handler(mon, refresh_interval):
                     h = mon.hosted_by_sid.get(it["id"])
                     it["hosted"] = bool(h and h.alive())
                     it["hosted_id"] = h.hid if h else None
+                    it["hosted_rate_limit"] = (util.active_rate_limit(h.last_rate_limit)
+                                               if h and h.alive() else None)
                     it["selected_model"] = mon.preferences.get(it["id"])
                     it["pending_interactions"] = counts.get(it["id"], 0)
                 return self._json(items)
@@ -259,6 +261,10 @@ def make_handler(mon, refresh_interval):
                 d["hosted_queued"] = h.queued_count() if h and h.alive() else 0
                 d["hosted_stream_text"] = h.stream_text if h and h.alive() else ""
                 d["hosted_streaming"] = bool(h and h.alive() and h.stream_job is not None)
+                d["hosted_rate_limit"] = (util.active_rate_limit(h.last_rate_limit)
+                                          if h and h.alive() else None)
+                d["hosted_conversation_reset"] = (h.last_conversation_reset
+                                                  if h and h.alive() else None)
                 return self._json(d)
             if u.path.startswith("/static/"):
                 return self._static(u.path[len("/static/"):])
@@ -619,6 +625,8 @@ def make_handler(mon, refresh_interval):
                     h = mon.hosted_by_sid.get(item["id"])
                     item["hosted"] = bool(h and h.alive())
                     item["hosted_id"] = h.hid if h else None
+                    item["hosted_rate_limit"] = (util.active_rate_limit(h.last_rate_limit)
+                                                 if h and h.alive() else None)
                 data = {"sessions": sessions, "interactions": mon.pending_interactions()}
             return {"ts": util.now_ts(), "seq": seq, "session": only,
                     "type": "snapshot", "data": data}

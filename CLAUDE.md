@@ -88,6 +88,12 @@ uv run monitor.py --webhook http://localhost:3000/hook
    stream-json 双向的常驻 claude 进程，消息立即写 stdin（忙时由 CLI 排队并在工具轮之间
    吸收），已托管会话的 message 请求自动路由到常驻进程。托管进程带 `--permission-prompt-tool stdio`，
    权限请求经 `/interactions` 审批；`POST /sessions/<id>/interrupt` 中断当前回合。
+   stdout 的 `rate_limit_event` 存入 Hosted，投影为 `/hosted`、`/sessions`、detail 的
+   `hosted_rate_limit`（`util.active_rate_limit` 过滤已过 `resets_at` 的记录）；
+   `conversation_reset`（如 `/clear`）先记录并广播，随后按下一帧真实 `session_id`
+   迁移 `Hosted.session_id`、`hosted_by_sid`、交互和 job，并发 `hosted_session_switched`。
+   `system/task_started|progress|updated|notification` 探针仅在
+   `CLAUDE_SESSIONS_DEBUG_TASK_FRAMES=1` 时打印。
    接口无鉴权，不要暴露到不可信网络。
 
 ### 关键设计决策
@@ -131,6 +137,11 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - **双时钟**：`last_input_ts` 只由真实用户输入推进（排除 tool_result、isMeta、
   origin/promptSource 注入、中断标记），`last_event_ts` 是最后一条带时间戳的转录事件；
   列表按 `last_input_ts` 排序、回退 `last_event_ts`。
+- **claude 进程启动**：Windows 上默认把 `claude` 解析到原生 `claude.exe`
+  （shim 同目录 → PATH → `~/.local/bin/claude.exe`），显式 `--claude-bin` 保持原样并告警；
+  `.cmd/.bat` 只能经 cmd.exe 执行、参数会被二次解析且超时只杀到 cmd.exe。子进程统一用
+  `util.child_env` 去掉 `CLAUDECODE`、父会话 id、消息 socket/token 等变量，
+  保留 `ANTHROPIC_*`、代理等用户配置，并把 `PWD` 对齐到 `cwd`。
 - **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `full`（服务自动放行）**，持久化在
   `~/.claude/claude-sessions/approvals.json`；已有明确保存的模式优先。`ask` 等待网页响应
   （`--permission-timeout` 默认 1800 秒，超时自动拒绝），`auto` 交给 CLI 权限模式。
@@ -192,6 +203,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
   hook 客户端用二进制 stdin/stdout（避免 Windows 代码页问题）并绕过 HTTP 代理。
 - **前端实时更新**：EventSource 全局 + 单会话两路，各自维护 `seq`；连接先收 `snapshot`，
   断线重连后全量对账；SSE 事件触发节流刷新，保留定时轮询兜底。
+  托管限流状态在会话卡片/头部显示 chip（`resets_at` 过期自动隐藏）；`/clear` 后收到
+  `hosted_session_switched`，等新会话被扫描进列表再自动切换视图。
   对话只加载最近 100 条，消息列表顶部按钮加载更早；`cursor` 记录已加载末尾，
   服务端前插旧块时用响应里的 `shift` 调整，避免增量漏消息。
 - **通知与连接健康**：SSE 慢消费者队列满时标记 `overflowed` 并断开连接（不再静默丢事件），

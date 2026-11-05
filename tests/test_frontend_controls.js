@@ -2531,6 +2531,15 @@ test('snapshot 中的 detail 变化会立即重绘消息状态', () => {
   assert.equal(b.run('renderCalls'), 1);
 });
 
+test('限流 chip 只显示警告/拒绝且过期隐藏', () => {
+  const b = boot();
+  assert.match(b.run('rateLimitChip({hosted_rate_limit:{status:"rejected",resets_at:4102444800}})'), /已限流/);
+  assert.match(b.run('rateLimitChip({hosted_rate_limit:{status:"allowed_warning"}})'), /接近限流/);
+  assert.equal(b.run('rateLimitChip({hosted_rate_limit:{status:"allowed"}})'), "");
+  assert.equal(b.run('rateLimitChip({hosted_rate_limit:{status:"rejected",resets_at:1}})'), "");
+  assert.equal(b.run('rateLimitChip({})'), "");
+});
+
 test('分叉完成但扫描未就绪时留在父会话并提示刷新', async () => {
   const b = boot(async (url) => {
     if(url === '/sessions/sid/fork')

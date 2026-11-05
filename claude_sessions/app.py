@@ -43,7 +43,8 @@ hook 子命令（由托管进程的内联 --settings 调用，不面向用户）
                                之后给该会话 POST /sessions/<id>/message 会自动走常驻进程，
                                消息立即写入常驻进程 stdin；模型忙时由 CLI 排队，
                                并在工具轮之间把新消息折叠进当前回合
-  GET /hosted                  托管进程列表（状态、是否忙、排队数、审批模式、轮数）
+  GET /hosted                  托管进程列表（状态、是否忙、排队数、审批模式、轮数、
+                               last_rate_limit / last_conversation_reset）
   DELETE /hosted/<hid>         正常退出（做完当前一轮）；加 ?kill=1 立即终止
   托管进程带 --permission-prompt-tool stdio：ask 模式在网页审批，auto 交给 CLI（默认模式），
   full 自动放行；超时（--permission-timeout，默认 1800 秒）自动拒绝。
@@ -70,14 +71,14 @@ hook 子命令（由托管进程的内联 --settings 调用，不面向用户）
   python monitor.py --webhook http://localhost:3000/hook   # 事件同时 POST 出去
 """
 import argparse
+import os
 import secrets
 import shlex
-import shutil
 import sys
 import threading
 from http.server import ThreadingHTTPServer
 
-from . import config
+from . import config, util
 from .core import Monitor
 from .http_api import make_handler
 from .hook import hook_client
@@ -106,8 +107,14 @@ def main():
         ap.error("--permission-timeout 不能为负数（0 表示无限等待）")
 
     mon = Monitor(args.stale, args.webhook, args.permission_timeout)
-    # Windows 上 npm 安装的 claude 是 claude.cmd，这里先解析出完整路径
-    mon.claude_bin = shutil.which(args.claude_bin) or args.claude_bin
+    # Windows 上 npm 安装的 claude 是 claude.cmd，优先解析到同目录的原生 claude.exe
+    mon.claude_bin = util.resolve_claude_bin(args.claude_bin)
+    if os.name == "nt" and not util.is_windows_native_exe(mon.claude_bin):
+        kind = ("批处理脚本" if util.is_windows_batch_path(mon.claude_bin)
+                else "非原生程序")
+        print(f"[monitor] 警告：claude 解析到{kind} {mon.claude_bin}，"
+              "子进程将经 cmd.exe 启动；建议用 --claude-bin 指向原生 claude.exe",
+              flush=True)
     mon.claude_args = shlex.split(args.claude_args)
     mon.msg_timeout = args.msg_timeout
     mon.scan_subagents = args.scan_subagents

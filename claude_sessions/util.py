@@ -7,8 +7,11 @@ import base64
 import binascii
 import json
 import os
+import platform
 import re
+import shutil
 import time
+from pathlib import Path
 
 from . import config
 
@@ -20,6 +23,125 @@ def now_ts():
 def clip(s, n=300):
     s = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False)
     return s if len(s) <= n else s[:n] + "…"
+
+
+def is_windows_batch_path(path):
+    """路径任一组件是否以 .bat/.cmd 结尾（Windows 会经 cmd.exe 重新解析参数）。"""
+    if not path:
+        return False
+    for component in str(path).replace("\\", "/").split("/"):
+        for segment in component.split(":"):
+            if segment.rstrip(". ").lower().endswith((".bat", ".cmd")):
+                return True
+    return False
+
+
+def is_windows_native_exe(path):
+    """路径最后一段是否为 CreateProcess 可直接执行的 .exe/.com。"""
+    name = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return name.rstrip(". ").lower().endswith((".exe", ".com"))
+
+
+def resolve_claude_bin(raw, which=None, platform_name=None, home=None):
+    """解析 claude 可执行文件；Windows 上优先原生 exe，绕开 npm 的 .cmd 包装。
+
+    .cmd/.bat 只能由 cmd.exe 执行，命令行会被二次解析（BatBadBut/CVE-2024-27980），
+    且超时终止只杀到 cmd.exe。只对默认的裸命令名/批处理 shim 自动替换；显式路径
+    和自定义命令名保持用户选择（调用方负责告警），避免绕过 wrapper 的环境设置。
+    候选顺序：shim 同目录的原生 exe → PATH 里的 claude.exe → 原生安装器。
+    """
+    which = shutil.which if which is None else which
+    platform_name = platform.system() if platform_name is None else platform_name
+    home = Path.home() if home is None else Path(home)
+    raw_text = str(raw)
+    path = which(raw) or raw
+    if platform_name != "Windows" or is_windows_native_exe(path):
+        return path
+
+    explicit = "/" in raw_text or "\\" in raw_text
+    name = Path(raw_text).name.lower()
+    if explicit or name not in ("claude", "claude.cmd", "claude.bat", "claude.ps1"):
+        return path
+
+    prefix = Path(path).parent
+    candidates = [
+        str(prefix / "node_modules" / "@anthropic-ai"
+            / "claude-code" / "bin" / "claude.exe"),
+        which("claude.exe"),
+        str(home / ".local" / "bin" / "claude.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return path
+
+
+# 从 Claude Code 会话里启动 monitor 时，这些变量描述的是父会话/父进程，
+# 不能带进被托管的 claude 子进程（否则子进程会误连父会话的消息 socket）。
+CHILD_ENV_DROP = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "AI_AGENT",
+)
+
+
+def child_env(cwd=None, base=None):
+    """为 claude 子进程准备环境变量：只去掉 Claude Code 的会话内部变量。"""
+    env = dict(os.environ if base is None else base)
+    for key in CHILD_ENV_DROP:
+        env.pop(key, None)
+    if cwd:
+        env["PWD"] = str(cwd)
+    return env
+
+
+def result_error_text(data, fallback=""):
+    """把 result 的结构化错误字段拼成可读文本（result/errors/HTTP 状态/终止原因）。"""
+    data = data if isinstance(data, dict) else {}
+    parts = []
+    result = data.get("result")
+    if isinstance(result, str) and result.strip():
+        parts.append(result.strip())
+    errors = data.get("errors")
+    if isinstance(errors, str):
+        errors = [errors]
+    if isinstance(errors, list):
+        parts.extend(e.strip() for e in errors if isinstance(e, str) and e.strip())
+    status = data.get("api_error_status")
+    if isinstance(status, int):
+        parts.append(f"HTTP {status}")
+    reason = data.get("terminal_reason")
+    if isinstance(reason, str) and reason.strip() \
+            and reason.strip().lower() not in ("completed", "success"):
+        parts.append(reason.strip())
+    if not parts:
+        subtype = data.get("subtype")
+        if isinstance(subtype, str) and subtype.strip() \
+                and subtype.strip().lower() != "success":
+            parts.append(subtype.strip())
+        elif fallback:
+            parts.append(str(fallback).strip())
+        else:
+            parts.append("error")
+    return clip(" | ".join(dict.fromkeys(p for p in parts if p)), 500)
+
+
+def active_rate_limit(record, now=None):
+    """返回未过期的限流记录；resets_at 已过或记录无效时返回 None。"""
+    if not isinstance(record, dict):
+        return None
+    resets_at = record.get("resets_at")
+    now = now_ts() if now is None else now
+    if isinstance(resets_at, (int, float)) and 0 < resets_at <= now:
+        return None
+    return record
 
 
 def message_content(text, images=None):

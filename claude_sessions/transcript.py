@@ -13,7 +13,9 @@ from .util import clip, _parse_iso
 # 转录里 type=user 的行不一定是真人输入：工具结果回传、isMeta 注入、
 # 命令/任务通知等系统文本也以 user 角色写入，展示时需区分开
 SYSTEM_MARKERS = ("<task-notification>", "<command-name>", "<command-message>",
-                  "<local-command-stdout>", "Caveat:", "[Request interrupted")
+                  "<local-command-stdout>", "Caveat:", "[Request interrupted",
+                  "<session-start-hook>", "<tick>", "<goal>",
+                  "<ide_opened_file>", "<ide_selection>")
 
 # 网页发送的斜杠命令在转录里是 <command-name>/<command-args> 的 user 行，
 # 本地命令输出则是 <local-command-stdout> 行，解析成独立 part 供前端渲染命令气泡

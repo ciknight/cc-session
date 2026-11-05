@@ -2,10 +2,33 @@ import json
 import unittest
 
 import monitor
+from claude_sessions.transcript import classify_user_line
 
 
 def line(obj):
     return json.dumps(obj, ensure_ascii=False)
+
+
+class UserLineClassifyTests(unittest.TestCase):
+    def test_injected_markers_are_system(self):
+        markers = ("<session-start-hook>hook</session-start-hook>",
+                   "<tick>123</tick>",
+                   "<goal>keep going</goal>",
+                   "<ide_opened_file>/tmp/a.py</ide_opened_file>",
+                   "<ide_selection>selected</ide_selection>")
+        for text in markers:
+            with self.subTest(text=text):
+                blocks = [{"type": "text", "text": text}]
+                self.assertEqual(
+                    classify_user_line({"type": "user",
+                                        "message": {"content": blocks}}, blocks),
+                    "system")
+
+    def test_normal_user_text_stays_user(self):
+        blocks = [{"type": "text", "text": "普通消息"}]
+        self.assertEqual(
+            classify_user_line({"type": "user", "message": {"content": blocks}}, blocks),
+            "user")
 
 
 class ParseMessageTests(unittest.TestCase):

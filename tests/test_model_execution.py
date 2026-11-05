@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -66,9 +67,63 @@ class ExecutionTests(unittest.TestCase):
             job = self.wait_done(response["job_id"])
         self.assertEqual(job["requested_model"], "vendor-model-7")
         cmd = run.call_args.args[0]
+        self.assertIn("--resume=existing", cmd)
         self.assertEqual(cmd[-1], "--model=vendor-model-7")
         self.assertNotIn("--model=haiku", cmd)
         self.assertEqual(self.mon.preferences.get("existing"), "vendor-model-7")
+
+    def test_oneshot_child_env_strips_parent_session(self):
+        completed = subprocess.CompletedProcess([], 0, json.dumps({"result": "ok"}), "")
+        with patch.dict(os.environ, {"CLAUDECODE": "1",
+                                     "CLAUDE_CODE_SESSION_ID": "parent",
+                                     "ANTHROPIC_API_KEY": "k"}), \
+                patch.object(core.subprocess, "run", return_value=completed) as run:
+            code, response = self.mon.send_message("existing", "hello")
+            self.assertEqual(code, 202)
+            self.wait_done(response["job_id"])
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("CLAUDECODE", env)
+        self.assertNotIn("CLAUDE_CODE_SESSION_ID", env)
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "k")
+        self.assertEqual(env["PWD"], str(self.root))
+
+    def test_oneshot_error_uses_structured_result_fields(self):
+        payload = {"is_error": True, "subtype": "success",
+                   "result": "API Error: 529 overloaded",
+                   "errors": ["overloaded"], "api_error_status": 529,
+                   "terminal_reason": "api_error"}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        with patch.object(core.subprocess, "run", return_value=completed):
+            code, response = self.mon.send_message("existing", "hello")
+            self.assertEqual(code, 202)
+            job = self.wait_done(response["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("HTTP 529", job["error"])
+        self.assertIn("overloaded", job["error"])
+
+    def test_hosted_child_env_strips_parent_session(self):
+        captured = {}
+        original = subprocess.Popen
+        fake = str(Path(__file__).with_name("fake_claude.py"))
+
+        def popen(cmd, **kwargs):
+            captured.update(kwargs)
+            return original([sys.executable, fake] + cmd[1:], **kwargs)
+
+        with patch.dict(os.environ, {"CLAUDECODE": "1",
+                                     "CLAUDE_CODE_SESSION_ID": "parent",
+                                     "ANTHROPIC_API_KEY": "k"}), \
+                patch.object(hosted.subprocess, "Popen", side_effect=popen):
+            code, response = self.mon.host_session(str(self.root), None, "hi")
+        self.assertEqual(code, 202)
+        host = self.mon.hosted[response["hosted_id"]]
+        self.hosts.append(host)
+        env = captured["env"]
+        self.assertNotIn("CLAUDECODE", env)
+        self.assertNotIn("CLAUDE_CODE_SESSION_ID", env)
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "k")
+        self.assertEqual(env["PWD"], str(self.root))
+        self.wait_done(response["job_id"])
 
     def test_fork_uses_fork_session_and_returns_new_sid(self):
         completed = subprocess.CompletedProcess(
@@ -81,8 +136,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(job["result_session_id"], "forked-sid")
         self.assertEqual(job["session"], "forked-sid")
         cmd = run.call_args.args[0]
-        self.assertIn("--resume", cmd)
-        self.assertIn("existing", cmd)
+        self.assertIn("--resume=existing", cmd)
         self.assertIn("--fork-session", cmd)
 
     def test_fork_rejects_running_session(self):
@@ -572,8 +626,57 @@ class ExecutionTests(unittest.TestCase):
         self.hosts.append(host)
         return host, response["job_id"], captured
 
+    def test_hosted_tracks_rate_limit_and_conversation_reset(self):
+        host = hosted.Hosted(self.mon, str(self.root))
+        host._on_rate_limit({"rate_limit_info": {
+            "status": "rejected", "resets_at": 4102444800,
+            "rate_limit_type": "five_hour", "utilization": 1.0}})
+        self.assertEqual(host.last_rate_limit["status"], "rejected")
+        self.assertEqual(host.info()["last_rate_limit"]["resets_at"], 4102444800)
+        host.last_rate_limit["resets_at"] = 1
+        self.assertIsNone(host.info()["last_rate_limit"])
+        host._on_conversation_reset({"new_conversation_id": "new-conv"})
+        self.assertEqual(host.last_conversation_reset["new_conversation_id"], "new-conv")
+        self.assertEqual(host.info()["last_conversation_reset"]["new_conversation_id"],
+                         "new-conv")
+
+    def test_conversation_reset_switches_session_and_mappings(self):
+        host = hosted.Hosted(self.mon, str(self.root), resume_id="original")
+        host.session_id = "old"
+        host.resume_id = "original"
+        self.mon.hosted_by_sid["old"] = host
+        self.mon.hosted_by_sid["original"] = host
+        host._on_conversation_reset({"new_conversation_id": "fresh"})
+        self.assertEqual(host.pending_conversation_reset["from"], "old")
+        self.assertEqual(host.pending_conversation_reset["resume_from"], "original")
+        # 同 session id / 子代理帧不能触发迁移
+        host._maybe_switch_after_reset({"session_id": "old"})
+        host._maybe_switch_after_reset({"session_id": "new",
+                                        "parent_tool_use_id": "tool-1"})
+        self.assertEqual(host.session_id, "old")
+        self.assertIsNotNone(host.pending_conversation_reset)
+        host._maybe_switch_after_reset({"type": "result", "session_id": "new"})
+        self.assertEqual(host.session_id, "new")
+        self.assertEqual(host.resume_id, "new")
+        self.assertIs(self.mon.hosted_by_sid.get("new"), host)
+        self.assertIsNone(self.mon.hosted_by_sid.get("old"))
+        self.assertIsNone(self.mon.hosted_by_sid.get("original"))
+        self.assertIsNone(host.pending_conversation_reset)
+        self.assertEqual(host.last_conversation_reset["session_id"], "new")
+
+    def test_terminate_process_closes_and_kills(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            hosted._terminate_process(proc, grace=0.2)
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
     def test_hosted_effort_spawn_argument(self):
         host, job_id, captured = self.start_host_capturing(resume_id="existing", effort="high")
+        self.assertIn("--resume=existing", captured[0])
         self.assertIn("--effort=high", captured[0])
         self.assertEqual(self.mon.efforts.get("existing"), "high")
         self.assertEqual(host.effort, "high")

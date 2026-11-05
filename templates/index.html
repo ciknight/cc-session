@@ -51,6 +51,7 @@ main{overflow-y:auto;padding:12px 18px;min-width:0}
 .b{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff;white-space:nowrap}
 .working{background:#d97706}.idle{background:#16a34a}.stale{background:#888}
 .chip{display:inline-block;padding:0 7px;border:1px solid var(--bd);border-radius:10px;font-size:12px;color:var(--mut);margin:1px 2px;background:var(--card)}
+.chip.warn{color:#b45309;border-color:rgba(217,119,6,.4);background:rgba(217,119,6,.10)}
 .mut{color:var(--mut);font-size:12px}
 .grid{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0;font-size:12px;color:var(--mut)}
 .grid b{color:var(--fg);font-weight:600}
@@ -446,6 +447,7 @@ let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
                                    // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
 const forkJobs = new Map();        // sid -> {jobId, status, error, newSid} 分叉任务状态
+let pendingSessionSwitch = null;   // /clear 后等待新会话出现在列表再自动切换
 let pendingEcho = {};              // sid -> {text, failed} 发送后未落盘的本地回显
 const turnEndHighWater = new Map(), displayedTurnEnd = new Map(), unreadSessions = new Set();
 let sessionsVersion = 0, displayedSession = null;
@@ -486,6 +488,14 @@ function applySessions(next){
   updateDocTitle();
   markDisplayedRead();
   renderMain();
+  if(pendingSessionSwitch && view.session === pendingSessionSwitch.from){
+    const target = next.find(s => s.id === pendingSessionSwitch.to);
+    if(target){
+      const sw = pendingSessionSwitch;
+      pendingSessionSwitch = null;
+      navigate({project: target.project, session: target.id, new: false});
+    }
+  }
 }
 const messageDrafts = new Map();   // 独立于模型草稿；只在当前页面内存保存
 function saveMessageDraft(key, text, input = false){
@@ -663,6 +673,18 @@ function fmtTok(n){
 const projName = cwd => (cwd || "?").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd;
 const sessTitle = s => s.alias || ((!s.title || s.title.includes("�")) ? (s.first_user_message || s.id.slice(0, 8)) : s.title);
 
+function rateLimitChip(s){
+  const r = s && s.hosted_rate_limit;
+  if(!r || (r.status !== "allowed_warning" && r.status !== "rejected")) return "";
+  if(r.resets_at && r.resets_at * 1000 <= Date.now()) return "";
+  const label = r.status === "rejected" ? "已限流" : "接近限流";
+  const parts = [];
+  if(r.rate_limit_type) parts.push(r.rate_limit_type);
+  if(typeof r.utilization === "number") parts.push(Math.round(r.utilization * 100) + "%");
+  if(r.resets_at) parts.push("重置 " + new Date(r.resets_at * 1000).toLocaleTimeString());
+  return `<span class="chip warn" title="${esc(parts.join(" · "))}">⏳ ${label}</span>`;
+}
+
 const metadataCache = new Map(), metadataSaves = new Map(), detailMetadata = new Map();
 function mergeMetadata(data){
   if(!data?.id) return data;
@@ -738,7 +760,7 @@ function renderHostedList(){
       return items.length ? `<section><h3>${esc(projName(p.cwd))} <span class="mut">${esc(p.cwd)}</span></h3>` +
         items.map(s => `<div class="scard" data-id="${esc(s.id)}"><span class="b ${s.state}">${esc(STATE_ZH[s.state] || s.state)}</span>
           <span class="stitle">${esc(sessTitle(s))}</span> ${s.archived ? '<span class="chip">已归档</span>' : ""}
-          <span class="chip">⚙ 托管中</span><div class="mut">进入会话</div></div>`).join("") + "</section>" : "";
+          <span class="chip">⚙ 托管中</span>${rateLimitChip(s)}<div class="mut">进入会话</div></div>`).join("") + "</section>" : "";
     }).join("") + (hosted.length ? "" : '<div class="empty">暂无托管会话</div>');
 }
 
@@ -1191,7 +1213,8 @@ const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_
   "tool_use", "tool_error", "turn_finished", "subagent_start", "subagent_done",
   "task_created",
   "task_updated", "context_compacted", "api_error", "hosted_turn_done",
-  "hosted_api_retry", "hosted_foreign_turn", "interaction_pending",
+  "hosted_api_retry", "hosted_rate_limit", "hosted_conversation_reset",
+  "hosted_session_switched", "hosted_foreign_turn", "interaction_pending",
   "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
   "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed",
   "session_fork_started", "session_forked"];
@@ -1267,6 +1290,13 @@ function handleSseMessage(msg){
         }, 5000);
       }
     }
+  }
+  if(msg.type === "hosted_session_switched" && msg.data
+     && msg.data.from && msg.data.to && view.session === msg.data.from){
+    // /clear 后 CLI 会换 session id；新会话被扫描进列表后自动切过去
+    pendingSessionSwitch = {from: msg.data.from, to: msg.data.to};
+    flashSendSt(msg.data.from, "会话已被 /clear 重置，正在切换…");
+    load();
   }
   if(["turn_finished", "hosted_turn_done", "interaction_pending",
       "turn_interrupted"].includes(msg.type) && view.session === msg.session){
@@ -1589,7 +1619,7 @@ function renderSessionList(p){
   document.getElementById("sessioncards").innerHTML = matching.map(s => `
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
-        ${s.hosted ? '<span class="chip" title="消息直接写入常驻 claude 进程">⚙ 托管中</span>' : ""}
+        ${s.hosted ? '<span class="chip" title="消息直接写入常驻 claude 进程">⚙ 托管中</span>' : ""}${rateLimitChip(s)}
         ${s.pending_interactions ? `<span class="chip pending">待审批 ${s.pending_interactions}</span>` : ""}
         ${unreadSessions.has(s.id) ? '<span class="chip" title="本页面观察到主回合结束；不代表任务成功或后台子代理全部结束">新回复</span>' : ""}
         <span class="stitle">${esc(sessTitle(s))}</span>
@@ -2300,7 +2330,7 @@ async function renderConversation(id, force){
                       title="返回项目列表">←<span class="back-label"> 返回</span></button>
               <h2>
                 <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
-                ${d.hosted ? '<span class="chip" title="该会话由常驻进程托管">⚙<span class="chip-label"> 托管中</span></span>' : ""}
+                ${d.hosted ? '<span class="chip" title="该会话由常驻进程托管">⚙<span class="chip-label"> 托管中</span></span>' : ""}${rateLimitChip(d)}
                 <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
                 <span class="mut conv-cwd">${esc(d.cwd || "")}</span></h2>
               ${d.is_subagent ? "" : `<button class="back" id="forkbtn" title="以当前会话历史创建新会话，原会话不受影响"

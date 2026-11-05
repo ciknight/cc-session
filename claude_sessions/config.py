@@ -38,3 +38,6 @@ MSG_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 # webhook 单 worker 的有界队列容量；满时丢弃新事件并限频记录
 WEBHOOK_QUEUE_LIMIT = 1000
+
+# 临时探针：打印托管进程 stdout 的后台任务帧，确认 CLI 是否发送 task_updated 等事件
+DEBUG_TASK_FRAMES = os.environ.get("CLAUDE_SESSIONS_DEBUG_TASK_FRAMES") == "1"

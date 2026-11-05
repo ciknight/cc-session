@@ -331,7 +331,7 @@ class Monitor:
 
     def _run_fork_job(self, parent, job, text, selected_model=None):
         try:
-            cmd = [self.claude_bin, "-p", "--resume", parent.id, "--fork-session",
+            cmd = [self.claude_bin, "-p", f"--resume={parent.id}", "--fork-session",
                    "--output-format", "json"]
             cmd += model_args(self.claude_args, selected_model)
             print(f"[fork] job {job['id']} 会话 {parent.id} 开始: {job['text']}", flush=True)
@@ -421,7 +421,7 @@ class Monitor:
 
     def _run_job(self, sess, job, text, selected_model=None):
         self.emit(sess, "remote_message_sent", {"job": job["id"], "text": job["text"]})
-        cmd = [self.claude_bin, "-p", "--resume", sess.id, "--output-format", "json"]
+        cmd = [self.claude_bin, "-p", f"--resume={sess.id}", "--output-format", "json"]
         cmd += model_args(self.claude_args, selected_model)
         print(f"[msg] job {job['id']} 会话 {sess.id} 开始: {job['text']}", flush=True)
         self._exec(job, cmd, sess.cwd, text)
@@ -479,7 +479,8 @@ class Monitor:
             # 显式 utf-8：Windows 中文系统默认是 gbk，会把中文消息和回复弄乱
             p = subprocess.run(cmd, input=text, capture_output=True, text=True,
                                encoding="utf-8", errors="replace",
-                               cwd=cwd, timeout=self.msg_timeout)
+                               cwd=cwd, timeout=self.msg_timeout,
+                               env=util.child_env(cwd=cwd))
             out = p.stdout.strip()
             try:
                 if stream_json:
@@ -498,8 +499,10 @@ class Monitor:
                 if data is not None:
                     result = data.get("result")
                     result_sid = data.get("session_id")
+                    job["terminal_reason"] = data.get("terminal_reason")
+                    job["api_error_status"] = data.get("api_error_status")
                     if data.get("is_error") or p.returncode != 0:
-                        error = clip(data.get("result") or p.stderr or out, 500)
+                        error = util.result_error_text(data, p.stderr or out)
             except json.JSONDecodeError:
                 result = clip(out, 2000)
                 if p.returncode != 0:

@@ -81,6 +81,30 @@ class ManagementAPITests(unittest.TestCase):
         self.assertEqual(self.sess.path.read_bytes(), original)
         self.assertEqual(json.load(self.request('/sessions/sid-1/messages'))['total'], 1)
 
+    def test_hosted_rate_limit_and_reset_projection(self):
+        from claude_sessions import hosted
+        h = hosted.Hosted(self.mon, str(self.project))
+        h.proc = object()
+        h.status = "running"
+        h.last_rate_limit = {"status": "allowed_warning", "resets_at": 4102444800}
+        h.last_conversation_reset = {"new_conversation_id": "next-conv"}
+        self.mon.hosted[h.hid] = h
+        self.mon.hosted_by_sid["sid-1"] = h
+
+        for path in ("/sessions", "/sessions?full=1", "/sessions/sid-1"):
+            item = json.load(self.request(path))
+            if isinstance(item, list):
+                item = item[0]
+            self.assertEqual(item["hosted_rate_limit"]["status"], "allowed_warning")
+        detail = json.load(self.request("/sessions/sid-1"))
+        self.assertEqual(detail["hosted_conversation_reset"]["new_conversation_id"],
+                         "next-conv")
+        self.assertEqual(self.snapshot()[0]["hosted_rate_limit"]["status"],
+                         "allowed_warning")
+
+        h.last_rate_limit = {"status": "rejected", "resets_at": 1}
+        self.assertIsNone(json.load(self.request("/sessions/sid-1"))["hosted_rate_limit"])
+
     def test_fork_route_returns_job_and_new_session(self):
         def fake_exec(self, job, cmd, cwd, text):
             job["result"] = "ok"
