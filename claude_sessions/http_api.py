@@ -253,7 +253,8 @@ def make_handler(mon, refresh_interval):
                 d["interactions"] = mon.pending_interactions(sid)
                 d["subagent_session_ids"] = mon.subagent_ids(s)
                 h = mon.hosted_by_sid.get(sid)
-                d["commands"] = list(h.commands) if h and h.alive() else []
+                d["commands"] = (list(h.commands) if h and h.alive()
+                                 else scan_slash_commands(config.CLAUDE_DIR, s.cwd))
                 d["hosted"] = bool(h and h.alive())
                 d["hosted_id"] = h.hid if h else None
                 d["hosted_busy"] = bool(h and h.alive()

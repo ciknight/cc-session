@@ -151,10 +151,14 @@ uv run monitor.py --webhook http://localhost:3000/hook
   覆盖用户 `--claude-args` 里的同名参数）；在线切换失败不回滚保存，重托管后生效。
   托管进程 `system/init` 的 `slash_commands` 去前缀去重存入 Hosted，detail 返回 `commands`；
   发送框 `/` 单 token 输入时浮出提示面板（↑↓/Tab/Enter 补全、Esc 关闭），面板展开时
-  Enter 只把选中项补全进输入框、不触发发送，收起后 Enter 才发送。新建会话页没有托管
-  进程，提示目录来自 `GET /commands?cwd=`（`scan_slash_commands` 扫描用户级
-  `<claude_dir>/commands` 与项目级 `<cwd>/.claude/commands` 的 `*.md`，子目录映射
-  `name/sub`；内置命令要等进程 init 广播，不在扫描范围内），前端按 cwd 缓存。
+  Enter 只把选中项补全进输入框、不触发发送，收起后 Enter 才发送。新建会话页与未托管
+  会话没有 init 广播，提示目录来自 `scan_slash_commands` 的静态扫描（`GET /commands?cwd=`
+  供新建页、detail 在无活动托管进程时回退）：用户级 `<claude_dir>/commands` 与项目级
+  `<cwd>/.claude/commands` 的 `*.md`（子目录映射 `name/sub`）、两级 `skills/` 下的目录型
+  skill（含 `SKILL.md`，散装 `.md` 是知识库不算）、`installed_plugins.json` 里插件的
+  `commands/*.md` 与目录型 skill（`plugin:name`，local scope 按 `projectPath` 匹配
+  cwd）；内置命令不在文件系统上，仍要等进程 init 广播。结果按 `(claude_dir, cwd)` 缓存
+  30 秒，前端另按 cwd 缓存。
 - **工作时发送**：非托管一次性消息进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动
   派发下一条（每会话上限 32）。托管会话的消息**立即写入常驻进程 stdin**，不再等服务端等上一轮
   结束：CLI 自己维护命令队列，并在工具轮之间把新消息折叠进当前回合（absorbed_mid_turn）。

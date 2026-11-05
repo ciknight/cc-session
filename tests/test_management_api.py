@@ -880,6 +880,15 @@ class ManagementAPITests(unittest.TestCase):
         result = json.load(self.request('/commands?cwd=' + urllib.parse.quote(str(self.project))))
         self.assertEqual(result, {'commands': ['global', 'sub/dep']})
 
+    def test_detail_commands_fall_back_to_static_scan_when_not_hosted(self):
+        # 未托管会话没有 init 广播，detail 的指令目录回退到文件系统静态扫描
+        skills = self.project / ".claude" / "skills" / "deploy"
+        skills.mkdir(parents=True)
+        (skills / "SKILL.md").write_text("deploy", encoding="utf-8")
+        detail = json.load(self.request('/sessions/sid-1'))
+        self.assertEqual(detail['commands'], ['deploy'])
+        self.assertFalse(detail['hosted'])
+
     def test_system_endpoint_returns_snapshot(self):
         fake = SimpleNamespace(
             cpu_percent=lambda interval=None, percpu=False: [11.0, 22.0] if percpu else 99.0,
