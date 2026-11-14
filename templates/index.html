@@ -2339,9 +2339,15 @@ async function renderConversation(id, force){
           <div id="bgstrip" hidden></div>
           <div id="conv"></div>
           ${composerHtml("conv", d)}`;
-        document.getElementById("back").onclick = () => {
-          navigate({project: view.project, session: null, new: false});
+        const backBtn = document.getElementById("back");
+        backBtn.onclick = () => {
+          navigate(sessionReturn || {project: view.project, session: null, new: false});
         };
+        // 返回目标按来源动态化（直链/刷新进入没有来源，标注默认的项目列表）
+        const backTarget = sessionReturn && sessionReturn.pending ? "待处理列表"
+          : sessionReturn && sessionReturn.hosted ? "托管列表" : "项目列表";
+        backBtn.setAttribute("aria-label", "返回" + backTarget);
+        backBtn.title = "返回" + backTarget;
         // 沉浸按钮点亮与点击都绑定当前视觉态（applyZen 已按偏好算好 body.zen）
         const zenBtn = document.getElementById("zenbtn");
         if(zenBtn){
@@ -3068,10 +3074,16 @@ function clearSessionView(){
   convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
                hasMore: false, loadingEarlier: false, detail: null};
 }
+let sessionReturn = null;   // 进入会话前的来源视图，会话页「返回」的目标
 function navigate(next, opts){
   saveComposerDraft();   // 此时路由尚未改变；以旧输入框所属 key 保存，不能依赖 curPanel。
   next = next || {project: null, session: null, new: false};
   const leaving = view.session !== (next.session || null);
+  // 从非会话视图进入会话时记录来源，会话页「返回」回到来处（托管/待处理列表）；
+  // 会话间切换（/clear 换新 sid 等）不覆盖；刷新或直链进入没有来源，回退默认项目列表
+  if(next.session && !view.session)
+    sessionReturn = {project: view.project || null, pending: !!view.pending,
+                     hosted: !!view.hosted, new: false};
   view = next;
   routeGeneration++;
   if(leaving) clearSessionView();

@@ -2375,6 +2375,37 @@ test('输入框自动增高上限：窄屏 25% 视口、桌面 40%', () => {
   }
 });
 
+test('会话页返回按钮回到进入来源（托管/待处理列表），会话间切换不覆盖来源', async () => {
+  const detail = id => response({id, cwd:'/project', state:'idle',
+    tokens:{}, tool_uses:{}, subagents:[], tasks:[]});
+  const b=boot(async url => {
+    if(url === '/sessions/sid' || url === '/sessions/sid2') return detail(url.slice('/sessions/'.length));
+    if(url.startsWith('/sessions/') && url.includes('/messages')) return response({messages:[],total:0,end:0,size:0});
+    return response({});
+  });
+  // 从托管列表进入会话：返回标签与目标都是托管列表
+  await b.run('view={hosted:true,project:null,session:null,new:false}; navigate({project:"/project",session:"sid",new:false})');
+  await new Promise(r=>setTimeout(r,0));
+  assert.equal(b.node('back').dataset.attr_aria_label, '返回托管列表');
+  // 会话间切换（/clear 换新 sid 场景）不覆盖来源
+  await b.run('navigate({project:"/project",session:"sid2",new:false})');
+  await new Promise(r=>setTimeout(r,0));
+  b.node('back').click();
+  assert.equal(b.run('view.hosted'), true, '切换会话后返回仍是托管列表');
+  // 从待处理列表进入：返回待处理列表
+  await b.run('view={pending:true,project:null,session:null,new:false}; navigate({project:"/project",session:"sid",new:false})');
+  await new Promise(r=>setTimeout(r,0));
+  assert.equal(b.node('back').dataset.attr_aria_label, '返回待处理列表');
+  b.node('back').click();
+  assert.equal(b.run('view.pending'), true, '返回待处理列表');
+  // 直链/刷新进入（无来源，不走 navigate 直接渲染会话视图）：回退默认项目列表
+  await b.run('sessionReturn=null; view={project:"/project",session:"sid",new:false}; renderMain()');
+  await new Promise(r=>setTimeout(r,0));
+  assert.equal(b.node('back').dataset.attr_aria_label, '返回项目列表');
+  b.node('back').click();
+  assert.equal(b.run('view.session'), null, '返回离开会话视图');
+});
+
 for(const [device, narrow, navigator] of [
   ['移动端', true, {userAgent:'Android'}],
   ['iPhone', true, {userAgent:'iPhone'}],

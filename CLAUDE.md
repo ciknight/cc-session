@@ -228,6 +228,10 @@ uv run monitor.py --webhook http://localhost:3000/hook
   `GET /pending`、`GET /hosted`、
   `GET /p/...` 与 `/` 一样回退渲染同一 SPA 模板。导航统一走 `navigate`（`pushState`），
   首页自动选中项目时用 `replaceState` 避免多余历史记录；`popstate` 重新解析地址并恢复视图。
+  会话页「返回」回到进入来源：`navigate` 从非会话视图进入会话时把旧视图存进
+  `sessionReturn`（托管/待处理/项目列表），返回按钮按它导航、标签随来源动态化
+  （「返回托管列表」等）；会话间切换（`/clear` 换 sid）不覆盖来源，直链或整页刷新
+  进入没有来源（内存态），回退默认项目列表。
 
 ### 前端
 
