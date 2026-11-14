@@ -71,9 +71,6 @@ uv run monitor.py --webhook http://localhost:3000/hook
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
    设置托管思考档位（low/medium/high/xhigh/max/default）。
-   `POST /sessions/<id>/fork` 以 `claude -p --resume <id> --fork-session` 创建新会话
-   （复制整段历史，原会话不变；异步 job，完成事件 `session_forked` 带新 sid）。
-   `Monitor.forking` 与普通发送/再次分叉互斥；完成后把所选模型绑定到新 sid。
    `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲），
 `POST /system/sleep-timer` 定时睡眠（服务端 `threading.Timer` 内存态，minutes 0-720、0 取消，
 `GET /system` 的 `sleep_timer_remaining` 随轮询返回剩余秒）。
@@ -226,7 +223,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - **URL 路由**：看板视图与地址栏同步，`/p/<项目路径>` 是项目列表，
   `/p/<项目路径>/s/<会话ID>` 是对话，`/p/<项目路径>/new` 是新建；项目路径保留目录层级
   （反斜杠归一为 `/`，冒号保留，仅转义空格等特殊字符），旧的整体编码链接仍可解析。
-  `/pending` 为全局待处理会话列表，只导航到原审批详情、不复制表单；
+  `/pending` 为全局待处理会话列表（header「待审批 N」徽章入口），只导航到原审批详情、不复制表单；
   `/hosted` 为托管会话列表（header「托管 N」徽章入口，点击卡片进对话）。
   `GET /pending`、`GET /hosted`、
   `GET /p/...` 与 `/` 一样回退渲染同一 SPA 模板。导航统一走 `navigate`（`pushState`），
@@ -255,10 +252,18 @@ cwd 与「对话 N/M」计数并入概览折叠 `overviewHtml`——summary 一�
 桌面 `display:contents` 原样展开、控件 DOM 不移动；textarea 压两行，头部隐藏 cwd。
 模型选择行强制单行（`nowrap`）：隐藏「模型选择」标签文字、select/自定义输入可收缩、
 状态与队列 chip 单行省略并右对齐；发送/图片/中断/⚙ 按钮同样收紧内边距保持一行。
-窄屏顶部同样压缩为两行：全局 header 隐藏「自动刷新/间隔/系统」文字与更新时间
-（保留 `aria-label`/`title`），用 `.hdr-break` 让托管/待审批/通知/系统徽章换行；
-会话头「返回」「托管中」只留图标，概览摘要只显示对话数、消息数、子代理与任务，
-模型/分支/token 留在展开面板（摘要项带 `ov-*` 类名，分隔符在项内，隐藏后不留悬空「·」）。
+窄屏顶部同样压缩：全局 header 隐藏「自动刷新/间隔/系统」文字与更新时间
+（保留 `aria-label`/`title`），列表页用 `.hdr-break` 让托管/待审批/通知/系统徽章换行成两行；
+**会话视图（`body.insession`）里徽章与通知/系统按钮一并隐藏、header 回到一行**（列表页均可达，
+断连提示 `#connbadge` 仍会临时占行）。会话头「返回」「托管中」只留图标，概览摘要只显示对话数、
+消息数、子代理与任务，模型/分支/token 留在展开面板（摘要项带 `ov-*` 类名，分隔符在项内，
+隐藏后不留悬空「·」）。窄屏另有**沉浸模式**：会话头 ⛶ 按钮（仅窄屏渲染）切换 `body.zen`，
+隐藏全局 header 与概览折叠行、消息区最大化；偏好持久化在 localStorage `zen`，由 `applyZen`
+在 `renderMain` 切换 `convview` 后同步——仅会话视图生效，返回列表自动退出、重进自动恢复。
+偏好与视觉态解耦：点击 token chip 展开概览只是**临时退出**（`zenSessionOff`，不落盘，
+轮询刷新不翻回），离开会话视图或手动点 ⛶ 即失效，重进仍按偏好恢复；⛶ 按钮点亮与
+aria 状态绑定当前视觉态。`autosizeComposer` 的输入框增高上限窄屏降为
+视口 25%（桌面 40%），长草稿不再吞掉近半屏消息区。
 所有设备的会话页发送框均常驻底部，滚动消息时不隐藏、不回弹，也不因滚动停止强制顶底。
 发送状态（发送中/排队/处理中/已完成/失败）显示为输入区上方的浮动胶囊，不占布局高度；
 「已完成/已取消」约 4 秒后自动消失，失败等错误保持显示。发送区提供中断按钮、审批
@@ -274,9 +279,7 @@ Agent 等给出摘要、类别色、状态与 diff 统计），连续同名工�
 结果默认不展开。消息头提供复制按钮，图片点击打开全屏灯箱；SSE 断开时 header 的
 `#connbadge` 显示重连提示。模型行内的 `#tokchip` 显示上下文 token，点击展开概览。
 移动端用 `visualViewport` 计算 `--keyboard-height` 收缩 body，输入框按内容自适应高度，
-避免 iOS 键盘遮住发送区。会话头「分叉」按钮把当前输入作为首条消息调用
-`POST /sessions/<id>/fork`；进度/失败走独立的 `forkJobs` 状态，查询失败标为未知而不是
-直接判失败，扫描未就绪时留在父会话提示刷新，轮询到新 sid 后才跳转。
+避免 iOS 键盘遮住发送区。
 消息草稿按会话/新建项目隔离，仅存页面内存；发送响应只消费提交时版本，异步回调不能清空
 其他面板或后续编辑的草稿；复用旧会话 DOM 时也要同步过期草稿版本，避免显示内容与待发送内容不一致。
 新回复提示只依赖 `last_turn_end_at` 高水位推进，首次见会话只建基线，不以 `stale` 或工具结束

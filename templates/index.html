@@ -253,7 +253,6 @@ img.msg-image{cursor:zoom-in}
 .config-path{overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:12px;margin:3px 0}
 button:disabled,select:disabled{opacity:.5;cursor:not-allowed}
 .metadata-actions{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:8px}
-#pendingnav{margin:10px;width:calc(100% - 20px);text-align:left}
 .queue-job{padding:8px 0;border-top:1px solid var(--bd)}
 .queue-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:8em;overflow:auto}
 #queuepop h5{margin:8px 0 0;font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
@@ -299,10 +298,20 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
 .systimer{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:var(--mut)}
 .systimer select{font:inherit;font-size:12px;padding:2px 4px;background:var(--bg);color:var(--fg);
   border:1px solid var(--bd);border-radius:6px}
+/* 沉浸模式：仅移动端会话视图生效（body.zen 由 applyZen 按视图同步），按钮也只在窄屏显示 */
+#zenbtn{display:none}
+#zenbtn.on{border-color:var(--acc);color:var(--acc)}
 /* 移动端：抽屉式侧栏 */
 #menu{display:none}
 #mask{display:none}
 @media(max-width:768px){
+  #zenbtn{display:inline-block}
+  /* 会话视图里全局徽章与低频控件（通知/系统）让位（列表页均可达），顶栏回到一行；
+     沉浸时整个 header 与概览折叠行隐藏，消息区最大化 */
+  body.insession #pendingbadge,body.insession #hostedbadge,
+  body.insession #notifybtn,body.insession #sysbtn{display:none!important}
+  body.zen header{display:none}
+  body.zen .conv-overview{display:none}
   #app{grid-template-columns:1fr}
   #menu{display:inline-block}
   /* 顶部栏压成两行：标题行只留开关/间隔/系统图标，徽章与通知落到第二行；
@@ -317,7 +326,8 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   header .ctl{font-size:12px;gap:4px}
   #sysbtn{padding:2px 7px}
   main{padding:8px 10px}
-  .conv-top{padding:6px 10px 2px}
+  .conv-top{padding:4px 10px 2px}
+  .conv-overview{margin:3px 0 1px}
   .conv-cwd{display:none}
   .conv-head{gap:6px}
   .conv-head .back-label,.conv-head .chip-label{display:none}
@@ -326,7 +336,8 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   .conv-overview>summary .ov-model,.conv-overview>summary .ov-branch,
   .conv-overview>summary .ov-output,.conv-overview>summary .ov-ctx{display:none}
   #conv{padding:4px 10px 12px}
-  main.convview .composer{margin:8px 10px calc(8px + env(safe-area-inset-bottom,0px))}
+  main.convview .composer{margin:6px 10px calc(6px + env(safe-area-inset-bottom,0px))}
+  .composer.info-panel{padding:8px 10px}
   #bgstrip{margin:0 10px}
   .composer textarea{resize:none}
   .composer-cog{display:inline-block}
@@ -336,7 +347,7 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
     border:1px solid var(--bd);border-radius:8px;padding:10px 12px;
     box-shadow:0 8px 24px rgba(0,0,0,.16);max-height:60vh;overflow-y:auto}
   /* 模型选择行保持单行：隐藏“模型选择”文字、控件可收缩、队列摘要靠右 */
-  .composer .model-controls{flex-wrap:nowrap;gap:6px;margin:4px 0;min-width:0}
+  .composer .model-controls{flex-wrap:nowrap;gap:6px;margin:2px 0;min-width:0}
   .composer .model-controls>label.ctl{gap:4px;flex:0 1 auto;min-width:0}
   .composer .ctl-label{display:none}
   #modelsel{min-width:0;max-width:46vw;flex:0 1 auto;font-size:12px}
@@ -348,7 +359,7 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   .queue-chip{flex:none;margin-left:auto;max-width:36vw;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap;font-size:11px}
   /* 按钮行：收紧内边距与间距，发送/图片/中断/⚙ 始终同一行 */
-  .composer-actions{flex-wrap:nowrap;gap:6px;margin-top:5px}
+  .composer-actions{flex-wrap:nowrap;gap:6px;margin-top:4px}
   .composer-actions>.back{flex:none;padding:5px 9px;min-height:32px;font-size:12px;white-space:nowrap}
   .composer textarea{height:4.1em}
   .ubody{max-width:92%}
@@ -446,7 +457,6 @@ let liveText = "", liveRaf = null;
 let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
                                    // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
-const forkJobs = new Map();        // sid -> {jobId, status, error, newSid} 分叉任务状态
 let pendingSessionSwitch = null;   // /clear 后等待新会话出现在列表再自动切换
 let pendingEcho = {};              // sid -> {text, failed} 发送后未落盘的本地回显
 const turnEndHighWater = new Map(), displayedTurnEnd = new Map(), unreadSessions = new Set();
@@ -958,10 +968,12 @@ function composerHtml(mode, d){
   </div>`;
 }
 function autosizeComposer(box){
-  // 按内容增高到上限，避免长指令在固定高度的小框里来回滚动
+  // 按内容增高到上限，避免长指令在固定高度的小框里来回滚动；
+  // 窄屏上限更低：长草稿不该吞掉近半屏消息区
   if(!box || !box.style) return;
   box.style.height = "auto";
-  const max = Math.max(72, Math.round((window.innerHeight || 800) * 0.4));
+  const narrow = !!(window.matchMedia && window.matchMedia("(max-width:768px)").matches);
+  const max = Math.max(72, Math.round((window.innerHeight || 800) * (narrow ? 0.25 : 0.4)));
   const height = Math.min(box.scrollHeight || 0, max);
   if(height > 0) box.style.height = height + "px";
 }
@@ -990,6 +1002,11 @@ function trackVisualViewport(){
   update();
 }
 function showTokenOverview(){
+  // 沉浸模式隐藏了概览折叠，先临时退出再展开（不落盘：偏好保留，重进会话仍恢复沉浸）
+  if(document.body && document.body.classList && document.body.classList.contains("zen")){
+    zenSessionOff = true;
+    applyZen();
+  }
   const wrap = document.getElementById("overviewwrap");
   const details = wrap && wrap.querySelector ? wrap.querySelector("details") : null;
   if(!details) return;
@@ -1216,8 +1233,7 @@ const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_
   "hosted_api_retry", "hosted_rate_limit", "hosted_conversation_reset",
   "hosted_session_switched", "hosted_foreign_turn", "interaction_pending",
   "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
-  "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed",
-  "session_fork_started", "session_forked"];
+  "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed"];
 const raf = window.requestAnimationFrame || (fn => setTimeout(fn, 16));
 
 function listGap(){ return +ival.value || DEFAULT_IVAL; }
@@ -1270,26 +1286,6 @@ function handleSseMessage(msg){
   if(msg.type === "turn_delta"){
     if(view.session === msg.session) updateLiveBubble(msg.data.text || "");
     return;
-  }
-  if(msg.type === "session_forked" && msg.session){
-    const state = forkJobs.get(msg.session);
-    // 迟到的旧 job 事件不能覆盖用户随后发起的新分叉
-    if(state && (!state.jobId || !msg.data || !msg.data.job || state.jobId === msg.data.job)){
-      const done = !!(msg.data && msg.data.status === "done" && msg.data.session);
-      state.status = done ? "done" : "failed";
-      state.newSid = (msg.data && msg.data.session) || state.newSid;
-      state.error = done ? "" : ((msg.data && msg.data.error) || "分叉失败");
-      updateSendSt(msg.session);
-      if(done){
-        const target = msg.session;
-        setTimeout(() => {
-          if(forkJobs.get(target) === state && state.status === "done"){
-            forkJobs.delete(target);
-            updateSendSt(target);
-          }
-        }, 5000);
-      }
-    }
   }
   if(msg.type === "hosted_session_switched" && msg.data
      && msg.data.from && msg.data.to && view.session === msg.data.from){
@@ -1543,14 +1539,14 @@ function renderSidebar(projects){
     projects.map(p => [p.cwd, p.sessions.length, p.working, p.wt, p.last, p.unread])]);
   if(sig === lastSidebarSig) return;
   lastSidebarSig = sig;
-  document.getElementById("projs").innerHTML = `<button class="back" id="pendingnav">全局待处理</button>` + (projects.map(p => `
+  document.getElementById("projs").innerHTML = projects.map(p => `
     <div class="pitem ${p.cwd === view.project ? "active" : ""}" data-cwd="${esc(p.cwd)}">
       <div class="pname">${esc(projName(p.cwd))}
         ${p.working ? `<span class="b working">${p.working}</span>` : ""}
         ${p.unread ? `<span class="chip" aria-label="${p.unread} 个会话有新回复">${p.unread} 新回复</span>` : ""}</div>
       <div class="pmeta">${p.sessions.length} 会话${p.wt ? ` · ${p.wt} 子目录` : ""} · ${relTime(p.last)}</div>
       <button class="newbtn" data-cwd="${esc(p.cwd)}" title="在此项目新建会话">＋</button>
-    </div>`).join("") || '<div class="empty">暂无项目</div>');
+    </div>`).join("") || '<div class="empty">暂无项目</div>';
 }
 
 /* ---------- 渲染：会话列表 ---------- */
@@ -2333,8 +2329,8 @@ async function renderConversation(id, force){
                 ${d.hosted ? '<span class="chip" title="该会话由常驻进程托管">⚙<span class="chip-label"> 托管中</span></span>' : ""}${rateLimitChip(d)}
                 <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
                 <span class="mut conv-cwd">${esc(d.cwd || "")}</span></h2>
-              ${d.is_subagent ? "" : `<button class="back" id="forkbtn" title="以当前会话历史创建新会话，原会话不受影响"
-                      aria-label="分叉会话"><span aria-hidden="true">⑂</span><span class="back-label"> 分叉</span></button>`}
+              <button class="back" id="zenbtn" title="沉浸模式：隐藏顶部栏与概览，扩大消息区"
+                      aria-label="沉浸模式：隐藏顶部栏与概览，扩大消息区" aria-pressed="false">⛶<span class="back-label"> 沉浸</span></button>
             </div>
             <div id="overviewwrap">${overviewHtml(mergeMetadata(d))}</div>
             <div id="interactions"></div>
@@ -2346,8 +2342,15 @@ async function renderConversation(id, force){
         document.getElementById("back").onclick = () => {
           navigate({project: view.project, session: null, new: false});
         };
-        const forkBtn = document.getElementById("forkbtn");
-        if(forkBtn) forkBtn.onclick = () => forkSession(id);
+        // 沉浸按钮点亮与点击都绑定当前视觉态（applyZen 已按偏好算好 body.zen）
+        const zenBtn = document.getElementById("zenbtn");
+        if(zenBtn){
+          const zenOn = () => !!(document.body && document.body.classList
+            && document.body.classList.contains("zen"));
+          zenBtn.classList.toggle("on", zenOn());
+          zenBtn.setAttribute("aria-pressed", zenOn() ? "true" : "false");
+          zenBtn.onclick = () => setZen(!zenOn());
+        }
         // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
         bindSendBox(id, d);
         curPanel = {type: "conv", key: id};
@@ -2628,154 +2631,6 @@ function fetchT(url, opts = {}, ms = 30000){
   return fetch(url, {...opts, signal: c.signal}).finally(() => clearTimeout(t));
 }
 
-async function waitForSession(sid, tries = 60, shouldStop = null){
-  for(let i = 0; i < tries; i++){
-    if(shouldStop && shouldStop()) return false;
-    try{
-      const r = await fetchT("/sessions/" + encodeURIComponent(sid), {}, 10000);
-      if(r.ok) return true;
-    }catch(e){ /* 扫描线程还没发现新文件，稍后重试 */ }
-    if(shouldStop && shouldStop()) return false;
-    await new Promise(f => setTimeout(f, 500));
-  }
-  return false;
-}
-function forkJobState(id){
-  let state = forkJobs.get(id);
-  if(!state){
-    state = {status: "", error: "", jobId: null, newSid: null};
-    forkJobs.set(id, state);
-  }
-  return state;
-}
-function forkBusy(id){
-  const state = forkJobs.get(id);
-  // 已拿到 job id 的 unknown 状态说明服务端任务可能仍在跑，继续锁住；
-  // POST 本身失败（没有 job id）时允许用户重试，后端 forking 仍会兜底串行化。
-  return !!state && (state.status === "running"
-    || (state.status === "unknown" && !!state.jobId));
-}
-function forkJobText(id){
-  const state = forkJobs.get(id);
-  if(!state) return "";
-  if(state.status === "running") return "正在分叉…";
-  if(state.status === "done") return state.newSid ? "分叉完成，新会话已创建" : "分叉完成";
-  if(state.status === "created") return state.error || "分叉完成，新会话已创建，等待扫描…";
-  if(state.status === "unknown") return state.error || "分叉状态未知，任务可能仍在执行";
-  if(state.status === "failed") return "分叉失败：" + (state.error || "未知错误");
-  return "";
-}
-function updateForkBtn(id){
-  const btn = document.getElementById("forkbtn");
-  if(!btn) return;
-  const busy = forkBusy(id);
-  btn.disabled = busy;
-  btn.title = busy ? "正在分叉，请稍候" : "以当前会话历史创建新会话，原会话不受影响";
-}
-function setForkState(id, status, error = ""){
-  const state = forkJobState(id);
-  state.status = status;
-  state.error = error;
-  updateSendSt(id);
-  return state;
-}
-async function forkSession(id){
-  if(forkBusy(id)) return;
-  const box = document.getElementById("msgbox");
-  const text = (box && box.value || "").trim();
-  if(!text){
-    setForkState(id, "failed", "请先在输入框输入分叉后的第一条消息");
-    if(box && box.focus) box.focus();
-    return;
-  }
-  if(view.session !== id) return;
-  const selected = modelSnapshot(id);
-  if(selected === undefined) return;
-  if(window.confirm && !window.confirm("将以当前会话历史创建新会话（复制历史），原会话不受影响。继续？")) return;
-  const state = setForkState(id, "running");
-  state.jobId = null; state.newSid = null;
-  const route = routeGeneration;
-  const stop = () => view.session !== id || route !== routeGeneration;
-  let accepted = false;
-  try{
-    const r = await fetchT("/sessions/" + encodeURIComponent(id) + "/fork", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text, model: selected}),
-    }, 30000);
-    let started = null, parsed = true;
-    try{ started = await r.json(); }catch(e){ parsed = false; }
-    if(!r.ok){
-      setForkState(id, "failed", (started && started.error) || ("HTTP " + r.status));
-      return;
-    }
-    if(!parsed || !started || !started.job_id){
-      setForkState(id, "unknown", "分叉请求已发出但响应无法解析，任务可能仍在执行");
-      return;
-    }
-    accepted = true;
-    state.jobId = started.job_id;
-    updateSendSt(id);
-    const deadline = Date.now() + 10 * 60 * 1000;
-    for(;;){
-      if(stop()) return;
-      if(Date.now() > deadline){
-        setForkState(id, "unknown", "分叉超时，任务可能仍在执行");
-        return;
-      }
-      await new Promise(f => setTimeout(f, 1500));
-      if(stop()) return;
-      let jrRes, job;
-      try{
-        jrRes = await fetchT("/jobs/" + encodeURIComponent(started.job_id), {}, 15000);
-        job = await jrRes.json();
-      }catch(e){
-        setForkState(id, "unknown", "分叉状态查询失败，任务可能仍在执行：" + (e.message || e));
-        return;
-      }
-      if(stop()) return;
-      if(!jrRes.ok || (job.error && !job.status)){
-        setForkState(id, "unknown",
-          "分叉状态查询失败，任务可能仍在执行：" + (job.error || ("HTTP " + jrRes.status)));
-        return;
-      }
-      if(job.status === "failed"){
-        setForkState(id, "failed", job.error || "分叉失败");
-        return;
-      }
-      if(job.status !== "done") continue;
-      const newSid = job.result_session_id || job.session;
-      if(!newSid){
-        setForkState(id, "failed", "分叉完成但没有返回新会话 id");
-        return;
-      }
-      state.newSid = newSid;
-      const found = await waitForSession(newSid, 60, stop);
-      if(stop()) return;
-      // 分叉的首条消息已经提交，清掉父会话草稿；只消费仍等于提交文本的版本
-      const draft = messageDrafts.get(id);
-      if(draft && draft.text === text){
-        const cleared = saveMessageDraft(id, "");
-        if(box && box.dataset.draftKey === id && box.value === text){
-          box.value = ""; box.dataset.draftVersion = String(cleared.version);
-          autosizeComposer(box);
-        }
-      }
-      if(!found){
-        setForkState(id, "created",
-          "分叉完成，新会话已创建（" + newSid + "），扫描尚未完成，请稍后刷新列表");
-        return;
-      }
-      const finishedState = setForkState(id, "done", "");
-      navigate({project: view.project, session: newSid, new: false}, {replace: true});
-      if(forkJobs.get(id) === finishedState) forkJobs.delete(id);
-      return;
-    }
-  }catch(e){
-    // 即使已经离开父会话也记录状态，用户返回时能看到失败/未知原因
-    setForkState(id, "unknown",
-      (accepted ? "分叉状态查询失败" : "分叉请求状态未知") + "，任务可能仍在执行：" + (e.message || e));
-  }
-}
 function sendJobText(id){
   // 状态从模块级 sendJobs 读取，而不是闭包里的 DOM 引用——
   // 自动刷新会整体重渲染对话视图，旧引用会指向已替换的节点导致界面停在"发送中…"
@@ -2862,17 +2717,14 @@ function updateSendSt(id){
   if(!panelMatch(id)) return;
   const st = document.getElementById("sendst");
   const images = imageDraft(id);
-  const forkBusyNow = forkBusy(id);
-  if(st) st.textContent = images.pending ? "图片读取中…"
-    : (images.error || (forkBusyNow ? forkJobText(id) : (sendJobText(id) || forkJobText(id))));
+  if(st) st.textContent = images.pending ? "图片读取中…" : (images.error || sendJobText(id));
   const btn = document.getElementById("sendbtn");
   const j = sendJobs[id];
   // 对话视图里 running/queued 仍可继续发送：托管会话会排队；新建会话必须先拿到 sid，
-  // 否则连点会创建多个新会话，所以新建面板继续锁住。分叉进行中也不允许发送。
+  // 否则连点会创建多个新会话，所以新建面板继续锁住。
   const newPanel = curPanel && curPanel.type === "new";
-  if(btn) btn.disabled = images.pending > 0 || forkBusyNow || !!j && (j.status === "sending"
+  if(btn) btn.disabled = images.pending > 0 || !!j && (j.status === "sending"
     || (newPanel && ["queued", "running"].includes(j.status)));
-  updateForkBtn(id);
 }
 let sendStFlashTimer = null;
 function flashSendSt(id, text, ms = 4000){
@@ -3232,6 +3084,34 @@ function onPopState(){
 }
 
 /* ---------- 主渲染 ---------- */
+/* 沉浸模式：zenPref 是持久化偏好（进入会话视图时是否沉浸），只在会话视图生效；
+   zenSessionOff 记录本视图内的临时退出（点击 token chip 看概览）——不落盘、
+   离开会话视图或手动点 ⛶ 即失效，轮询刷新不会把它翻回沉浸；
+   按钮点亮与 aria 状态绑定当前视觉态（body.zen），与偏好解耦 */
+let zenPref = false, zenSessionOff = false;
+try{ zenPref = localStorage.getItem("zen") === "1"; }catch(e){}
+function applyZen(){
+  const mainEl = document.getElementById("main");
+  const inSession = !!(mainEl && mainEl.classList && mainEl.classList.contains
+    && mainEl.classList.contains("convview"));
+  if(!inSession) zenSessionOff = false;
+  const zen = inSession && zenPref && !zenSessionOff;
+  if(document.body && document.body.classList){
+    document.body.classList.toggle("zen", zen);
+    document.body.classList.toggle("insession", inSession);
+  }
+  const btn = document.getElementById("zenbtn");
+  if(btn){
+    btn.classList.toggle("on", zen);
+    btn.setAttribute("aria-pressed", zen ? "true" : "false");
+  }
+}
+function setZen(on){
+  zenPref = !!on;
+  zenSessionOff = false;
+  try{ localStorage.setItem("zen", zenPref ? "1" : "0"); }catch(e){}
+  applyZen();
+}
 function renderPendingBadge(){
   const total = sessions.reduce((sum, s) => sum + (s.pending_interactions || 0), 0);
   const el = document.getElementById("pendingbadge");
@@ -3251,6 +3131,7 @@ function renderMain(){
   const mainEl = document.getElementById("main");
   if(mainEl && mainEl.classList && mainEl.classList.toggle)
     mainEl.classList.toggle("convview", !!(view.session && !view.pending && !view.hosted));
+  applyZen();   // convview 切换后同步沉浸/会话视图标记（列表页自动退出沉浸）
   const projects = groupByProject();
   resolveViewProject(projects);
   renderSidebar(projects);
@@ -3315,7 +3196,6 @@ document.getElementById("hostedbadge").onclick = () => navigate({hosted: true, p
 document.getElementById("menu").onclick = () => toggleDrawer(!asideEl.classList.contains("open"));
 maskEl.onclick = () => toggleDrawer(false);
 document.getElementById("projs").addEventListener("click", e => {
-  if(e.target.closest("#pendingnav")){ toggleDrawer(false); openPending(); return; }
   const nb = e.target.closest(".newbtn");
   if(nb){
     toggleDrawer(false);

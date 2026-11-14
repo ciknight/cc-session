@@ -73,7 +73,6 @@ class Monitor:
         self.jobs = {}             # 注册表归 lock；字段归 job._owner.ready 或 lock
         self.terminal_jobs = deque()  # 首次终态完成顺序，全局保留 100 条
         self.busy = set()          # 正在执行远程消息的 session id
-        self.forking = set()       # 正在分叉的 session id；与普通发送互斥
         self.remote_queues = {}    # sid -> deque[(job, text, model)]，非托管一次性消息排队
         self.new_cwd_busy = set()  # 尚未取得 session id 的新会话目录
         self.hosted = {}           # hosted_id -> Hosted（服务托管的常驻进程）
@@ -279,101 +278,12 @@ class Monitor:
         with self.cc_switch.operation(cwd):
             return self._send_message_locked(sid, content, force, model)
 
-    def fork_session(self, sid, text, model=UNSET, images=None):
-        """从已有会话分叉：claude --resume <sid> --fork-session 跑一轮首条消息。
-
-        分叉复制整段历史，原会话不受影响；新会话 id 由 CLI 在结果里返回。
-        与普通发送一样走一次性的 job，前端轮询到 result_session_id 后跳转。
-        """
-        try:
-            content = message_content(text, images)
-        except ValueError as e:
-            return 400, {"error": str(e)}
-        self.ensure_subagent(sid)
-        with self.lock:
-            sess = self.by_sid(sid)
-            busy = sid in self.busy or sid in self.forking
-            h = self.hosted_by_sid.get(sid)
-        if not sess:
-            return 404, {"error": "session not found"}
-        if sess.is_subagent:
-            return 400, {"error": "子代理会话只读，不能分叉"}
-        if not sess.cwd or not os.path.isdir(sess.cwd):
-            return 400, {"error": f"session cwd unavailable: {sess.cwd}"}
-        if busy or sess.summary(self.stale_after)["state"] == "working":
-            return 409, {"error": "会话正在执行或分叉，请等当前任务结束后再试"}
-        if h and h.alive() and (h.current or h.pending or h.processing):
-            return 409, {"error": "托管会话仍在执行，请等本轮结束后再分叉"}
-        try:
-            selected = validate_model(self.preferences.get(sid) if model is UNSET else model)
-        except ValueError as e:
-            return 400, {"error": str(e)}
-        with self.cc_switch.operation(sess.cwd):
-            # 检查与占用必须在同一把锁内：两个 fork 或 fork+send 不能同时通过。
-            with self.lock:
-                if sid in self.forking or sid in self.busy:
-                    return 409, {"error": "会话正在执行或分叉，请等当前任务结束后再试"}
-                self.forking.add(sid)
-            try:
-                job = self._new_job(None, content, selected)
-                with self.lock:
-                    job["fork_of"] = sid
-                    job["status"] = "running"
-                threading.Thread(target=self._run_fork_job,
-                                 args=(sess, job, content, selected), daemon=True).start()
-            except Exception as exc:
-                with self.lock:
-                    self.forking.discard(sid)
-                    if "job" in locals():
-                        self._terminal_job_locked(job, "failed", error=clip(str(exc), 500))
-                return 500, {"error": f"启动分叉失败：{exc}"}
-        return 202, {"job_id": job["id"], "status": "running", "fork_of": sid}
-
-    def _run_fork_job(self, parent, job, text, selected_model=None):
-        try:
-            cmd = [self.claude_bin, "-p", f"--resume={parent.id}", "--fork-session",
-                   "--output-format", "json"]
-            cmd += model_args(self.claude_args, selected_model)
-            print(f"[fork] job {job['id']} 会话 {parent.id} 开始: {job['text']}", flush=True)
-            self.emit(parent, "session_fork_started", {"job": job["id"], "from": parent.id})
-            self._exec(job, cmd, parent.cwd, text)
-        except Exception as exc:
-            # _exec 正常路径已经终态化；这里兜底 emit/线程启动等意外异常
-            with self.lock:
-                self._terminal_job_locked(job, "failed", error=clip(str(exc), 500))
-        finally:
-            with self.lock:
-                completed = self._job_public(job)
-            new_sid = completed.get("result_session_id")
-            if completed["status"] == "done" and new_sid and selected_model is not None:
-                try:
-                    self.preferences.bind(new_sid, selected_model)
-                except ValueError as exc:
-                    with self.lock:
-                        job["preference_error"] = str(exc)
-            with self.lock:
-                completed = self._job_public(job)
-                self.forking.discard(parent.id)
-            print(f"[fork] job {completed['id']} {completed['status']} "
-                  f"新会话={new_sid}", flush=True)
-            try:
-                self.emit(parent, "session_forked", {
-                    "job": completed["id"], "from": parent.id,
-                    "session": completed.get("session") or new_sid,
-                    "status": completed["status"], "error": completed["error"],
-                    "preference_error": completed.get("preference_error")})
-            except Exception:
-                pass
-
     def _send_message_locked(self, sid, text, force=False, model=UNSET):
         """给会话发消息；model 是该会话后续发送的模型覆盖。"""
         try:
             selected = validate_model(self.preferences.get(sid) if model is UNSET else model)
         except ValueError as e:
             return 400, {"error": str(e)}
-        with self.lock:
-            if sid in self.forking:
-                return 409, {"error": "会话正在分叉，请等分叉完成后再发送"}
         h = self.hosted_by_sid.get(sid)
         if h and h.needs_rehost and h.status != "exited":
             return 409, {"error": "项目 local 配置已更改；请退出托管后重新托管以加载新配置"}
@@ -730,8 +640,6 @@ class Monitor:
                 return 409, {"error": "session is already hosted", "hosted_id": old.hid}
             if resume_id and resume_id in self.busy:
                 return 409, {"error": "a remote message is already running for this session"}
-            if resume_id and resume_id in self.forking:
-                return 409, {"error": "session is forking; wait for it to finish"}
             cwd = cwd or (sess.cwd if sess else None)
             if not cwd or not os.path.isdir(cwd):
                 return 400, {"error": f"cwd unavailable: {cwd}"}

@@ -9,14 +9,19 @@ const html = fs.readFileSync(path.join(__dirname, '../templates/index.html'), 'u
 const source = html.match(/<script>([\s\S]*?)<\/script>/)[1].replace(/\r\n/g, '\n')
   .replace(/\{\{ refresh_interval \| round\(3\) \}\}/, '3')
   .replace(/\nload\(\);\nresetTimer\(\);/, '\n');
+function makeClassList(){
+  const classes = new Set();
+  return {add(...names){names.forEach(n=>classes.add(n));}, remove(...names){names.forEach(n=>classes.delete(n));},
+    toggle(name, force){(force===undefined ? !classes.has(name) : force) ? classes.add(name) : classes.delete(name);},
+    contains(name){return classes.has(name);}};
+}
 function boot(fetch = async () => { throw Error('unexpected fetch'); }, windowExtra = {}) {
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {value:'', checked:false, textContent:'', innerHTML:'', disabled:false,
       dataset:{}, style:{}, options:[], querySelectorAll(){return [];}, appendChild(option){this.options.push(option);}, replaceChildren(){this.options=[];},
-      classList:(classes => ({add(...names){names.forEach(n=>classes.add(n));}, remove(...names){names.forEach(n=>classes.delete(n));},
-        toggle(name, force){(force===undefined ? !classes.has(name) : force) ? classes.add(name) : classes.delete(name);},
-        contains(name){return classes.has(name);}}))(new Set()), listeners:{},
+      setAttribute(name, value){this.dataset['attr_' + String(name).replace(/-/g,'_')] = String(value);},
+      classList:makeClassList(), listeners:{},
       addEventListener(type, listener){(this.listeners[type] ||= []).push(listener);},
       dispatchEvent(event){this['on'+event.type]?.(event); for(const listener of this.listeners[event.type] || []) listener(event);},
       click(){this.clickCount=(this.clickCount || 0)+1; if(this.onclick) this.onclick();}});
@@ -38,6 +43,7 @@ function boot(fetch = async () => { throw Error('unexpected fetch'); }, windowEx
       getElementById:node,
       createElement:tag=>({tagName:tag.toUpperCase(), value:'', textContent:'', dataset:{}}),
       addEventListener(type, listener){(documentListeners[type] ||= []).push(listener);},
+      body:{classList:makeClassList()},
     }, window:{confirm:()=>true, location, history, ...windowExtra},
     localStorage:{getItem(){return null;}}, fetch, AbortController, setTimeout, clearTimeout,
     setInterval(){}, clearInterval(){}, console});
@@ -1729,7 +1735,7 @@ test('待处理：精确route、跨项目归档汇总、返回与零入口', asy
  b.node('main').dispatchEvent({type:'click',target:{closest:selector=>selector==='.scard'?{dataset:{id:'b'}}:null}}); await flush();
  assert.equal(b.run('view.project'),'/q'); assert.equal(b.run('view.session'),'b');
  b.location.pathname='/pending'; b.run('onPopState(); sessions=[]; renderMain()');
- assert.match(b.node('main').innerHTML,/暂无待处理事项/); assert.match(b.node('projs').innerHTML,/pendingnav/); assert.equal(b.node('pendingbadge').style.display,'inline-block');
+ assert.match(b.node('main').innerHTML,/暂无待处理事项/); assert.equal(b.node('pendingbadge').style.display,'inline-block');
 });
 
 test('托管列表：精确route、按项目分组、进入会话与空态', async () => {
@@ -2297,6 +2303,78 @@ test('发送框自动隐藏的样式与事件逻辑已移除', () => {
   assert.match(html, /main\.convview \.composer\{flex:none;margin:10px 18px 12px\}/);
 });
 
+test('沉浸模式：会话头按钮切换、仅会话视图生效、偏好跨视图保留', async () => {
+  const b=boot(async url => {
+    if(url === '/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',
+      tokens:{},tool_uses:{},subagents:[],tasks:[]});
+    if(url.startsWith('/sessions/sid/messages')) return response({messages:[],total:0,end:0,size:0});
+    return response({});
+  });
+  await b.run('view={project:"/project",session:"sid",new:false}; renderConversation("sid",true)');
+  const zenBtn=b.node('zenbtn');
+  assert.ok(zenBtn, '会话头渲染沉浸按钮');
+  assert.match(b.node('main').innerHTML, /id="zenbtn"[^>]*aria-pressed="false"/);
+  // 会话视图（main 带 convview）里开启：body 进入沉浸态并标记会话视图
+  b.node('main').classList.add('convview');
+  zenBtn.click();
+  assert.equal(zenBtn.dataset.attr_aria_pressed, 'true');
+  assert.ok(zenBtn.classList.contains('on'));
+  assert.ok(b.context.document.body.classList.contains('zen'), '会话视图开启沉浸');
+  assert.ok(b.context.document.body.classList.contains('insession'));
+  // 离开会话视图（renderMain 摘掉 convview 后 applyZen）：沉浸态解除、偏好保留
+  b.node('main').classList.remove('convview');
+  b.run('applyZen()');
+  assert.equal(b.context.document.body.classList.contains('zen'), false);
+  assert.equal(b.context.document.body.classList.contains('insession'), false);
+  assert.equal(b.run('zenPref'), true, '偏好不随离开会话重置');
+  // 再次经 renderMain 进入会话视图：沉浸按偏好自动恢复
+  b.run('view={project:null,session:"sid",pending:false,hosted:false}; renderMain()');
+  assert.ok(b.node('main').classList.contains('convview'));
+  assert.ok(b.context.document.body.classList.contains('zen'), '重回会话视图恢复沉浸');
+});
+
+test('token 概览临时退出沉浸：偏好保留、刷新不强回、重进恢复', async () => {
+  const b=boot(async url => {
+    if(url === '/sessions/sid') return response({id:'sid',cwd:'/project',state:'idle',
+      tokens:{},tool_uses:{},subagents:[],tasks:[]});
+    if(url.startsWith('/sessions/sid/messages')) return response({messages:[],total:0,end:0,size:0});
+    return response({});
+  });
+  await b.run('view={project:"/project",session:"sid",new:false}; renderConversation("sid",true)');
+  b.node('main').classList.add('convview');
+  b.run('setZen(true)');
+  assert.ok(b.context.document.body.classList.contains('zen'));
+  // 点击 token chip 看概览：临时退出沉浸，偏好不动、按钮随视觉态熄灭
+  b.node('tokchip').click();
+  assert.equal(b.context.document.body.classList.contains('zen'), false, '临时退出沉浸');
+  assert.equal(b.run('zenPref'), true, '点击概览不清除偏好');
+  assert.equal(b.node('zenbtn').dataset.attr_aria_pressed, 'false');
+  // 轮询刷新（renderMain→applyZen）不得把临时退出翻回沉浸
+  b.run('applyZen()');
+  assert.equal(b.context.document.body.classList.contains('zen'), false, '刷新不强制恢复沉浸');
+  // 离开会话视图再回来：临时退出失效，按偏好恢复沉浸
+  b.node('main').classList.remove('convview');
+  b.run('applyZen()');
+  b.node('main').classList.add('convview');
+  b.run('applyZen()');
+  assert.ok(b.context.document.body.classList.contains('zen'), '重进会话视图按偏好恢复沉浸');
+  // 沉浸中手动点 ⛶ 关闭：落盘偏好
+  b.node('zenbtn').click();
+  assert.equal(b.context.document.body.classList.contains('zen'), false);
+  assert.equal(b.run('zenPref'), false, '手动关闭落盘');
+});
+
+test('输入框自动增高上限：窄屏 25% 视口、桌面 40%', () => {
+  for(const [narrow, expected] of [[true, 200], [false, 320]]){
+    const b=boot(async () => response({}), {matchMedia:() => ({matches:narrow})});
+    b.context.window.innerHeight = 800;
+    const box=b.node('msgbox');
+    box.scrollHeight = 99999;
+    b.run('autosizeComposer(document.getElementById("msgbox"))');
+    assert.equal(box.style.height, expected + 'px', (narrow ? '窄屏' : '桌面') + '上限');
+  }
+});
+
 for(const [device, narrow, navigator] of [
   ['移动端', true, {userAgent:'Android'}],
   ['iPhone', true, {userAgent:'iPhone'}],
@@ -2436,28 +2514,6 @@ test('工具/子代理状态变化会进入分组签名，缓存节点不会停�
   assert.equal(b.run('convGroupSig(' + textGroup + ')'), before, '无状态依赖的文本组不因详情变化重绘');
 });
 
-test('分叉状态不会被轮询的 updateSendSt 清空，并在查询失败时标为未知', async () => {
-  const b = boot(async (url) => {
-    if(url === '/sessions/sid/fork')
-      return {ok:true, status:202, json:async()=>({job_id:'fj', status:'running'})};
-    if(url === '/jobs/fj') throw Error('network down');
-    throw Error('unexpected fetch ' + url);
-  });
-  b.context.setTimeout = (fn) => { fn(); return 1; };
-  b.run('view={project:"/p",session:"sid",new:false}; curPanel={type:"conv",key:"sid"}');
-  b.node('msgbox').value = 'fork text';
-  b.run('modelDraft("sid", null)');
-  const running = b.run('forkSession("sid")');
-  b.run('updateSendSt("sid")');
-  assert.match(b.node('sendst').textContent, /正在分叉/);
-  assert.equal(b.node('sendbtn').disabled, true);
-  assert.equal(b.node('forkbtn').disabled, true);
-  await running;
-  assert.match(b.node('sendst').textContent, /状态查询失败/);
-  assert.doesNotMatch(b.node('sendst').textContent, /^分叉失败/);
-  assert.equal(b.run('forkBusy("sid")'), true);
-});
-
 test('visualViewport 只在未缩放且差值足够大时才缩短 body', () => {
   const b = boot();
   const writes = [];
@@ -2538,22 +2594,4 @@ test('限流 chip 只显示警告/拒绝且过期隐藏', () => {
   assert.equal(b.run('rateLimitChip({hosted_rate_limit:{status:"allowed"}})'), "");
   assert.equal(b.run('rateLimitChip({hosted_rate_limit:{status:"rejected",resets_at:1}})'), "");
   assert.equal(b.run('rateLimitChip({})'), "");
-});
-
-test('分叉完成但扫描未就绪时留在父会话并提示刷新', async () => {
-  const b = boot(async (url) => {
-    if(url === '/sessions/sid/fork')
-      return {ok:true, status:202, json:async()=>({job_id:'fj'})};
-    if(url === '/jobs/fj')
-      return response({status:'done', result_session_id:'new-sid', session:'new-sid'});
-    throw Error('unexpected fetch ' + url);
-  });
-  b.context.setTimeout = (fn) => { fn(); return 1; };
-  b.run('view={project:"/p",session:"sid",new:false}; curPanel={type:"conv",key:"sid"}; waitForSession=async () => false');
-  b.node('msgbox').value = 'fork text';
-  b.run('modelDraft("sid", null)');
-  await b.run('forkSession("sid")');
-  assert.equal(b.run('view.session'), 'sid', '不跳转到尚未扫描的会话');
-  assert.match(b.node('sendst').textContent, /扫描尚未完成/);
-  assert.equal(b.run('forkBusy("sid")'), false);
 });
