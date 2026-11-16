@@ -2626,3 +2626,33 @@ test('限流 chip 只显示警告/拒绝且过期隐藏', () => {
   assert.equal(b.run('rateLimitChip({hosted_rate_limit:{status:"rejected",resets_at:1}})'), "");
   assert.equal(b.run('rateLimitChip({})'), "");
 });
+
+test("文件预览链接解析纯函数", () => {
+  const b = boot();
+  assert.equal(b.run('normLocalPath("F:\\\\a\\\\./b/../c//d/")'), "F:/a/c/d");
+  assert.equal(b.run('normLocalPath("//srv/share/x/")'), "//srv/share/x");
+  const cwd = "F:/code/proj";
+  assert.equal(b.run(`localPathFromHref("docs/s/x.md", "${cwd}")`), "F:/code/proj/docs/s/x.md");
+  assert.equal(b.run(`localPathFromHref("../x.md", "${cwd}")`), "F:/code/x.md");
+  assert.equal(b.run(`localPathFromHref("F:\\\\code\\\\x.md", "${cwd}")`), "F:/code/x.md");
+  assert.equal(b.run(`localPathFromHref("file:///F:/code/x.md", "${cwd}")`), "F:/code/x.md");
+  assert.equal(b.run(`localPathFromHref("https://a.b/c", "${cwd}")`), null);
+  assert.equal(b.run(`localPathFromHref("#anchor", "${cwd}")`), null);
+  assert.equal(b.run(`localPathFromHref("//cdn.example/x", "${cwd}")`), null);
+  assert.equal(b.run(`localPathFromHref("中文 文档.md", "${cwd}")`), "F:/code/proj/中文 文档.md");
+  assert.equal(b.run(`localPathFromHref("a%20b.md", "${cwd}")`), "F:/code/proj/a b.md");
+  const enc = encodeURIComponent("F:/code/proj/docs/a/b.md");
+  assert.equal(b.run('routeFileUrl([{cwd:"F:/code/proj"}], "F:/code/proj/s/docs/a/b.md")'),
+    "/view?path=" + enc);
+  assert.equal(b.run('routeFileUrl([{cwd:"F:/code/proj"}], "F:/code/proj/docs/a/b.md")'), null);
+  assert.equal(b.run('routeFileUrl([{cwd:"F:/code/proj"}], "F:/other/s/x.md")'), null);
+  assert.equal(b.run('routeFileUrl([{cwd:"F:/code/proj"}], "F:/code/proj/s/")'), null);
+});
+
+test("looksLikeFileName 区分文件名与会话 ID", () => {
+  const b = boot();
+  assert.equal(b.run('looksLikeFileName("README.md")'), true);
+  assert.equal(b.run('looksLikeFileName("spec.V2.MD")'), true);
+  assert.equal(b.run('looksLikeFileName("a1b2c3d4-5678-90ab-cdef-1234567890ab")'), false);
+  assert.equal(b.run('looksLikeFileName("parent::agent-abc123")'), false);
+});

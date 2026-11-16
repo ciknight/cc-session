@@ -68,19 +68,24 @@ img{max-width:100%;border-radius:8px}
   }
   function normLocalPath(p){
     p = String(p).replace(/\\/g, "/");
-    var uncles = p.slice(0, 2) === "//";
+    var unc = p.slice(0, 2) === "//";
     var parts = p.split("/"), out = [];
     for(var i = 0; i < parts.length; i++){
       var seg = parts[i];
       if(!seg || seg === ".") continue;
-      if(seg === ".."){ if(out.length && out[out.length - 1] !== "..") out.pop(); continue; }
+      if(seg === ".."){
+        var top = out[out.length - 1];
+        if(out.length && top !== ".." && !/^[A-Za-z]:$/.test(top)) out.pop();
+        continue;
+      }
       out.push(seg);
     }
-    p = out.join("/");
-    return (uncles ? "//" : "") + p;
+    return (unc ? "//" : "") + out.join("/");
   }
   function localPathFromHref(href, baseDir){
     if(!href || href.charAt(0) === "#") return null;
+    if(/^[a-z]:([\\/]|$)/i.test(href))   // 盘符路径要先于 scheme 判定（F: 会被当成单字母协议）
+      return normLocalPath(href);
     var m = /^([a-z][a-z0-9+.-]*):/i.exec(href);
     if(m){
       if(m[1].toLowerCase() !== "file") return null;

@@ -783,6 +783,62 @@ function decSeg(s){
 function normPath(p){
   return String(p == null ? "" : p).replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
 }
+
+/* ---------- 本地文件链接 → /view 预览 ---------- */
+// 词法归一本地路径：反斜杠→/，折叠 ./ ../ 与重复斜杠（保留 UNC 前导 //），去尾斜杠；
+// 盘符是 Windows 路径的根，.. 不能越过它
+function normLocalPath(p){
+  p = String(p).replace(/\\/g, "/");
+  const unc = p.slice(0, 2) === "//";
+  const out = [];
+  for(const seg of p.split("/")){
+    if(!seg || seg === ".") continue;
+    if(seg === ".."){
+      const top = out[out.length - 1];
+      if(out.length && top !== ".." && !/^[A-Za-z]:$/.test(top)) out.pop();
+      continue;
+    }
+    out.push(seg);
+  }
+  return (unc ? "//" : "") + out.join("/");
+}
+function decodeMaybe(s){
+  try{ return decodeURIComponent(s); }catch(e){ return s; }
+}
+// 把消息里的 <a href> 解析成本地绝对路径；非本地路径（http/锚点/协议相对）返回 null。
+// md 链接里的 %20 等百分号转义还原成真实文件名
+function localPathFromHref(href, cwd){
+  if(!href || href.charAt(0) === "#") return null;
+  if(/^[a-z]:([\\/]|$)/i.test(href))   // 盘符路径要先于 scheme 判定（F: 会被当成单字母协议）
+    return normLocalPath(href);
+  const m = /^([a-z][a-z0-9+.-]*):/i.exec(href);
+  if(m){
+    if(m[1].toLowerCase() !== "file") return null;
+    return normLocalPath(decodeMaybe(href.replace(/^file:\/{2,3}/i, "")));
+  }
+  if(href.slice(0, 2) === "//") return null;
+  return normLocalPath(cwd + "/" + decodeMaybe(href));
+}
+function viewFileUrl(p){ return "/view?path=" + encodeURIComponent(p); }
+// 遗留错误 URL 兜底：<已知项目>/s/<相对文件路径> 形态 → /view 预览链接
+function routeFileUrl(projects, full){
+  if(!full) return null;
+  const f = normPath(full);
+  for(const p of projects || []){
+    const base = normPath(p.cwd);
+    if(!base || f === base) continue;
+    if(f.startsWith(base + "/")){
+      const rest = f.slice(base.length + 1);
+      if(rest.startsWith("s/") && rest.length > 2)
+        return viewFileUrl(normLocalPath(base + "/" + rest.slice(2)));
+    }
+  }
+  return null;
+}
+// 会话 ID（UUID / parent::agent-hash）永不带点号；结尾带扩展名的路由段按文件处理
+function looksLikeFileName(s){
+  return /\.[A-Za-z0-9]{1,10}$/.test(String(s || ""));
+}
 function sameProject(a, b){ return !!a && !!b && normPath(a) === normPath(b); }
 function projectUrlPath(cwd){
   return normPath(cwd).split("/").filter(Boolean).map(encSeg).join("/");
