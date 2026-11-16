@@ -69,6 +69,11 @@ def make_handler(mon, refresh_interval):
             ).encode()
             self._raw(body, ctype="text/html; charset=utf-8")
 
+        def _preview(self):
+            # 预览壳不校验参数：文件是否存在由页面 JS 调 /file 呈现错误
+            body = _jinja.get_template("preview.html").render().encode()
+            self._raw(body, ctype="text/html; charset=utf-8")
+
         def do_GET(self):
             u = urlparse(self.path)
             if u.path == "/healthz":
@@ -94,6 +99,8 @@ def make_handler(mon, refresh_interval):
                 return self._json({"interactions": mon.pending_interactions(sid)})
             if u.path == "/file":
                 return self._file_endpoint(u)
+            if u.path == "/view":
+                return self._preview()
             if u.path in ("/", "/pending", "/hosted") or u.path.startswith("/p/"):
                 # /p/<项目>[/s/<会话>|/new] 都由前端路由裁决，服务端统一回模板
                 return self._index()

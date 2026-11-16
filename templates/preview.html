@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>文件预览</title>
+<script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--card:#f6f6f4;--card2:#efefec;--mut:#777;--bd:#e2e2de;--acc:#2563eb}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1b1a;--fg:#eee;--card:#262625;--card2:#2e2d2c;--mut:#999;--bd:#3a3a38;--acc:#60a5fa}}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.65 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 16px;
+       border-bottom:1px solid var(--bd);position:sticky;top:0;background:var(--bg);z-index:2}
+.pv-name{font-weight:600}
+.pv-chip{display:inline-block;padding:1px 8px;border-radius:10px;background:var(--card2);
+         font-size:12px;color:var(--mut);white-space:nowrap}
+.pv-path{color:var(--mut);font-size:12px;word-break:break-all;flex:1;min-width:200px}
+.pv-raw{color:var(--acc);text-decoration:none;white-space:nowrap}
+main{max-width:860px;margin:0 auto;padding:20px 16px 60px}
+a{color:var(--acc)}
+pre{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px;margin:0;
+    overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+img{max-width:100%;border-radius:8px}
+.md h1,.md h2,.md h3,.md h4{line-height:1.3;margin:1.2em 0 .5em}
+.md h1{font-size:1.55em}.md h2{font-size:1.3em}.md h3{font-size:1.12em}
+.md code{background:var(--card2);padding:1px 5px;border-radius:4px;font:12.5px/1.5 ui-monospace,Consolas,monospace}
+.md pre{padding:10px 12px}.md pre code{background:none;padding:0}
+.md table{border-collapse:collapse;margin:.6em 0}
+.md td,.md th{border:1px solid var(--bd);padding:4px 10px}
+.md blockquote{margin:.6em 0;padding:2px 12px;border-left:3px solid var(--bd);color:var(--mut)}
+.md hr{border:none;border-top:1px solid var(--bd)}
+.pv-err{color:var(--mut);text-align:center;margin-top:15vh}
+.pv-bin{border:1px dashed var(--bd);border-radius:8px;padding:20px;text-align:center;color:var(--mut)}
+</style>
+</head>
+<body class="pv-shell">
+<header id="pv-head" hidden>
+  <span class="pv-name" id="pv-name"></span>
+  <span class="pv-chip" id="pv-chip"></span>
+  <span class="pv-path" id="pv-path"></span>
+  <a class="pv-raw" id="pv-raw" href="#" target="_blank" rel="noopener">原始内容</a>
+</header>
+<main id="pv-main"><p class="pv-err">加载中…</p></main>
+<script>
+(function(){
+  var qs = new URLSearchParams(location.search);
+  var path = qs.get("path") || "";
+  var fileUrl = "/file?path=" + encodeURIComponent(path);
+  var KIND_ZH = {markdown: "Markdown", text: "文本", image: "图片", binary: "二进制"};
+  var main = document.getElementById("pv-main");
+
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+  function human(n){
+    if(n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+    if(n >= 1024) return (n / 1024).toFixed(1) + " KB";
+    return n + " B";
+  }
+  function showErr(msg){
+    main.innerHTML = '<p class="pv-err">' + esc(msg) + "</p>";
+  }
+
+  /* 与主 SPA 的 localPathFromHref 语义一致；预览页独立实现，不引主脚本 */
+  function decodeMaybe(s){
+    try{ return decodeURIComponent(s); }catch(e){ return s; }
+  }
+  function normLocalPath(p){
+    p = String(p).replace(/\\/g, "/");
+    var uncles = p.slice(0, 2) === "//";
+    var parts = p.split("/"), out = [];
+    for(var i = 0; i < parts.length; i++){
+      var seg = parts[i];
+      if(!seg || seg === ".") continue;
+      if(seg === ".."){ if(out.length && out[out.length - 1] !== "..") out.pop(); continue; }
+      out.push(seg);
+    }
+    p = out.join("/");
+    return (uncles ? "//" : "") + p;
+  }
+  function localPathFromHref(href, baseDir){
+    if(!href || href.charAt(0) === "#") return null;
+    var m = /^([a-z][a-z0-9+.-]*):/i.exec(href);
+    if(m){
+      if(m[1].toLowerCase() !== "file") return null;
+      return normLocalPath(decodeMaybe(href.replace(/^file:\/{2,3}/i, "")));
+    }
+    if(href.slice(0, 2) === "//") return null;
+    return normLocalPath(baseDir + "/" + decodeMaybe(href));
+  }
+  function rewriteLinks(root, baseDir){
+    var links = root.querySelectorAll ? root.querySelectorAll("a[href]") : [];
+    for(var i = 0; i < links.length; i++){
+      var a = links[i], p = localPathFromHref(a.getAttribute("href"), baseDir);
+      if(p){
+        a.setAttribute("href", "/view?path=" + encodeURIComponent(p));
+        a.setAttribute("target", "_blank");
+        a.setAttribute("rel", "noopener");
+      }
+    }
+  }
+
+  function renderHead(meta){
+    var head = document.getElementById("pv-head");
+    head.hidden = false;
+    document.title = meta.name + " · 文件预览";
+    document.getElementById("pv-name").textContent = meta.name;
+    var chip = document.getElementById("pv-chip");
+    chip.textContent = (KIND_ZH[meta.kind] || meta.kind) + " · " + human(meta.size);
+    document.getElementById("pv-path").textContent = meta.path;
+    var raw = document.getElementById("pv-raw");
+    raw.href = fileUrl;
+    if(meta.kind === "binary") raw.textContent = "下载";
+  }
+
+  function render(meta){
+    renderHead(meta);
+    var baseDir = meta.path.replace(/[\\/][^\\/]*$/, "");
+    if(meta.kind === "image"){
+      main.innerHTML = '<img alt="' + esc(meta.name) + '" src="' + esc(fileUrl) + '">';
+      return;
+    }
+    if(meta.kind === "binary"){
+      main.innerHTML = '<div class="pv-bin">该文件类型暂不支持在线预览（' + human(meta.size)
+        + '）。<a href="' + esc(fileUrl) + '" target="_blank" rel="noopener">下载原始文件</a></div>';
+      return;
+    }
+    fetch(fileUrl).then(function(r){
+      if(!r.ok) throw Error("HTTP " + r.status);
+      return r.text();
+    }).then(function(text){
+      if(meta.kind === "markdown" && window.marked){
+        var html = window.DOMPurify ? DOMPurify.sanitize(marked.parse(text)) : marked.parse(text);
+        main.innerHTML = '<div class="md">' + html + "</div>";
+        rewriteLinks(main, baseDir);
+      }else{
+        main.innerHTML = "<pre></pre>";
+        main.firstChild.textContent = text;
+      }
+    }).catch(function(e){ showErr("读取失败：" + e.message); });
+  }
+
+  if(!path){
+    showErr("缺少 path 参数");
+    return;
+  }
+  fetch(fileUrl + "&meta=1").then(function(r){
+    return r.json().then(function(j){ return {ok: r.ok, j: j}; });
+  }).then(function(res){
+    if(!res.ok || !res.j.ok){ showErr(res.j.error || ("HTTP " + res.status)); return; }
+    render(res.j);
+  }).catch(function(e){ showErr("连接失败：" + e.message); });
+})();
+</script>
+</body>
+</html>

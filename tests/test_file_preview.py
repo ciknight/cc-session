@@ -125,6 +125,16 @@ class FileEndpointTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 400)
         self.assertFalse(json.load(ctx.exception)["ok"])
 
+    def test_view_预览壳(self):
+        for q in ("", "?path=" + urllib.parse.quote(str(self.root / "doc.md"))):
+            r = self.get("/view" + q)
+            self.assertEqual(r.status, 200)
+            self.assertTrue(r.headers["Content-Type"].startswith("text/html"))
+            body = r.read().decode("utf-8")
+            self.assertIn("pv-shell", body)
+            self.assertIn("marked.min.js", body)
+            self.assertIn("purify.min.js", body)
+
 
 if __name__ == "__main__":
     unittest.main()
