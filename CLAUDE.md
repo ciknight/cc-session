@@ -35,7 +35,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - `http_api.py` — `make_handler`：REST/SSE/hook 回调/静态资源
 - `interactions.py` — `Interaction` 与审批预览；`system.py` — 系统采样、电源与推迟睡眠；
   `orphans.py` — 托管残留进程观察；`commands.py` — slash 命令扫描；
-  `fileview.py` — 文件预览的分类与文本解码（utf-8→gb18030 回退）；
+  `fileview.py` — 文件预览的分类与文本解码（BOM/UTF-16 启发 → utf-8 → gb18030 回退）；
   `util.py` — 纯工具函数；`config.py` — 路径与可调常量；
   `hook.py` — hook 客户端；`app.py` — CLI 入口与完整用法文档
 

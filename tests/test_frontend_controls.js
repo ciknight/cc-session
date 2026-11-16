@@ -2656,3 +2656,23 @@ test("looksLikeFileName 区分文件名与会话 ID", () => {
   assert.equal(b.run('looksLikeFileName("a1b2c3d4-5678-90ab-cdef-1234567890ab")'), false);
   assert.equal(b.run('looksLikeFileName("parent::agent-abc123")'), false);
 });
+
+test("单段文件判定不劫持已知会话，未知点号段仍跳预览", () => {
+  const b = boot();
+  const enc = encodeURIComponent("F:/p/notes.md");
+  b.run('sessions=[{id:"notes.md"}]; view={project:"F:/p",session:"notes.md",new:false}');
+  assert.equal(b.run('sessionFileRedirectUrl("notes.md")'), null);
+  b.run('sessions=[]');
+  assert.equal(b.run('sessionFileRedirectUrl("notes.md")'), "/view?path=" + enc);
+  assert.equal(b.run('sessionFileRedirectUrl("a1b2c3d4-5678-90ab-cdef-1234567890ab")'), null);
+});
+
+test("空项目列表不吞掉 URL 里的项目信息（等数据到达再解析）", () => {
+  const b = boot();
+  b.run('view={project:"F:/a",session:null,new:false,fullProject:"F:/a/s/docs/x.md"}; resolveViewProject([])');
+  assert.equal(b.run('view.fullProject'), "F:/a/s/docs/x.md");
+  b.run('resolveViewProject([{cwd:"F:/b"}])');
+  assert.equal(b.run('view.fullProject'), undefined);
+  b.run('resolveViewProject([{cwd:"F:/a"}])');
+  assert.equal(b.run('view.project'), "F:/a");
+});

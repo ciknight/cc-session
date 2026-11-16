@@ -839,6 +839,13 @@ function routeFileUrl(projects, full){
 function looksLikeFileName(s){
   return /\.[A-Za-z0-9]{1,10}$/.test(String(s || ""));
 }
+// /s/README.md 这类单段文件 URL（根目录文件链接被浏览器解析而成）→ 预览链接；
+// 已加载会话列表里的 id 绝不劫持——自定义点号 session id（--session-id）也在保护之列
+function sessionFileRedirectUrl(sid){
+  if(!view || !view.project || !looksLikeFileName(sid)) return null;
+  if(sessions.some(s => s && s.id === sid)) return null;
+  return viewFileUrl(normLocalPath(view.project + "/" + sid));
+}
 // 消息组节点内的本地文件链接重写为 /view 预览、新标签打开；
 // 用 getAttribute 取原始 href（浏览器属性会解析成绝对 URL），无 DOM 原语的环境静默跳过
 function rewriteConvLinks(node, cwd){
@@ -891,6 +898,7 @@ function parseRoute(pathname){
 // 把 URL 中的可读路径映射回系统原生 cwd；同时处理 "项目目录名恰好是 new" 的歧义
 function resolveViewProject(projects){
   if(!view) return;
+  if(!projects.length) return;   // 数据未到（刚启动的空快照）：保留 URL 里的项目信息等下一轮
   if(view.fullProject){
     const exact = projects.find(p => sameProject(p.cwd, view.fullProject));
     if(exact){
@@ -3230,18 +3238,17 @@ function renderMain(){
   if(view.pending){ renderPendingList(); return; }
   if(view.hosted){ renderHostedList(); return; }
   if(view.session){
-    // 会话 ID（UUID / parent::agent-hash）永不带点号：/s/README.md 这类单段
-    // 文件 URL（根目录文件链接被浏览器解析而成）同步判定直接跳预览，零探测请求
-    if(view.project && looksLikeFileName(view.session) && location.replace)
-      return location.replace(viewFileUrl(normLocalPath(view.project + "/" + view.session)));
+    // 单段文件 URL 同步判定直接跳预览，零探测请求；已知会话不被劫持
+    const su = sessionFileRedirectUrl(view.session);
+    if(su && location.replace) return location.replace(su);
     syncUrl(view, true);   // 旧格式编码地址自动规整成可读路径
     renderConversation(view.session, false);
     return;
   }
-  if(!view.project || !projects.some(p => p.cwd === view.project))
-    // 侧栏固定排序后，初次进入仍默认选中最近活跃的项目
-    view.project = projects.length
-      ? projects.reduce((a, b) => b.last > a.last ? b : a).cwd : null;
+  if(projects.length && (!view.project || !projects.some(p => p.cwd === view.project)))
+    // 侧栏固定排序后，初次进入仍默认选中最近活跃的项目；
+    // 数据未到（刚启动的空快照）不选默认，保留 URL 信息等下一轮解析
+    view.project = projects.reduce((a, b) => b.last > a.last ? b : a).cwd;
   if(view.project) syncUrl(view, true);   // 默认项目解析后用 replace 落地址，不新增历史记录
   renderSidebar(projects);   // 更新 active 高亮
   const p = projects.find(x => x.cwd === view.project);
