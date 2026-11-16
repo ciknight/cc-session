@@ -151,7 +151,7 @@ img{max-width:100%;border-radius:8px}
     return;
   }
   fetch(fileUrl + "&meta=1").then(function(r){
-    return r.json().then(function(j){ return {ok: r.ok, j: j}; });
+    return r.json().then(function(j){ return {ok: r.ok, status: r.status, j: j}; });
   }).then(function(res){
     if(!res.ok || !res.j.ok){ showErr(res.j.error || ("HTTP " + res.status)); return; }
     render(res.j);
