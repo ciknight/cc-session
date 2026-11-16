@@ -31,6 +31,10 @@ HTTP_IMAGE_BODY_LIMIT = 28 * 1024 * 1024
 # 非托管会话的一次性消息排队上限；超出后返回 429
 REMOTE_QUEUE_LIMIT = 32
 
+# 文件在线预览：文本截断到该字符数（内容模式只读头部字节），图片超限拒绝
+PREVIEW_TEXT_CHARS = 2_000_000
+PREVIEW_IMAGE_LIMIT = 32 * 1024 * 1024
+
 # 对话解析缓存最多保留的转录文件数（LRU）；同时限制估算 payload 总字节，
 # 图片 base64 较大时优先淘汰最久未用且无活动请求的缓存
 MSG_CACHE_SESSION_LIMIT = 8

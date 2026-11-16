@@ -8,14 +8,14 @@ import threading
 from collections import Counter
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from session_preferences import UNSET, validate_metadata_patch
 from cc_switch import SwitchError
 
-from . import config, system, util
+from . import config, fileview, system, util
 from .commands import scan_slash_commands
 from .interactions import Interaction
 from .transcript import _align_line_start, _parse_message_chunk, _absorb_orphan_tool_parts
@@ -92,6 +92,8 @@ def make_handler(mon, refresh_interval):
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
                 return self._json({"interactions": mon.pending_interactions(sid)})
+            if u.path == "/file":
+                return self._file_endpoint(u)
             if u.path in ("/", "/pending", "/hosted") or u.path.startswith("/p/"):
                 # /p/<项目>[/s/<会话>|/new] 都由前端路由裁决，服务端统一回模板
                 return self._index()
@@ -563,6 +565,54 @@ def make_handler(mon, refresh_interval):
                 h.stop(kill=parse_qs(u.query).get("kill", ["0"])[0] in ("1", "true"))
                 return self._json(h.info())
             self._json({"error": "not found"}, 404)
+
+        def _file_endpoint(self, u):
+            # /file?path=<绝对路径>[&meta=1]：预览页内容/元信息与会话链接共用。
+            # query 里的 + 会被 parse_qs 当成空格，文件名可能真含 +，先保护回来
+            qs = parse_qs(u.query.replace("+", "%2B"), keep_blank_values=True)
+            raw = (qs.get("path") or [""])[0]
+            if not raw:
+                return self._json({"ok": False, "error": "缺少 path 参数"}, 400)
+            fp = Path(raw)
+            if not fp.is_absolute():
+                return self._json({"ok": False, "error": "path 必须是绝对路径"}, 400)
+            fp = fp.resolve()
+            if not fp.exists():
+                return self._json({"ok": False, "error": "文件不存在"}, 404)
+            if not fp.is_file():
+                return self._json({"ok": False, "error": "path 不是普通文件"}, 400)
+            kind = fileview.classify_file(fp)
+            size = fp.stat().st_size
+            if qs.get("meta", ["0"])[0] in ("1", "true"):
+                return self._json({"ok": True, "path": str(fp), "name": fp.name,
+                                   "size": size, "kind": kind})
+            if kind == "image":
+                if size > config.PREVIEW_IMAGE_LIMIT:
+                    return self._json({"ok": False, "error": "图片超过预览大小上限"}, 413)
+                ctype = fileview.IMAGE_TYPES.get(fp.suffix.lower(), "application/octet-stream")
+                return self._raw(fp.read_bytes(), ctype=ctype)
+            if kind in ("markdown", "text"):
+                # 只读头部：几十 MB 的日志也不能整读进内存
+                with open(fp, "rb") as f:
+                    data = f.read(fileview.TEXT_HEAD_BYTES)
+                text = fileview.decode_text(data)
+                if len(text) > config.PREVIEW_TEXT_CHARS:
+                    text = text[:config.PREVIEW_TEXT_CHARS] + \
+                        f"\n\n[已截断：原文件 {size} 字节，完整内容请用「原始内容」下载]"
+                return self._raw(text.encode("utf-8"), ctype="text/plain; charset=utf-8")
+            # 二进制：流式下发并作为附件下载，不整读大文件
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition",
+                             "attachment; filename*=UTF-8''" + quote(fp.name))
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(fp, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
 
         def _static(self, name):
             # 防目录穿越，只允许 static 目录下的普通文件
