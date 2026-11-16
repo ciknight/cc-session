@@ -45,7 +45,21 @@ def classify_file(path: Path) -> str:
 
 
 def decode_text(data: bytes) -> str:
-    """utf-8 严格 → gb18030 严格 → utf-8 替换，中文 Windows 文件常见 GBK 编码。"""
+    """BOM/UTF-16 启发 → utf-8 严格 → gb18030 严格 → utf-8 替换。
+
+    中文 Windows 文本常见 GBK 编码；含 NUL 字节的"文本"几乎必是 UTF-16
+    （Windows 记事本带 BOM；无 BOM 时按 NUL 出现在奇/偶偏移猜 LE/BE）。"""
+    if data[:2] == b"\xff\xfe":
+        return data[2:].decode("utf-16-le", errors="replace")
+    if data[:2] == b"\xfe\xff":
+        return data[2:].decode("utf-16-be", errors="replace")
+    if b"\x00" in data:
+        zeros = [i % 2 for i, b in enumerate(data) if b == 0]
+        enc = "utf-16-le" if sum(zeros) >= len(zeros) - sum(zeros) else "utf-16-be"
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            pass   # 猜错或并非 UTF-16，回退常规链
     for enc in ("utf-8", "gb18030"):
         try:
             return data.decode(enc)

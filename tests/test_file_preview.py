@@ -52,6 +52,14 @@ class FileViewPureTests(unittest.TestCase):
         # 无法识别的字节不抛异常，替换为 U+FFFD
         self.assertIsInstance(fileview.decode_text(b"\xff\xfe\x00abc"), str)
 
+    def test_decode_utf16_bom与无bom启发(self):
+        # 带 BOM 的 UTF-16（Windows 记事本常见）
+        self.assertEqual(fileview.decode_text("中文doc".encode("utf-16")), "中文doc")
+        self.assertEqual(fileview.decode_text(b"\xfe\xff" + "中文doc".encode("utf-16-be")), "中文doc")
+        # 无 BOM 的 UTF-16：NUL 字节位置启发 LE/BE（ASCII 为主的文件）
+        self.assertEqual(fileview.decode_text("plain text".encode("utf-16-le")), "plain text")
+        self.assertEqual(fileview.decode_text("plain text".encode("utf-16-be")), "plain text")
+
 
 class FileEndpointTests(unittest.TestCase):
     """GET /file：meta 与内容两种模式（复用管理 API 测试的服务器搭法）。"""
