@@ -839,6 +839,19 @@ function routeFileUrl(projects, full){
 function looksLikeFileName(s){
   return /\.[A-Za-z0-9]{1,10}$/.test(String(s || ""));
 }
+// 消息组节点内的本地文件链接重写为 /view 预览、新标签打开；
+// 用 getAttribute 取原始 href（浏览器属性会解析成绝对 URL），无 DOM 原语的环境静默跳过
+function rewriteConvLinks(node, cwd){
+  if(!node || !cwd || !node.querySelectorAll) return;
+  for(const a of node.querySelectorAll("a[href]")){
+    const p = localPathFromHref(a.getAttribute("href"), cwd);
+    if(p){
+      a.setAttribute("href", viewFileUrl(p));
+      a.setAttribute("target", "_blank");
+      a.setAttribute("rel", "noopener");
+    }
+  }
+}
 function sameProject(a, b){ return !!a && !!b && normPath(a) === normPath(b); }
 function projectUrlPath(cwd){
   return normPath(cwd).split("/").filter(Boolean).map(encSeg).join("/");
@@ -2280,6 +2293,8 @@ function renderConvDom(el, groups, echoStr){
     if(!node){
       node = makeNodeFromHtml(convGroupHtml(g));
       node.__copyText = groupCopyText(g);
+      // AI 写的相对 md 链接按会话 cwd 翻译成本地路径，交给 /view 预览
+      rewriteConvLinks(node, (convState.detail || {}).cwd);
       convDom.nodes.set(sig, node);
     }
     wanted.push(node);
@@ -3202,6 +3217,12 @@ function renderMain(){
   applyZen();   // convview 切换后同步沉浸/会话视图标记（列表页自动退出沉浸）
   const projects = groupByProject();
   resolveViewProject(projects);
+  // 遗留错误 URL 兜底：项目路径形如 <已知项目>/s/<相对文件路径>（浏览器把消息里的
+  // 相对链接错误解析成的地址）时直接跳预览，不再当成项目渲染
+  if(!view.session && !view.pending && !view.hosted){
+    const vu = routeFileUrl(projects, view.fullProject || view.project);
+    if(vu && location.replace) return location.replace(vu);
+  }
   renderSidebar(projects);
   document.getElementById("total").textContent = `(${sessions.length})`;
   renderPendingBadge();
@@ -3209,6 +3230,10 @@ function renderMain(){
   if(view.pending){ renderPendingList(); return; }
   if(view.hosted){ renderHostedList(); return; }
   if(view.session){
+    // 会话 ID（UUID / parent::agent-hash）永不带点号：/s/README.md 这类单段
+    // 文件 URL（根目录文件链接被浏览器解析而成）同步判定直接跳预览，零探测请求
+    if(view.project && looksLikeFileName(view.session) && location.replace)
+      return location.replace(viewFileUrl(normLocalPath(view.project + "/" + view.session)));
     syncUrl(view, true);   // 旧格式编码地址自动规整成可读路径
     renderConversation(view.session, false);
     return;
