@@ -35,6 +35,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - `http_api.py` — `make_handler`：REST/SSE/hook 回调/静态资源
 - `interactions.py` — `Interaction` 与审批预览；`system.py` — 系统采样、电源与推迟睡眠；
   `orphans.py` — 托管残留进程观察；`commands.py` — slash 命令扫描；
+  `fileview.py` — 文件预览的分类与文本解码（utf-8→gb18030 回退）；
   `util.py` — 纯工具函数；`config.py` — 路径与可调常量；
   `hook.py` — hook 客户端；`app.py` — CLI 入口与完整用法文档
 
@@ -42,6 +43,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
 模块属性访问（`config.X` / `system.X` / `util.now_ts()`），测试 patch 对应模块属性即全局生效；
 其余纯函数自由 from import。根级另有扫描缓存 `scan_cache.py` + 会话偏好
 `session_preferences.py` + cc-switch 适配 `cc_switch.py` + Jinja 模板 `templates/index.html` +
+独立文件预览页 `templates/preview.html` +
 本地前端依赖 `static/marked.min.js`、`static/purify.min.js`（不依赖外网 CDN）。
 
 ### 数据流
@@ -67,6 +69,12 @@ uv run monitor.py --webhook http://localhost:3000/hook
 3. **HTTP 层**（`make_handler`，`ThreadingHTTPServer` + `BaseHTTPRequestHandler`）：
    `GET /` 渲染看板模板，`/sessions`、`/sessions/<id>`、`/sessions/<id>/messages` 返回 JSON，
    `/events` 是 SSE 流（连接先发 `snapshot`，随后推增量），`/static/` 提供静态文件。
+   `GET /view?path=<绝对路径>` 渲染独立预览页（`preview.html`：md 渲染/文本/图片，
+   页内相对链接按被预览文件所在目录继续跳 `/view`）；`GET /file?path=` 按类型返回
+   文件内容，`&meta=1` 只回元信息（`fileview.classify_file` 四类；文本截断
+   `config.PREVIEW_TEXT_CHARS`、只读头部字节，图片限 `config.PREVIEW_IMAGE_LIMIT`，
+   svg 按文本防同源脚本，二进制流式下发带附件头；query 里的 `+` 先还原成
+   `%2B` 再 parse_qs，文件名里的真实 `+` 不被吞成空格）。
    `/sessions/<id>/messages` 支持 `limit`（默认 100）、`before`、`from` 分页。
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
@@ -239,6 +247,13 @@ uv run monitor.py --webhook http://localhost:3000/hook
 对话用 marked + DOMPurify 渲染 markdown（用户气泡 / 助手 markdown / 可折叠工具结果与 diff），
 消息按连续角色分组渲染：`renderConvList` 按组内容签名复用未变化的 DOM 节点，
 markdown/DOMPurify 只处理新增或变化的组（无 DOM 原语的环境退回整段 HTML）。
+消息内 AI 写的文件链接在线预览：消息组 DOM 新建时 `rewriteConvLinks` 把无 scheme 的
+相对 href（含 `../`、盘符、`file:///`）按**会话 cwd** 解析成绝对路径
+（`localPathFromHref`，盘符先于 scheme 判定），重写为 `/view?path=` 新标签打开；
+浏览器错误解析出的遗留地址由 `renderMain` 兜底——`<已知项目>/s/<相对文件路径>` 多段
+形态走 `routeFileUrl`，`/s/README.md` 这类带扩展名单段按 `looksLikeFileName` 同步判定
+（会话 ID 均为 UUID / `parent::agent-hash`，永不带点号，零探测请求）直接跳预览。
+自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
 自动刷新间隔存在 localStorage，对话视图仅在文件 size 变化时重渲染并保持滚动位置。
 对话视图是聊天窗口布局（`main.convview` 纵向 flex，类由 `renderMain` 进入/离开会话视图时
 显式切换，不依赖 `:has()`）：固定头部单行（返回与标题同行，
