@@ -3,6 +3,7 @@
 数据来源:
   ~/.claude/projects/<项目>/<sessionId>.jsonl   会话转录，逐行追加
   ~/.claude/tasks/<sessionId>/*.json            任务清单（如果存在，作为补充）
+  ~/.claude/claude-sessions/prompt-templates.json 常用提示词模板（网页或手工维护）
 
 接口 (默认 http://127.0.0.1:8765):
   GET /                       网页看板：左侧项目列表，右侧会话列表/对话视图，自动刷新可开关
@@ -11,6 +12,9 @@
   GET /sessions/<id>/messages 按需解析对话；?limit=100&before=N 向前分页，?from=N 增量追加
   GET /interactions           待审批的权限请求（?session=<id> 可过滤）
   POST /interactions/<id>/respond 审批 {"behavior":"allow|deny","scope":"once|always"}
+  GET /prompt-templates       常用提示词模板列表
+  POST /prompt-templates      新建/更新模板 {"id"?: "...", "title": "...", "text": "..."}
+  DELETE /prompt-templates/<id> 删除模板
   POST /sessions/<id>/interrupt   中断托管会话当前回合并清空排队消息
   POST /sessions/<id>/approval    设置审批模式 {"approval":"ask|auto|full"}
   POST /sessions/<id>/effort      设置托管思考档位 {"effort":"low|medium|high|xhigh|max|default"}

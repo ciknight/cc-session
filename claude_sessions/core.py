@@ -32,6 +32,7 @@ from .transcript import (AGENT_ID_RE, classify_user_line, TASK_TOOL_USE_ID_RE,
                          _result_text)
 from .hosted import Hosted
 from .orphans import OrphanWatcher
+from .prompts import PromptTemplates
 
 
 class Monitor:
@@ -81,6 +82,8 @@ class Monitor:
         self.approvals = ApprovalPreferences(config.CLAUDE_DIR / "claude-sessions" / "approvals.json")
         self.efforts = EffortPreferences(config.CLAUDE_DIR / "claude-sessions" / "efforts.json")
         self.metadata = SessionMetadata(config.CLAUDE_DIR / "claude-sessions" / "session-metadata.json")
+        self.prompts = PromptTemplates(
+            config.CLAUDE_DIR / "claude-sessions" / "prompt-templates.json")
         self.cc_switch = CCSwitch(config.CLAUDE_DIR)
         # 子代理转录默认不扫描；需要时通过 --scan-subagents 或 include_subagents=1 加载
         self.scan_subagents = False

@@ -286,6 +286,25 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
 #syspop{position:fixed;z-index:200;width:min(90vw,340px);background:var(--bg);border:1px solid var(--bd);
   border-radius:8px;padding:10px 14px;box-shadow:0 8px 24px rgba(0,0,0,.16);text-align:left}
 #syspop[hidden]{display:none}
+/* 提示词模板浮层：同 #queuepop/#syspop 挂 body 顶层，锚定发送框的「模板」按钮 */
+#tplpop{position:fixed;z-index:200;width:min(92vw,460px);max-height:min(70vh,520px);
+  overflow-y:auto;background:var(--bg);border:1px solid var(--bd);border-radius:8px;
+  padding:10px 14px;box-shadow:0 8px 24px rgba(0,0,0,.16);text-align:left}
+#tplpop[hidden]{display:none}
+.tplhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.tplsearch{width:100%;box-sizing:border-box;font:inherit;font-size:13px;padding:5px 8px;
+  background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;margin:4px 0 8px}
+.tplitem{padding:8px 0;border-top:1px solid var(--bd)}
+.tpltitle{font-weight:600;font-size:13px;cursor:pointer;overflow-wrap:anywhere}
+.tpltext{font-size:12px;color:var(--mut);white-space:pre-wrap;overflow-wrap:anywhere;
+  max-height:3.6em;overflow:hidden;margin:2px 0 4px;cursor:pointer}
+.tplacts{display:flex;gap:6px}
+.tplacts .back{font-size:12px;padding:2px 8px}
+.tplform label{display:block;font-size:12px;color:var(--mut);margin:6px 0 3px}
+.tplform input,.tplform textarea{width:100%;box-sizing:border-box;font:inherit;font-size:13px;
+  padding:5px 8px;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px}
+.tplform textarea{min-height:110px;resize:vertical}
+.tplfoot{margin-top:8px;padding-top:8px;border-top:1px solid var(--bd);display:flex;gap:8px;flex-wrap:wrap}
 .sysrow{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--mut);margin-top:8px}
 .sysbar{height:6px;background:var(--card2);border-radius:3px;overflow:hidden;margin-top:3px}
 .sysbar>i{display:block;height:100%;background:var(--acc)}
@@ -407,6 +426,7 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
 <div id="mask"></div>
 <div id="queuepop" hidden></div>
 <div id="syspop" hidden></div>
+<div id="tplpop" hidden role="dialog" aria-label="提示词模板"></div>
 <div id="lightbox" hidden role="dialog" aria-modal="true" aria-label="图片预览">
   <button type="button" id="lightboxclose" aria-label="关闭图片预览">×</button>
   <img alt="">
@@ -1016,6 +1036,9 @@ function composerHtml(mode, d){
     <div class="composer-actions">
       <button class="back" id="sendbtn">${isNew ? "创建并发送" : "发送"}</button>
       <button class="back" id="imagebtn" type="button" title="选择图片，也可以直接粘贴到输入框">图片</button>
+      <button class="back" id="tplbtn" type="button" aria-label="插入提示词模板"
+              aria-controls="tplpop" aria-expanded="false"
+              title="插入常用提示词模板">模板</button>
       ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断并清空队列</button>`}
       <button class="back composer-cog" id="cogbtn" aria-label="发送选项"
               title="审批 / 思考 / 发送选项">⚙</button>
@@ -2418,6 +2441,7 @@ async function renderConversation(id, force){
           <div id="bgstrip" hidden></div>
           <div id="conv"></div>
           ${composerHtml("conv", d)}`;
+        toggleTplPop(false);
         const backBtn = document.getElementById("back");
         backBtn.onclick = () => {
           navigate(sessionReturn || {project: view.project, session: null, new: false});
@@ -2617,6 +2641,240 @@ function renderQueue(sid){
   if(state.notice) bits.push(state.notice);
   el.innerHTML = `<span class="queue-summary">${bits.join(" · ")}</span>`;
   refreshQueuePop(sid);
+}
+/* ---------- 提示词模板：发送框旁「模板」浮层 ---------- */
+const TPL_TITLE_MAX = 80, TPL_TEXT_MAX = 20000, TPL_PREVIEW_CHARS = 240;
+const tplPop = {open:false, loading:false, error:"", list:[], query:"",
+                editing:null, formError:"", note:"", saving:false, deleting:null};
+let tplPopClickInside = false;   // 浮层内点击会重渲染，目标可能脱离 DOM，外点判定要豁免本次点击
+
+function templateTitleFromText(text){
+  const trimmed = String(text ?? "").trim();
+  if(!trimmed) return "";
+  // 按码点截断，避免把 emoji 的代理对切成孤立高位
+  return Array.from(trimmed.split(/\r?\n/)[0].trim()).slice(0, 40).join("");
+}
+function insertTemplateText(value, start, end, text){
+  const base = String(value ?? ""), insert = String(text ?? "");
+  let a = Number.isFinite(start) ? Math.trunc(start) : base.length;
+  let b = Number.isFinite(end) ? Math.trunc(end) : a;
+  a = Math.max(0, Math.min(a, base.length));
+  b = Math.max(0, Math.min(b, base.length));
+  if(a > b){ const t = a; a = b; b = t; }
+  return {value: base.slice(0, a) + insert + base.slice(b), cursor: a + insert.length};
+}
+function templateFilter(list, query){
+  const q = String(query ?? "").trim().toLowerCase();
+  if(!q) return (list || []).slice();
+  return (list || []).filter(t =>
+    (String(t.title ?? "") + "\n" + String(t.text ?? "")).toLowerCase().includes(q));
+}
+function tplItemHtml(t){
+  const id = esc(t.id), deleting = tplPop.deleting === t.id;
+  const chars = Array.from(String(t.text ?? ""));
+  const preview = chars.slice(0, TPL_PREVIEW_CHARS).join("")
+    + (chars.length > TPL_PREVIEW_CHARS ? "…" : "");
+  return `<div class="tplitem"><div class="tpltitle" data-tpl-insert="${id}">${esc(t.title)}</div>
+    <div class="tpltext" data-tpl-insert="${id}">${esc(preview)}</div>
+    <div class="tplacts"><button class="back" data-tpl-insert="${id}">插入</button>
+      <button class="back" data-tpl-edit="${id}">编辑</button>
+      <button class="back" data-tpl-delete="${id}" ${deleting ? "disabled" : ""}>${
+        deleting ? "删除中…" : "删除"}</button></div></div>`;
+}
+function tplListHtml(){
+  const items = templateFilter(tplPop.list, tplPop.query);
+  if(tplPop.loading) return '<div class="mut">加载中…</div>';
+  if(!items.length) return `<div class="mut">${tplPop.list.length
+    ? "没有匹配的模板" : "还没有模板，点「+ 新建」或把输入框里的文字存为模板"}</div>`;
+  return items.map(tplItemHtml).join("");
+}
+function tplFormHtml(){
+  const e = tplPop.editing;
+  return `<div class="tplhead"><b>${e.id ? "编辑模板" : "新建模板"}</b></div>
+    <div class="tplform"><label for="tpltitle">标题（留空自动取正文首行）</label>
+      <input id="tpltitle" maxlength="${TPL_TITLE_MAX}" value="${esc(e.title)}">
+      <label for="tpltext">正文</label>
+      <textarea id="tpltext" maxlength="${TPL_TEXT_MAX}">${esc(e.text)}</textarea></div>
+    ${tplPop.formError ? `<div class="terror" role="status">${esc(tplPop.formError)}</div>` : ""}
+    <div class="tplfoot"><button class="back" data-tpl-save ${tplPop.saving ? "disabled" : ""}>${
+      tplPop.saving ? "保存中…" : "保存"}</button>
+      <button class="back" data-tpl-cancel ${tplPop.saving ? "disabled" : ""}>取消</button></div>`;
+}
+function tplPopHtml(){
+  if(tplPop.editing) return tplFormHtml();
+  const box = document.getElementById("msgbox");
+  const hasText = !!(box && box.value && box.value.trim());
+  return `<div class="tplhead"><b>提示词模板</b>
+      <button class="back" data-tpl-new>+ 新建</button></div>
+    <input class="tplsearch" id="tplsearch" type="search"
+           placeholder="搜索标题或内容…" aria-label="搜索模板" value="${esc(tplPop.query)}">
+    ${tplPop.error ? `<div class="terror" role="status">${esc(tplPop.error)}
+      <button class="back" data-tpl-retry>重试</button></div>` : ""}
+    ${tplPop.note ? `<div role="status">${esc(tplPop.note)}</div>` : ""}
+    <div id="tpllist">${tplListHtml()}</div>
+    ${hasText ? `<div class="tplfoot">
+      <button class="back" data-tpl-save-current>保存当前输入为模板</button></div>` : ""}`;
+}
+function visibleViewportRect(){
+  // iOS 键盘弹出时布局视口不缩，visualViewport 才是可见区域；无该 API 时退回布局视口。
+  const vv = (typeof window !== "undefined") && window.visualViewport;
+  if(vv && vv.width && vv.height)
+    return {left:vv.offsetLeft || 0, top:vv.offsetTop || 0,
+            width:vv.width, height:vv.height};
+  const root = document.documentElement;
+  return {left:0, top:0, width:root ? root.clientWidth : 0,
+          height:root ? root.clientHeight : 0};
+}
+function positionTplPop(){
+  const pop = document.getElementById("tplpop"), btn = document.getElementById("tplbtn");
+  if(!pop || pop.hidden || !btn) return;
+  const rect = btn.getBoundingClientRect && btn.getBoundingClientRect();
+  const vp = visibleViewportRect();
+  if(!rect || !vp.width || !vp.height) return;   // 无布局环境（单测假 DOM）时只展示不定位
+  // 键盘弹出时布局视口的 70vh 可能高于可见区域，按 visualViewport 收紧高度上限
+  pop.style.maxHeight = Math.max(120, Math.min(520, Math.round(vp.height * 0.7))) + "px";
+  const w = pop.offsetWidth || 0, h = pop.offsetHeight || 0;
+  let left = Math.min(Math.max(vp.left + 8, rect.right - w),
+                      vp.left + vp.width - w - 8);
+  let top = rect.top - h - 6;   // 输入区在底部，优先向上展开
+  if(top < vp.top + 8)
+    top = Math.min(rect.bottom + 6, Math.max(vp.top + 8, vp.top + vp.height - h - 8));
+  pop.style.left = Math.round(left) + "px";
+  pop.style.top = Math.round(top) + "px";
+}
+function focusTplSearch(){
+  const field = document.getElementById("tplsearch");
+  if(field && field.focus) field.focus();
+}
+function renderTplPop(){
+  const pop = document.getElementById("tplpop");
+  if(!pop || !tplPop.open) return;
+  pop.innerHTML = tplPopHtml();
+  pop.hidden = false;
+  positionTplPop();
+}
+function renderTplList(){
+  const list = document.getElementById("tpllist");
+  if(list) list.innerHTML = tplListHtml();
+}
+function toggleTplPop(open, returnFocus){
+  const pop = document.getElementById("tplpop");
+  if(!pop) return;
+  const btn = document.getElementById("tplbtn");
+  if(btn && btn.setAttribute)
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  tplPop.open = !!open;
+  tplPop.editing = null; tplPop.query = "";
+  tplPop.error = ""; tplPop.formError = ""; tplPop.note = "";
+  if(!open){
+    pop.hidden = true; pop.innerHTML = "";
+    if(returnFocus && btn && btn.focus) btn.focus();
+    return;
+  }
+  renderTplPop();
+  focusTplSearch();
+  loadPromptTemplates();
+}
+async function loadPromptTemplates(){
+  if(tplPop.loading) return;
+  tplPop.loading = true; tplPop.error = "";
+  renderTplPop();
+  try{
+    const r = await fetchT("/prompt-templates", {}, 15000);
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok) throw Error(j.error || ("HTTP " + r.status));
+    tplPop.list = Array.isArray(j.templates) ? j.templates : [];
+  }catch(e){
+    tplPop.error = "模板加载失败：" + (e.message || e);
+  }
+  tplPop.loading = false;
+  if(tplPop.open){
+    renderTplPop();
+    if(!tplPop.editing) focusTplSearch();
+  }
+}
+function notifyComposerInput(box){
+  // 派发真实 input 事件，让草稿、命令提示与 autosize 的 addEventListener 都生效；
+  // 无 Event 原语的环境（node:test 假 DOM）退回 oninput。
+  if(typeof Event !== "undefined" && box.dispatchEvent){
+    box.dispatchEvent(new Event("input", {bubbles:true}));
+  }else if(box.oninput){
+    box.oninput();
+  }
+}
+function insertTemplateById(id){
+  const t = (tplPop.list || []).find(x => x.id === id);
+  const box = document.getElementById("msgbox");
+  if(!t || !box) return;
+  const result = insertTemplateText(box.value, box.selectionStart, box.selectionEnd, t.text);
+  box.value = result.value;
+  if("selectionStart" in box) box.selectionStart = box.selectionEnd = result.cursor;
+  if(box.focus) box.focus();
+  notifyComposerInput(box);
+  autosizeComposer(box);
+  toggleTplPop(false);
+}
+function openTemplateEditor(tpl, prefill){
+  tplPop.editing = tpl
+    ? {id:tpl.id, title:tpl.title || "", text:tpl.text || ""}
+    : {id:null, title:"", text:String(prefill || "")};
+  tplPop.formError = ""; tplPop.note = "";
+  if(!tpl && tplPop.editing.text) tplPop.editing.title = templateTitleFromText(tplPop.editing.text);
+  renderTplPop();
+  const field = document.getElementById("tpltitle");
+  if(field && field.focus) field.focus();
+}
+function openCurrentAsTemplate(){
+  const box = document.getElementById("msgbox"), text = box ? box.value : "";
+  if(String(text || "").trim()) openTemplateEditor(null, text);
+}
+async function saveTemplateEditor(){
+  const e = tplPop.editing;
+  if(!e || tplPop.saving) return;
+  if(!String(e.text || "").trim()){
+    tplPop.formError = "模板正文不能为空"; renderTplPop(); return;
+  }
+  const body = {title:e.title || "", text:e.text || ""};
+  if(e.id) body.id = e.id;
+  tplPop.saving = true; tplPop.formError = "";
+  renderTplPop();   // 立即显示“保存中…”并禁用按钮，双击不会重复提交
+  try{
+    const r = await fetchT("/prompt-templates", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)}, 15000);
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok || !j.template) throw Error(j.error || ("HTTP " + r.status));
+    const saved = j.template;
+    const index = tplPop.list.findIndex(t => t.id === saved.id);
+    if(index < 0) tplPop.list.unshift(saved);
+    else tplPop.list[index] = saved;
+    tplPop.editing = null; tplPop.formError = ""; tplPop.note = "已保存";
+    tplPop.error = "";
+  }catch(err){
+    tplPop.formError = "保存失败：" + (err.message || err);
+  }finally{
+    tplPop.saving = false;
+  }
+  renderTplPop();
+}
+async function deletePromptTemplate(id){
+  if(tplPop.deleting) return;
+  const tpl = (tplPop.list || []).find(x => x.id === id);
+  if(!tpl || (window.confirm && !window.confirm(`删除模板「${tpl.title}」？`))) return;
+  tplPop.deleting = id; tplPop.error = "";
+  renderTplPop();   // 立即禁用该行，双击不会重复 DELETE
+  try{
+    const r = await fetchT("/prompt-templates/" + encodeURIComponent(id),
+                           {method:"DELETE"}, 15000);
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok) throw Error(j.error || ("HTTP " + r.status));
+    tplPop.list = tplPop.list.filter(x => x.id !== id);
+    tplPop.note = "已删除";
+  }catch(e){
+    tplPop.error = "删除失败：" + (e.message || e);
+  }finally{
+    tplPop.deleting = null;
+  }
+  renderTplPop();
 }
 async function loadQueue(sid){
   if(sid.includes("::")) return;
@@ -2838,6 +3096,7 @@ function renderNewSession(p){
     <button class="back" id="back">← 返回列表</button>
     <h2 style="font-size:16px;margin:8px 0">新建会话 <span class="mut">${esc(p.cwd)}</span></h2>
     ${composerHtml("new", {})}`;
+  toggleTplPop(false);
   document.getElementById("back").onclick = () => {
     navigate({project: view.project, session: null, new: false});
   };
@@ -3147,6 +3406,7 @@ function clearSessionView(){
   displayedSession = null;
   for(const [, state] of queueStates) state.pop = null;   // 离开会话时收起队列详情浮层
   hideQueuePop();
+  toggleTplPop(false);   // 模板浮层同样离开会话即收起，避免停在列表页
   disconnectSessionSse();
   clearLiveBubble();
   convCache = {id: null, size: -1};
@@ -3314,6 +3574,8 @@ document.getElementById("main").addEventListener("click", e => {
     toggleQueuePop(view.session);
     return;
   }
+  const tplBtn = e.target.closest && e.target.closest("#tplbtn");
+  if(tplBtn){ e.preventDefault?.(); toggleTplPop(!tplPop.open); return; }
   // 窄屏 ⚙ 浮层开合（次要控件收纳，桌面不显示该按钮）
   const cog = e.target.closest && e.target.closest("#cogbtn");
   if(cog && cog.parentElement && cog.parentElement.parentElement){
@@ -3389,7 +3651,7 @@ function systimerHtml(data){
     return `<div class="systimer"><span>⏱ ${fmtRemain(rem)}后睡眠</span>
       <button class="ibtn secondary" data-sleep-cancel>取消定时</button></div>`;
   return `<div class="systimer"><select id="sleeptimermin" aria-label="定时睡眠分钟数">
-    ${[15, 30, 60, 120].map(m => `<option value="${m}">${m} 分钟</option>`).join("")}
+    ${[30, 60, 120, 180].map(m => `<option value="${m}">${m} 分钟</option>`).join("")}
     </select><button class="ibtn secondary" data-sleep-set>定时睡眠</button></div>`;
 }
 // 推迟睡眠开关与通知过滤行：开关状态来自服务端，过滤阈值存 localStorage，
@@ -3606,7 +3868,7 @@ document.getElementById("syspop").addEventListener("click", e => {
   const set = e.target.closest && e.target.closest("[data-sleep-set]");
   if(set){
     const sel = document.getElementById("sleeptimermin");
-    setSleepTimer(parseInt(sel && sel.value, 10) || 15);
+    setSleepTimer(parseInt(sel && sel.value, 10) || 30);
     return;
   }
   const cancel = e.target.closest && e.target.closest("[data-sleep-cancel]");
@@ -3623,6 +3885,55 @@ document.addEventListener("keydown", e => { if(e.key === "Escape" && sysPop.time
 document.addEventListener("scroll", () => { if(sysPop.timer) positionSysPop(); }, true);
 if(typeof window !== "undefined" && window.addEventListener)
   window.addEventListener("resize", () => { if(sysPop.timer) positionSysPop(); });
+
+/* 模板浮层：外点/Esc 收起，滚动/resize 重新定位 */
+document.getElementById("tplpop").addEventListener("click", e => {
+  tplPopClickInside = true;
+  setTimeout(() => { tplPopClickInside = false; }, 0);
+  const insert = e.target.closest && e.target.closest("[data-tpl-insert]");
+  if(insert){ insertTemplateById(insert.dataset.tplInsert); return; }
+  const edit = e.target.closest && e.target.closest("[data-tpl-edit]");
+  if(edit){ openTemplateEditor(tplPop.list.find(x => x.id === edit.dataset.tplEdit)); return; }
+  const del = e.target.closest && e.target.closest("[data-tpl-delete]");
+  if(del){ deletePromptTemplate(del.dataset.tplDelete); return; }
+  if(e.target.closest && e.target.closest("[data-tpl-new]")){ openTemplateEditor(null); return; }
+  if(e.target.closest && e.target.closest("[data-tpl-save-current]")){ openCurrentAsTemplate(); return; }
+  if(e.target.closest && e.target.closest("[data-tpl-save]")){ saveTemplateEditor(); return; }
+  if(e.target.closest && e.target.closest("[data-tpl-cancel]")){
+    tplPop.editing = null; tplPop.formError = ""; renderTplPop(); return;
+  }
+  if(e.target.closest && e.target.closest("[data-tpl-retry]")){ loadPromptTemplates(); }
+});
+document.getElementById("tplpop").addEventListener("input", e => {
+  if(!e.target) return;
+  if(e.target.id === "tplsearch"){ tplPop.query = e.target.value; renderTplList(); return; }
+  if(tplPop.editing && e.target.id === "tpltitle") tplPop.editing.title = e.target.value;
+  if(tplPop.editing && e.target.id === "tpltext") tplPop.editing.text = e.target.value;
+});
+document.addEventListener("click", e => {
+  if(!tplPop.open || tplPopClickInside) return;
+  const pop = document.getElementById("tplpop");
+  if(pop && pop.contains && pop.contains(e.target)) return;
+  if(e.target.closest && e.target.closest("#tplbtn")) return;
+  toggleTplPop(false);
+});
+document.addEventListener("keydown", e => {
+  if(e.key !== "Escape" || !tplPop.open) return;
+  if(tplPop.editing){
+    tplPop.editing = null; tplPop.formError = "";
+    renderTplPop(); focusTplSearch(); return;
+  }
+  toggleTplPop(false, true);   // Esc 关闭时把焦点还给「模板」按钮
+});
+document.addEventListener("scroll", () => { if(tplPop.open) positionTplPop(); }, true);
+if(typeof window !== "undefined" && window.addEventListener)
+  window.addEventListener("resize", () => { if(tplPop.open) positionTplPop(); });
+if(typeof window !== "undefined" && window.visualViewport
+   && window.visualViewport.addEventListener){
+  const repositionTplPop = () => { if(tplPop.open) positionTplPop(); };
+  window.visualViewport.addEventListener("resize", repositionTplPop);
+  window.visualViewport.addEventListener("scroll", repositionTplPop);
+}
 
 /* ---------- 对话内的复制 / 图片灯箱 / 子代理跳转 ---------- */
 function copyToClipboard(text, button){

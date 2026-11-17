@@ -5,4 +5,5 @@ hosted    Hosted：常驻 claude 进程（stream-json 双向）
 session   Session：单个转录的累计状态与对外投影
 transcript 转录行解析（对话消息提取）
 http_api  HTTP/SSE 层
+prompts   常用提示词模板的 JSON 存储
 """

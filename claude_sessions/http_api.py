@@ -97,6 +97,11 @@ def make_handler(mon, refresh_interval):
             if u.path == "/interactions":
                 sid = parse_qs(u.query).get("session", [None])[0]
                 return self._json({"interactions": mon.pending_interactions(sid)})
+            if u.path == "/prompt-templates":
+                try:
+                    return self._json({"templates": mon.prompts.list()})
+                except RuntimeError as e:
+                    return self._json({"error": str(e)}, 500)
             if u.path == "/file":
                 return self._file_endpoint(u)
             if u.path == "/view":
@@ -398,6 +403,25 @@ def make_handler(mon, refresh_interval):
                 return self._handle_hook(u.path[len("/hook/"):])
             if not self._safe_json_write():
                 return
+            if u.path == "/prompt-templates":
+                body = self._read_body()
+                if not isinstance(body, dict):
+                    return self._json({"error": "invalid JSON body"}, 400)
+                tid, title, text = body.get("id"), body.get("title", ""), body.get("text")
+                if tid is not None and not isinstance(tid, str):
+                    return self._json({"error": '"id" 必须是字符串'}, 400)
+                if not isinstance(title, str) or not isinstance(text, str):
+                    return self._json({"error": '"title" 和 "text" 必须是字符串'}, 400)
+                try:
+                    record = (mon.prompts.update(tid, title, text) if tid
+                              else mon.prompts.create(title, text))
+                except KeyError:
+                    return self._json({"error": "模板不存在"}, 404)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                except RuntimeError as e:
+                    return self._json({"error": str(e)}, 500)
+                return self._json({"template": record})
             if u.path == "/system/power":
                 body = self._read_body()
                 action = body.get("action") if isinstance(body, dict) else None
@@ -565,6 +589,13 @@ def make_handler(mon, refresh_interval):
                 return
             print(f"[http] {self.command} {self.path} 收到", flush=True)
             parts = u.path.strip("/").split("/")
+            if len(parts) == 2 and parts[0] == "prompt-templates":
+                try:
+                    removed = mon.prompts.delete(parts[1])
+                except RuntimeError as e:
+                    return self._json({"error": str(e)}, 500)
+                return (self._json({"ok": True}) if removed
+                        else self._json({"error": "模板不存在"}, 404))
             if len(parts) == 2 and parts[0] == "hosted":
                 h = mon.hosted.get(parts[1])
                 if not h:

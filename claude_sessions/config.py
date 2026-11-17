@@ -45,3 +45,8 @@ WEBHOOK_QUEUE_LIMIT = 1000
 
 # 临时探针：打印托管进程 stdout 的后台任务帧，确认 CLI 是否发送 task_updated 等事件
 DEBUG_TASK_FRAMES = os.environ.get("CLAUDE_SESSIONS_DEBUG_TASK_FRAMES") == "1"
+
+# 提示词模板：服务端全局共享，数量与单条长度设限，避免文件与浮层无限膨胀
+PROMPT_TEMPLATE_LIMIT = 100
+PROMPT_TEMPLATE_TITLE_CHARS = 80
+PROMPT_TEMPLATE_TEXT_CHARS = 20_000

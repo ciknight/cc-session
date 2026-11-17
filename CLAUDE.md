@@ -35,6 +35,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - `http_api.py` — `make_handler`：REST/SSE/hook 回调/静态资源
 - `interactions.py` — `Interaction` 与审批预览；`system.py` — 系统采样、电源与推迟睡眠；
   `orphans.py` — 托管残留进程观察；`commands.py` — slash 命令扫描；
+  `prompts.py` — 常用提示词模板的服务端 JSON 存储（原子写、mtime 自动重载、数量/长度/字符校验）；
   `fileview.py` — 文件预览的分类与文本解码（BOM/UTF-16 启发 → utf-8 → gb18030 回退）；
   `util.py` — 纯工具函数；`config.py` — 路径与可调常量；
   `hook.py` — hook 客户端；`app.py` — CLI 入口与完整用法文档
@@ -79,6 +80,10 @@ uv run monitor.py --webhook http://localhost:3000/hook
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
    设置托管思考档位（low/medium/high/xhigh/max/default）。
+   `GET/POST /prompt-templates` 与 `DELETE /prompt-templates/<id>` 管理常用提示词模板，
+   存 `CLAUDE_DIR/claude-sessions/prompt-templates.json`；每次操作前比对文件 mtime/size，
+   运行期间手改文件会自动重载，损坏文件修复后也能自动恢复。网页发送框「模板」浮层支持搜索、
+   插入光标处、保存当前输入、编辑与删除。
    `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲），
 `POST /system/sleep-timer` 定时睡眠（服务端 `threading.Timer` 内存态，minutes 0-720、0 取消，
 `GET /system` 的 `sleep_timer_remaining` 随轮询返回剩余秒）。
@@ -267,10 +272,14 @@ cwd 与「对话 N/M」计数并入概览折叠 `overviewHtml`——summary 一�
 顶层的 `#queuepop`（`position:fixed` 按 chip 矩形定位并夹紧视口，滚动/ resize 重定位）：
 不随 `main` 的 overflow 裁剪、也不被侧栏遮挡；点击展开/收起，外点或 Esc 收起，
 取消按钮、最近结束折叠在浮层内（点击兼容触屏）。
+发送框「模板」按钮打开 body 顶层 `#tplpop`（`role="dialog"`，模式同 `#queuepop`/`#syspop`，
+按 `visualViewport` 夹紧可见区域）：支持搜索、插入光标处、保存当前输入、编辑/删除；浮层内点击
+会重渲染导致事件目标脱离 DOM，用 `tplPopClickInside` 豁免本次外点关闭；离开会话视图或重建面板
+时收起。保存/删除期间按钮禁用防重复提交；列表预览只渲染前 240 个码点，搜索/插入仍用全文。
 窄屏（≤768px）发送区次要控件（审批/思考/发送选项/托管）收进 ⚙ 浮层——`composer-extra`
 桌面 `display:contents` 原样展开、控件 DOM 不移动；textarea 压两行，头部隐藏 cwd。
 模型选择行强制单行（`nowrap`）：隐藏「模型选择」标签文字、select/自定义输入可收缩、
-状态与队列 chip 单行省略并右对齐；发送/图片/中断/⚙ 按钮同样收紧内边距保持一行。
+状态与队列 chip 单行省略并右对齐；发送/图片/模板/中断/⚙ 按钮同样收紧内边距保持一行。
 窄屏顶部同样压缩：全局 header 隐藏「自动刷新/间隔/系统」文字与更新时间
 （保留 `aria-label`/`title`），列表页用 `.hdr-break` 让托管/待审批/通知/系统徽章换行成两行；
 **会话视图（`body.insession`）里徽章与通知/系统按钮一并隐藏、header 回到一行**（列表页均可达，
@@ -312,4 +321,4 @@ Agent 等给出摘要、类别色、状态与 diff 统计），连续同名工�
 或输入法。草稿、未读及搜索条件随整页刷新清空；别名/置顶/归档由独立元数据持久化。
 归档范围与原搜索/状态条件取交集后稳定按置顶分组，组内保留原顺序；详情标题软更新，不重建输入区。
 待处理页和队列摘要均不能因查看、取消或整理操作提前清除新回复提示。
-header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/睡眠经 `window.confirm` 二次确认后 POST；定时睡眠行按 `sleep_timer_remaining` 切换（未设定：预设下拉（15/30/60/120 分钟）+ 设定按钮，已设定：剩余时间 + 取消），轮询重写 innerHTML 时保留用户选中的预设值。另有「干活时推迟睡眠」开关（`#keepawake`）、短回合通知阈值（`#notifymindur`）与残留进程区块（`orphansHtml`，逐个/全部结束均 confirm 后 POST）。
+header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/睡眠经 `window.confirm` 二次确认后 POST；定时睡眠行按 `sleep_timer_remaining` 切换（未设定：预设下拉（30/60/120/180 分钟）+ 设定按钮，已设定：剩余时间 + 取消），轮询重写 innerHTML 时保留用户选中的预设值。另有「干活时推迟睡眠」开关（`#keepawake`）、短回合通知阈值（`#notifymindur`）与残留进程区块（`orphansHtml`，逐个/全部结束均 confirm 后 POST）。

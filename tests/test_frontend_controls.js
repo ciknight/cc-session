@@ -2676,3 +2676,194 @@ test("空项目列表不吞掉 URL 里的项目信息（等数据到达再解析
   b.run('resolveViewProject([{cwd:"F:/a"}])');
   assert.equal(b.run('view.project'), "F:/a");
 });
+
+test('发送框提供模板入口，页面有顶层模板浮层', () => {
+  const b = boot();
+  for (const markup of [b.run('composerHtml("conv", {hosted:false})'),
+                        b.run('composerHtml("new", {})')]) {
+    assert.match(markup, /id="tplbtn"/);
+    assert.match(markup, />模板</);
+  }
+  assert.match(html, /<div id="tplpop" hidden role="dialog"/);
+});
+
+test('模板纯函数：标题、插入与过滤', () => {
+  const b = boot();
+  assert.equal(b.run('templateTitleFromText("  第一行  " + String.fromCharCode(10) + "第二行")'), '第一行');
+  assert.equal(b.run('templateTitleFromText("x".repeat(50))').length, 40);
+  assert.equal(b.run('templateTitleFromText("   ")'), '');
+
+  const cases = [
+    ['insertTemplateText("abc", 1, 1, "XY")', 'aXYbc', 3],
+    ['insertTemplateText("abc", 1, 2, "Z")', 'aZc', 2],
+    ['insertTemplateText("abc", 99, 99, "!")', 'abc!', 4],
+    ['insertTemplateText("abc", 2, 1, "Z")', 'aZc', 2],
+    ['insertTemplateText("", 0, 0, "hi")', 'hi', 2],
+  ];
+  for (const [expression, value, cursor] of cases) {
+    const result = b.run(expression);
+    assert.equal(result.value, value, expression);
+    assert.equal(result.cursor, cursor, expression);
+  }
+
+  b.run('var tpls = [{title:"修 bug",text:"按仓库风格修复"},'
+    + '{title:"写测试",text:"cover edge cases"}];');
+  assert.equal(b.run('templateFilter(tpls, "BUG").length'), 1);
+  assert.equal(b.run('templateFilter(tpls, "cover").length'), 1);
+  assert.equal(b.run('templateFilter(tpls, "").length'), 2);
+  assert.equal(b.run('templateFilter(tpls, "nomatch").length'), 0);
+});
+
+test('模板列表与编辑表单转义 HTML', () => {
+  const b = boot();
+  b.run('tplPop.list = [{id:"x",title:"<img src=x>",text:"<script>alert(1)</script>"}]');
+  const list = b.run('tplPopHtml()');
+  assert.doesNotMatch(list, /<img src=x>|<script>/);
+  assert.match(list, /&lt;img src=x&gt;/);
+  assert.match(list, /&lt;script&gt;/);
+
+  b.run('tplPop.editing = {id:null,title:"<b>",text:"<i>"}');
+  const form = b.run('tplPopHtml()');
+  assert.doesNotMatch(form, /value="<b>"|<i>/);
+  assert.match(form, /value="&lt;b&gt;"/);
+  assert.match(form, /&lt;i&gt;/);
+});
+
+test('模板浮层渲染搜索、空状态与保存当前输入入口', () => {
+  const b = boot();
+  b.run('tplPop.list = []; tplPop.query = ""; tplPop.editing = null;');
+  assert.match(b.run('tplPopHtml()'), /还没有模板/);
+
+  b.run('tplPop.list = [{id:"a",title:"修 bug",text:"修复"}]; tplPop.query = "nomatch";');
+  assert.match(b.run('tplPopHtml()'), /没有匹配的模板/);
+  assert.match(b.run('tplPopHtml()'), /id="tplsearch"/);
+
+  b.run('tplPop.query = "";');
+  b.node('msgbox').value = "当前草稿";
+  assert.match(b.run('tplPopHtml()'), /data-tpl-save-current/);
+  b.node('msgbox').value = "   ";
+  assert.doesNotMatch(b.run('tplPopHtml()'), /data-tpl-save-current/);
+});
+
+test('模板编辑状态优先于列表，摘要截断', () => {
+  const b = boot();
+  b.run('tplPop.editing = {id:"a",title:"t",text:"body"};');
+  const form = b.run('tplPopHtml()');
+  assert.match(form, /编辑模板/);
+  assert.match(form, /id="tpltext"/);
+  assert.doesNotMatch(form, /tplsearch/);
+  b.run('tplPop.editing = null;');
+  assert.match(b.run('tplPopHtml()'), /tplsearch/);
+});
+
+test('模板插入使用光标位置并关闭浮层，保存当前输入预填首行标题', () => {
+  const b = boot();
+  const box = b.node('msgbox');
+  box.value = 'abc';
+  box.selectionStart = 1;
+  box.selectionEnd = 1;
+  b.run('tplPop.open = true; tplPop.list = [{id:"a",title:"t",text:"XY"}]; insertTemplateById("a")');
+  assert.equal(box.value, 'aXYbc');
+  assert.equal(b.node('tplpop').hidden, true);
+
+  b.run('tplPop.open = true');
+  box.value = '  第一行  ' + String.fromCharCode(10) + '第二行';
+  b.run('openCurrentAsTemplate()');
+  assert.equal(b.run('tplPop.editing.title'), '第一行');
+  assert.equal(b.run('tplPop.editing.text'), box.value);
+});
+
+test('插入模板会触发 input 监听器（命令提示/自动增高）', () => {
+  const b = boot();
+  b.context.Event = class InputEvent {
+    constructor(type, options) { this.type = type; Object.assign(this, options || {}); }
+  };
+  const box = b.node('msgbox');
+  let oninput = 0, listened = 0;
+  box.oninput = () => { oninput++; };
+  box.addEventListener('input', () => { listened++; });
+  box.value = '';
+  b.run('tplPop.open = true; tplPop.list = [{id:"a",title:"t",text:"/help"}]; insertTemplateById("a")');
+  assert.equal(oninput, 1);
+  assert.equal(listened, 1);
+});
+
+test('离开会话视图会关闭模板浮层', () => {
+  const b = boot();
+  b.run('tplPop.open = true; tplPop.editing = {id:null,title:"",text:""};');
+  const pop = b.node('tplpop');
+  pop.hidden = false;
+  pop.innerHTML = 'stale';
+  b.run('clearSessionView()');
+  assert.equal(pop.hidden, true);
+  assert.equal(b.run('tplPop.open'), false);
+});
+
+test('模板标题按 Unicode 码点截断，不拆 emoji', () => {
+  const b = boot();
+  const title = b.run('templateTitleFromText("x".repeat(39) + "😀")');
+  assert.equal(title, 'x'.repeat(39) + '😀');
+  assert.equal(Array.from(title).length, 40);
+});
+
+test('模板列表预览截断长正文，搜索/插入仍用全文', () => {
+  const b = boot();
+  b.run('tplPop.list = [{id:"long",title:"t",text:"a".repeat(300)}]');
+  const out = b.run('tplPopHtml()');
+  assert.match(out, /a{240}…/);
+  assert.doesNotMatch(out, /a{241}/);
+  assert.equal(b.run('templateFilter(tplPop.list, "a".repeat(250)).length'), 1);
+});
+
+test('模板保存/删除防重复提交', async () => {
+  const calls = [];
+  const b = boot(async (url, opts = {}) => {
+    calls.push([url, opts.method || 'GET']);
+    if (url === '/prompt-templates') {
+      return response({template: {id: 'x', title: 't', text: 'body'}});
+    }
+    return response({ok: true});
+  });
+  b.run('tplPop.open = true; tplPop.editing = {id:null,title:"t",text:"body"};');
+  await Promise.all([b.run('saveTemplateEditor()'), b.run('saveTemplateEditor()')]);
+  assert.equal(calls.filter(([url, method]) =>
+    url === '/prompt-templates' && method === 'POST').length, 1);
+
+  calls.length = 0;
+  b.run('tplPop.list = [{id:"x",title:"t",text:"body"}]; tplPop.editing = null;');
+  await Promise.all([b.run('deletePromptTemplate("x")'), b.run('deletePromptTemplate("x")')]);
+  assert.equal(calls.filter(([url, method]) =>
+    url === '/prompt-templates/x' && method === 'DELETE').length, 1);
+});
+
+test('模板按钮与浮层有可访问性标记', () => {
+  const b = boot();
+  const markup = b.run('composerHtml("conv", {hosted:false})');
+  assert.match(markup, /aria-controls="tplpop"/);
+  assert.match(markup, /aria-expanded="false"/);
+  assert.match(html, /id="tplpop" hidden role="dialog"/);
+  b.run('toggleTplPop(true)');
+  assert.equal(b.node('tplbtn').dataset.attr_aria_expanded, 'true');
+  b.run('toggleTplPop(false)');
+  assert.equal(b.node('tplbtn').dataset.attr_aria_expanded, 'false');
+});
+
+test('模板浮层定位读取 visualViewport', () => {
+  const b = boot();
+  b.context.window.visualViewport = {width: 300, height: 400,
+    offsetLeft: 10, offsetTop: 20};
+  const rect = b.run('visibleViewportRect()');
+  assert.equal(rect.width, 300);
+  assert.equal(rect.height, 400);
+  assert.equal(rect.left, 10);
+  assert.equal(rect.top, 20);
+});
+
+test('定时睡眠预设支持 30/60/120/180 分钟', () => {
+  const b = boot();
+  const out = b.run('systimerHtml({})');
+  for (const minutes of [30, 60, 120, 180]) {
+    assert.match(out, new RegExp(`<option value="${minutes}">${minutes} 分钟</option>`));
+  }
+  assert.doesNotMatch(out, /value="15"/);
+});

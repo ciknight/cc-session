@@ -7,7 +7,7 @@
   session.py    Session：单个转录的累计状态与对外投影
   transcript.py 转录行解析（对话消息提取）
   http_api.py   HTTP/SSE 层
-  interactions.py / system.py / commands.py / util.py / config.py / hook.py / app.py
+  interactions.py / system.py / commands.py / prompts.py / util.py / config.py / hook.py / app.py
 
 本文件 re-export 公共符号，保持 `import monitor` 的旧用法可用；
 完整接口与用法说明见 claude_sessions/app.py 的模块文档。

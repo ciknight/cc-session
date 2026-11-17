@@ -24,6 +24,7 @@ Claude Code is great at running tasks. Once several sessions are active, keeping
 - **See everything at a glance** — sessions grouped by project, with working, idle, and stale states.
 - **Know what is happening** — inspect messages, tool calls, diffs, tasks, subagents, models, Git branches, and token usage.
 - **Keep work moving** — send follow-ups, queue messages while Claude is busy, interrupt a turn, or start a new session.
+- **Reuse prompts** — save prompt templates on the server and insert them into the composer from any device.
 - **Stay in control** — handle permission requests and `AskUserQuestion` prompts in the browser.
 - **Use it anywhere on your trusted network** — a responsive interface works on desktop and mobile, with live updates over SSE.
 - **Build on top of it** — consume the JSON API, SSE event stream, or optional webhooks in your own tools.
