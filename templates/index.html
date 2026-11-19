@@ -181,7 +181,10 @@ img.msg-image{cursor:zoom-in}
 .ibtn.secondary{background:none;border-color:var(--acc);color:var(--acc)}
 .ibtn.danger{background:none;border-color:#dc2626;color:#dc2626}
 .ibtn.danger:hover{background:rgba(220,38,38,.08)}
-/* 问答：选项整行可选，选中高亮 */
+/* 问答：选项整行可选，选中高亮。
+   问题列表限高约四问，超出在卡片内滚动，头部与提交按钮始终可见 */
+.choice-list{max-height:min(46vh,440px);overflow-y:auto;overscroll-behavior:contain;
+  padding-right:2px}
 .choice-q+.choice-q{margin-top:10px;padding-top:10px;border-top:1px solid var(--bd)}
 .choice-head{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut);margin-bottom:2px}
 .choice-text{margin-bottom:6px}
@@ -346,6 +349,8 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   #sysbtn{padding:2px 7px}
   main{padding:8px 10px}
   .conv-top{padding:4px 10px 2px}
+  /* 窄屏垂直空间紧张：问答列表再收紧一档，仍可滚动看完 */
+  .choice-list{max-height:min(40vh,320px)}
   .conv-overview{margin:3px 0 1px}
   .conv-cwd{display:none}
   .conv-head{gap:6px}
@@ -2088,7 +2093,8 @@ function interactionHtml(it){
       }).join("");
       return `<div class="inter-card" data-iid="${iid}" data-choice="1" data-sig="${iid}:${esc(it.state)}">
         <div class="inter-head"><span class="inter-kind">需要你的选择</span>
-          <code class="inter-tool">AskUserQuestion</code></div>${questions}
+          <code class="inter-tool">AskUserQuestion</code></div>
+        <div class="choice-list">${questions}</div>
         <div class="inter-actions">
           <button class="ibtn primary" data-act="choice-submit" disabled
             title="请先回答所有问题">提交</button>

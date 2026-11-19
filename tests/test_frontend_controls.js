@@ -758,6 +758,8 @@ test('计划与选择卡片渲染及答案收集', () => {
   assert.match(choice,/checkbox/); assert.match(choice,/Q1/);
   assert.match(choice,/URL 方案/); assert.match(choice,/说明 A/);
   assert.match(choice,/choice-opt/); assert.match(choice,/data-act="choice-submit"/);
+  // 问题列表单独包一层滚动容器，卡片高度不随问题数量无限增长
+  assert.match(choice,/<div class="choice-list">/);
   // 选项 preview 渲染为等宽块；提交按钮初始禁用；跳过带明确拒绝语义
   assert.match(choice,/opt-preview/); assert.match(choice,/code B/);
   assert.match(choice,/choice-submit" disabled/);
