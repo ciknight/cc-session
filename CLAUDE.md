@@ -84,7 +84,7 @@ uv run monitor.py --webhook http://localhost:3000/hook
    存 `CLAUDE_DIR/claude-sessions/prompt-templates.json`；每次操作前比对文件 mtime/size，
    运行期间手改文件会自动重载，损坏文件修复后也能自动恢复。网页发送框「模板」浮层支持搜索、
    插入光标处、保存当前输入、编辑与删除。
-   `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/睡眠（Popen 不等待、Windows 重启带 /t 3 缓冲），
+   `GET /system` 返回宿主机 CPU/内存快照（psutil），`POST /system/power` 执行重启/关机/睡眠（Popen 不等待、Windows 重启/关机带 /t 3 缓冲），
 `POST /system/sleep-timer` 定时睡眠（服务端 `threading.Timer` 内存态，minutes 0-720、0 取消，
 `GET /system` 的 `sleep_timer_remaining` 随轮询返回剩余秒）。
 `POST /system/keep-awake` 开关「干活时推迟睡眠」（仅 Windows `SetThreadExecutionState(ES_SYSTEM_REQUIRED)`：
@@ -321,4 +321,4 @@ Agent 等给出摘要、类别色、状态与 diff 统计），连续同名工�
 或输入法。草稿、未读及搜索条件随整页刷新清空；别名/置顶/归档由独立元数据持久化。
 归档范围与原搜索/状态条件取交集后稳定按置顶分组，组内保留原顺序；详情标题软更新，不重建输入区。
 待处理页和队列摘要均不能因查看、取消或整理操作提前清除新回复提示。
-header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/睡眠经 `window.confirm` 二次确认后 POST；定时睡眠行按 `sleep_timer_remaining` 切换（未设定：预设下拉（30/60/120/180 分钟）+ 设定按钮，已设定：剩余时间 + 取消），轮询重写 innerHTML 时保留用户选中的预设值。另有「干活时推迟睡眠」开关（`#keepawake`）、短回合通知阈值（`#notifymindur`）与残留进程区块（`orphansHtml`，逐个/全部结束均 confirm 后 POST）。
+header 右侧「系统」按钮弹出 `#syspop` 浮层（模式同 `#queuepop`）：CPU/内存利用率条形图、展开期间 3 秒自动刷新，底部重启/关机/睡眠经 `window.confirm` 二次确认后 POST；定时睡眠行按 `sleep_timer_remaining` 切换（未设定：预设下拉（30/60/120/180 分钟）+ 设定按钮，已设定：剩余时间 + 取消），轮询重写 innerHTML 时保留用户选中的预设值。另有「干活时推迟睡眠」开关（`#keepawake`）、短回合通知阈值（`#notifymindur`）与残留进程区块（`orphansHtml`，逐个/全部结束均 confirm 后 POST）。

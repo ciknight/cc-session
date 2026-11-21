@@ -904,27 +904,32 @@ class ManagementAPITests(unittest.TestCase):
     def test_power_command_platform_matrix(self):
         with patch.object(system.sys, "platform", "win32"):
             self.assertEqual(monitor.power_command("restart"), ["shutdown", "/r", "/t", "3"])
+            self.assertEqual(monitor.power_command("shutdown"), ["shutdown", "/s", "/t", "3"])
             self.assertEqual(monitor.power_command("sleep"),
                              ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
         with patch.object(system.sys, "platform", "linux"):
             self.assertEqual(monitor.power_command("restart"), ["systemctl", "reboot"])
+            self.assertEqual(monitor.power_command("shutdown"), ["systemctl", "poweroff"])
             self.assertEqual(monitor.power_command("sleep"), ["systemctl", "suspend"])
         with self.assertRaises(ValueError):
             monitor.power_command("halt")
 
     def test_power_endpoint_spawns_command(self):
         calls = []
-        commands = {"restart": ["x", "r"], "sleep": ["x", "s"]}
+        commands = {"restart": ["x", "r"], "shutdown": ["x", "off"], "sleep": ["x", "s"]}
         with patch.object(system, "power_command", lambda action: commands[action]), \
              patch.object(system.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)):
             result = json.load(self.request('/system/power', {"action": "restart"},
                                             {"Content-Type": "application/json"}))
+            result_off = json.load(self.request('/system/power', {"action": "shutdown"},
+                                                {"Content-Type": "application/json"}))
         self.assertEqual(result, {"ok": True})
-        self.assertEqual(calls, [["x", "r"]])
+        self.assertEqual(result_off, {"ok": True})
+        self.assertEqual(calls, [["x", "r"], ["x", "off"]])
 
     def test_power_endpoint_rejects_unknown_action(self):
         with self.assertRaises(HTTPError) as ctx:
-            self.request('/system/power', {"action": "shutdown"}, {"Content-Type": "application/json"})
+            self.request('/system/power', {"action": "halt"}, {"Content-Type": "application/json"})
         self.assertEqual(ctx.exception.code, 400)
 
     def test_power_endpoint_reports_spawn_failure(self):

@@ -430,7 +430,7 @@ def make_handler(mon, refresh_interval):
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400)
                 try:
-                    # spawn 即返回不等待命令完成；实际重启/挂起发生在响应写出之后
+                    # spawn 即返回不等待命令完成；实际重启/关机/挂起发生在响应写出之后
                     system.spawn_power(action)
                 except OSError as e:
                     return self._json({"error": f"电源命令执行失败：{e}"}, 500)

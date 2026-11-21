@@ -3708,6 +3708,7 @@ function sysPopHtml(data){
     ${systimerHtml(data)}
     ${notifyFilterHtml()}
     <div class="sysacts"><button class="ibtn danger" data-power="restart">重启</button>
+      <button class="ibtn danger" data-power="shutdown">关机</button>
       <button class="ibtn danger" data-power="sleep">睡眠</button></div>`;
 }
 function positionSysPop(){
@@ -3769,6 +3770,8 @@ function toggleSysPop(open){
 async function sendPower(action){
   const text = action === "restart"
     ? "确定要重启这台电脑？正在执行的会话任务会被中断。"
+    : action === "shutdown"
+    ? "确定要关闭这台电脑？未保存的工作会丢失，正在执行的会话任务会被中断。"
     : "确定要使这台电脑进入睡眠？";
   if(!window.confirm(text)) return;
   try{
@@ -3777,7 +3780,9 @@ async function sendPower(action){
     let j = null;
     try{ j = await r.json(); }catch(e){}
     sysPop.note = r.ok && j && j.ok
-      ? (action === "restart" ? "已发送重启指令，服务即将中断…" : "已发送睡眠指令…")
+      ? (action === "restart" ? "已发送重启指令，服务即将中断…"
+        : action === "shutdown" ? "已发送关机指令，服务即将中断…"
+        : "已发送睡眠指令…")
       : (j && j.error) || "执行失败";
   }catch(e){ sysPop.note = "执行失败：" + (e && e.message || e); }
   renderSysPop();

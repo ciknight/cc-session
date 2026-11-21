@@ -40,20 +40,26 @@ def system_snapshot():
 
 def power_command(action):
     """返回平台对应的电源命令参数列表（由调用方 Popen，不等待完成）；
-    动作非法时抛 ValueError。Windows 重启带 /t 3 缓冲，让前端先收到响应。"""
+    动作非法时抛 ValueError。Windows 重启/关机带 /t 3 缓冲，让前端先收到响应。"""
     if action == "restart":
         if sys.platform == "win32":
             return ["shutdown", "/r", "/t", "3"]
         if sys.platform == "darwin":
             return ["osascript", "-e", 'tell app "System Events" to restart']
         return ["systemctl", "reboot"]
+    if action == "shutdown":
+        if sys.platform == "win32":
+            return ["shutdown", "/s", "/t", "3"]
+        if sys.platform == "darwin":
+            return ["osascript", "-e", 'tell app "System Events" to shut down']
+        return ["systemctl", "poweroff"]
     if action == "sleep":
         if sys.platform == "win32":
             return ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]
         if sys.platform == "darwin":
             return ["osascript", "-e", 'tell app "System Events" to sleep']
         return ["systemctl", "suspend"]
-    raise ValueError("action 必须是 restart 或 sleep")
+    raise ValueError("action 必须是 restart、shutdown 或 sleep")
 
 
 def spawn_power(action):
