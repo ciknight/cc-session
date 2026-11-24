@@ -278,6 +278,10 @@ def make_handler(mon, refresh_interval):
                 d["hosted_streaming"] = bool(h and h.alive() and h.stream_job is not None)
                 d["hosted_rate_limit"] = (util.active_rate_limit(h.last_rate_limit)
                                           if h and h.alive() else None)
+                d["fast"] = h.fast_mode if h and h.alive() else None
+                d["hosted_fast_mode"] = ({"state": h.fast_mode_state,
+                                          "reason": h.fast_mode_reason}
+                                         if h and h.alive() else None)
                 d["hosted_conversation_reset"] = (h.last_conversation_reset
                                                   if h and h.alive() else None)
                 return self._json(d)
@@ -570,6 +574,13 @@ def make_handler(mon, refresh_interval):
                 body = self._read_body()
                 level = body.get("effort") if isinstance(body, dict) else None
                 code, resp = mon.set_effort(parts[1], level)
+                return self._json(resp, code)
+            if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "fast":
+                body = self._read_body()
+                on = body.get("fast") if isinstance(body, dict) else None
+                if not isinstance(on, bool):
+                    return self._json({"error": '"fast" 必须是布尔值'}, 400)
+                code, resp = mon.set_fast(parts[1], on)
                 return self._json(resp, code)
             if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "message":
                 body = self._read_body(config.HTTP_IMAGE_BODY_LIMIT)

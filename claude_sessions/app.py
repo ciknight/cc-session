@@ -18,6 +18,7 @@
   POST /sessions/<id>/interrupt   中断托管会话当前回合并清空排队消息
   POST /sessions/<id>/approval    设置审批模式 {"approval":"ask|auto|full"}
   POST /sessions/<id>/effort      设置托管思考档位 {"effort":"low|medium|high|xhigh|max|default"}
+  POST /sessions/<id>/fast        切换托管会话 fast mode {"fast":true|false}（会话级，不持久化）
   GET /static/<file>          前端静态资源（marked / DOMPurify）
   GET /events                 SSE 实时事件流（?session=<id> 可过滤；首帧为 snapshot，
                               流式文本为 transient turn_delta）

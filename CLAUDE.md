@@ -79,7 +79,9 @@ uv run monitor.py --webhook http://localhost:3000/hook
    `/sessions/<id>/messages` 支持 `limit`（默认 100）、`before`、`from` 分页。
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
-   设置托管思考档位（low/medium/high/xhigh/max/default）。
+   设置托管思考档位（low/medium/high/xhigh/max/default），
+   `POST /sessions/<id>/fast` 切换托管会话的 fast mode（body `{"fast": bool}`，
+   仅托管支持，会话级不持久化）。
    `GET/POST /prompt-templates` 与 `DELETE /prompt-templates/<id>` 管理常用提示词模板，
    存 `CLAUDE_DIR/claude-sessions/prompt-templates.json`；每次操作前比对文件 mtime/size，
    运行期间手改文件会自动重载，损坏文件修复后也能自动恢复。网页发送框「模板」浮层支持搜索、
@@ -169,6 +171,18 @@ uv run monitor.py --webhook http://localhost:3000/hook
   `commands/*.md` 与目录型 skill（`plugin:name`，local scope 按 `projectPath` 匹配
   cwd）；内置命令不在文件系统上，仍要等进程 init 广播。结果按 `(claude_dir, cwd)` 缓存
   30 秒，前端另按 cwd 缓存。
+- **fast mode（`/fast`）**：仅托管会话，会话级、不持久化（CLI 自身语义即 "this session only"，
+  与计费相关，重托管回到关闭）。CLI 在 SDK（stream-json）模式下默认 `sdk_opt_in_required`，
+  opt-in 靠 flagSettings（`--settings` 或 `apply_flag_settings` control）里的 `fastMode: true`，
+  且 `/fast off` 会把已注入的 opt-in 一并清掉——因此 `Hosted.set_fast(True)` 每次开启前都先用
+  `apply_flag_settings` 重新注入（幂等），再经正常消息通道发 `/fast on|off`，切换结果以命令
+  气泡呈现在对话里（可能附带模型切换到 Opus 的提示；`process_model` 不跟随，后续带模型的
+  发送仍按原记录切换）。状态分两层：`Hosted.fast_mode` 记录服务侧开关意图（前端 checkbox 的
+  数据源），CLI 在 `system/init` 与 `result` 帧上报的 `fast_mode_state`
+  （off/cooldown/on）与 `fast_mode_disabled_reason`（开放集合）由 `_update_fast_mode` 跟踪、
+  变化时发 `hosted_fast_mode` 事件，detail 投影为 `fast` + `hosted_fast_mode`，前端头部 chip
+  显示 on/cooldown。两者分开是因为 state 混入了模型支持与账号可用性（模型不支持时
+  `/fast on` 成功但 state 仍为 off），不能当开关用。
 - **工作时发送**：非托管一次性消息进入 `Monitor.remote_queues`，上一条 `_run_job` 结束后自动
   派发下一条（每会话上限 32）。托管会话的消息**立即写入常驻进程 stdin**，不再等服务端等上一轮
   结束：CLI 自己维护命令队列，并在工具轮之间把新消息折叠进当前回合（absorbed_mid_turn）。
@@ -296,7 +310,8 @@ aria 状态绑定当前视觉态。`autosizeComposer` 的输入框增高上限�
 发送状态（发送中/排队/处理中/已完成/失败）显示为输入区上方的浮动胶囊，不占布局高度；
 「已完成/已取消」约 4 秒后自动消失，失败等错误保持显示。发送区提供中断按钮、审批
 模式选择与思考档位（effort）下拉（托管中 onchange 即切，未托管保存待下次托管生效；新建页未勾选
-托管时禁用）；审批默认 `full`，发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用
+托管时禁用）与 fast 开关（仅会话页渲染，未托管禁用；切换失败回滚勾选，结果看对话里的命令气泡）；
+审批默认 `full`，发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用
 同一个 `composerHtml` 输入对话框；输入框下有斜杠指令提示面板（`wireCommandHints`，目录来自
 detail 轮询的 `commands`，仅托管会话有），`<details>` 的展开状态按稳定 key 记录在 `detailsOpen`，
 自动刷新/整页刷新后恢复（`sessionStorage`）。子代理折叠区与会话卡片显示运行中数量

@@ -680,7 +680,118 @@ class ExecutionTests(unittest.TestCase):
         deadline = time.time() + 2
         while not host.commands and time.time() < deadline:
             time.sleep(0.01)
-        self.assertEqual(host.commands, ["compact", "model", "review"])
+        self.assertEqual(host.commands, ["compact", "fast", "model", "review"])
+
+    def test_set_fast_requires_live_host(self):
+        code, resp = self.mon.set_fast("existing", True)
+        self.assertEqual(code, 409)
+        self.assertIn("托管", resp["error"])
+
+    def test_set_fast_roundtrip_tracks_state(self):
+        host, job_id, _ = self.start_host_capturing(resume_id="existing")
+        self.wait_done(job_id)
+        # 首轮 init 未 opt-in：CLI 上报 off + sdk_opt_in_required
+        deadline = time.time() + 2
+        while host.fast_mode_reason is None and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(host.fast_mode_state, "off")
+        self.assertEqual(host.fast_mode_reason, "sdk_opt_in_required")
+        # 开启：先 opt-in 再发 /fast on，fake 的 result 带 fast_mode_state=on
+        code, resp = self.mon.set_fast("existing", True)
+        self.assertEqual(code, 202)
+        self.assertTrue(host.fast_mode)
+        job = self.wait_done(resp["job_id"])
+        self.assertIn("Fast mode ON", job["result"])
+        self.assertEqual(host.fast_mode_state, "on")
+        self.assertIsNone(host.fast_mode_reason)
+        # 关闭：/fast off 清 opt-in，fake 下一回合 init 回到 sdk_opt_in_required
+        code, resp = self.mon.set_fast("existing", False)
+        self.assertEqual(code, 202)
+        self.assertFalse(host.fast_mode)
+        job = self.wait_done(resp["job_id"])
+        self.assertIn("Fast mode OFF", job["result"])
+
+    def test_set_fast_control_failure_returns_409(self):
+        host, _, _ = self.start_host_capturing(resume_id="existing")
+        with patch.object(host, "_control",
+                          side_effect=RuntimeError("控制请求失败: apply_flag_settings")):
+            code, resp = self.mon.set_fast("existing", True)
+        self.assertEqual(code, 409)
+        self.assertIn("opt-in", resp["error"])
+        self.assertIsNone(host.fast_mode)
+
+    def test_set_fast_interrupted_before_execution_rolls_back(self):
+        original = subprocess.Popen
+        fake = str(Path(__file__).with_name("fake_claude.py"))
+        def popen(cmd, **kw):
+            return original([sys.executable, fake] + cmd[1:], **kw)
+        with patch.object(hosted.subprocess, "Popen", side_effect=popen):
+            code, response = self.mon.host_session(str(self.root), None, "interrupt-me")
+        self.assertEqual(code, 202)
+        host = self.mon.hosted[response["hosted_id"]]
+        self.hosts.append(host)
+        time.sleep(0.6)      # 等 interrupt-me（5 秒）占住当前回合
+        code, resp = self.mon.set_fast("fake-session", True)
+        self.assertEqual(code, 202)
+        self.assertTrue(host.fast_mode)
+        # result 帧到达后 monitor 留 3 秒收集窗口，此时中断会清掉排队的 /fast on
+        code, _ = host.interrupt()
+        self.assertEqual(code, 200)
+        self.assertIsNone(host.fast_mode, "命令未执行应回滚到切换前的值")
+
+    def test_finish_job_settles_fast_intent_by_outcome(self):
+        host = hosted.Hosted(self.mon, str(self.root))
+
+        def make_job(result, **extra):
+            return {"id": "j", "session": "existing", "status": "queued",
+                    "started_at": 1, "command_uuid": "c1", "error": "",
+                    "result": result, **extra}
+
+        # CLI 拒绝（账号/模型不支持）：done 但 result 是 unavailable，回滚
+        host.fast_mode = False
+        host._finish_job(make_job("Fast mode unavailable: ...", _fast_prev=True),
+                         "completed")
+        self.assertTrue(host.fast_mode)
+        # 正常执行：Fast mode ON，保留新意图
+        host.fast_mode = True
+        host._finish_job(make_job("Fast mode ON · model set to Opus", _fast_prev=False),
+                         "completed")
+        self.assertTrue(host.fast_mode)
+        # 被后续消息接管：命令实际没跑，回滚
+        host.fast_mode = True
+        host._finish_job(make_job(None, _fast_prev=False, _preempted=True),
+                         "completed")
+        self.assertFalse(host.fast_mode)
+        # 取消：回滚
+        host.fast_mode = True
+        host._finish_job(make_job(None, _fast_prev=False), "cancelled")
+        self.assertFalse(host.fast_mode)
+        # 无 fast 标记的普通 job 不受影响
+        host.fast_mode = True
+        host._finish_job(make_job("hello"), "cancelled")
+        self.assertTrue(host.fast_mode)
+
+    def test_update_fast_mode_ignores_and_validates(self):
+        host = hosted.Hosted(self.mon, str(self.root))
+        events = []
+        host._emit_session_event = lambda kind, data: events.append(kind)
+        # 不带字段的帧（assistant 等）不产生状态
+        host._update_fast_mode({"type": "assistant"})
+        self.assertIsNone(host.fast_mode_state)
+        # 未知 state 归 None，reason 原样保留（开放集合）；每次变化各发一次事件
+        host._update_fast_mode({"fast_mode_state": "warp", "fast_mode_disabled_reason": "brand_new"})
+        self.assertIsNone(host.fast_mode_state)
+        self.assertEqual(host.fast_mode_reason, "brand_new")
+        host._update_fast_mode({"fast_mode_state": "off"})
+        self.assertEqual(events, ["hosted_fast_mode", "hosted_fast_mode"])
+        # 收敛到稳定值后，重复帧不重发事件
+        host._update_fast_mode({"fast_mode_state": "off"})
+        self.assertEqual(len(events), 2)
+        # info() 投影
+        info = host.info()
+        self.assertEqual(info["fast_mode_state"], "off")
+        self.assertIsNone(info["fast_mode_reason"])
+        self.assertIsNone(info["fast_mode"])
 
 
 if __name__ == "__main__":

@@ -130,6 +130,9 @@ class Hosted:
         self.max_resolved_commands = 128
         self.last_api_retry = None     # 最近一次上游重试，用于诊断 5xx/限流
         self.last_rate_limit = None    # 最近一次 rate_limit_event（status/resets_at/utilization）
+        self.fast_mode = None          # fast 开关意图（服务侧记录，CLI 的 /fast 是会话级）
+        self.fast_mode_state = None    # CLI 上报的 fast 状态（off/cooldown/on，见 _update_fast_mode）
+        self.fast_mode_reason = None   # CLI 上报的不可用原因（sdk_opt_in_required 等，开放集合）
         self.last_conversation_reset = None  # /clear 等场景的 conversation_reset
         self.pending_conversation_reset = None  # 等下一帧 session_id 出现后迁移会话
         self.stream_text = ""          # 当前 job 的流式文本聚合
@@ -444,6 +447,7 @@ class Hosted:
                     inter.skip_response = True
                     inter.resolve("deny", reason="请求已被 Claude 取消", state="cancelled")
             elif typ == "system" and obj.get("subtype") == "init":
+                self._update_fast_mode(obj)
                 self._on_init(obj.get("session_id"), obj)
             elif typ == "system" and obj.get("subtype") == "api_retry":
                 retry = {"attempt": obj.get("attempt"),
@@ -475,6 +479,7 @@ class Hosted:
             elif typ == "stream_event":
                 self._on_stream_event(obj)
             elif typ == "result":
+                self._update_fast_mode(obj)
                 self._on_result(obj)
             # 其余事件（assistant / thinking 等）转录文件里已有，这里不处理
         rc = self.proc.wait()
@@ -646,6 +651,31 @@ class Hosted:
         print(f"[hosted] {self.hid} rate_limit status={record['status']} "
               f"resets_at={record['resets_at']}", flush=True)
 
+    def _update_fast_mode(self, obj):
+        """跟踪 CLI 在 system/init 与 result 帧上报的 fast 状态。
+
+        state 是三值闭合集合（off/cooldown/on）；reason 是开放集合
+        （sdk_opt_in_required / model_not_allowed / preference / …），未知值原样
+        保留供前端展示。开关本身（self.fast_mode）由 set_fast 记录意图——
+        state 混入了模型支持与账号可用性，不能当开关用（例如模型不支持时
+        /fast on 成功但 state 仍为 off）。
+        """
+        if not isinstance(obj, dict) or "fast_mode_state" not in obj:
+            return
+        state = obj.get("fast_mode_state")
+        state = state if state in ("off", "cooldown", "on") else None
+        reason = obj.get("fast_mode_disabled_reason")
+        reason = reason if isinstance(reason, str) else None
+        with self.ready:
+            changed = ((self.fast_mode_state, self.fast_mode_reason)
+                       != (state, reason))
+            self.fast_mode_state, self.fast_mode_reason = state, reason
+        if changed:
+            self._emit_session_event("hosted_fast_mode",
+                                     {"hosted": self.hid,
+                                      "fast_mode_state": state,
+                                      "fast_mode_disabled_reason": reason})
+
     def _on_conversation_reset(self, obj):
         record = {"new_conversation_id": obj.get("new_conversation_id"),
                   "from": self.session_id,
@@ -798,6 +828,11 @@ class Hosted:
                 status, error = "cancelled", job.get("error") or "已中断"
             else:
                 status, error = "failed", job.get("error") or f"command {terminal_state}"
+            # fast 切换命令：正常跑完且 CLI 没有回 unavailable 才算执行成功
+            self._settle_fast_intent_locked(
+                job, executed=(status == "done" and not job.get("_preempted")
+                               and not str(job.get("result") or "")
+                               .startswith("Fast mode unavailable")))
             self.mon._terminal_job_locked(job, status, error=error)
             self.pending = deque(item for item in self.pending if item[1] is not job)
             if self.interrupt_target is job:
@@ -932,6 +967,50 @@ class Hosted:
             self.process_effort = level
         self.effort = level
 
+    def set_fast(self, on):
+        """切换 fast mode（CLI 的 /fast，会话级）。返回 send 的 (code, resp)。
+
+        开启前先用 apply_flag_settings 重新注入 flagSettings 的 fastMode：
+        SDK（stream-json）模式默认 sdk_opt_in_required，且 /fast off 会把
+        之前注入的 opt-in 一并清掉，所以每次开启都要先补一次（实测幂等）。
+        关闭无需 opt-in，直接发命令。命令经正常消息通道执行，输出是命令
+        气泡（"↯ Fast mode ON · model set to `Opus` …"），失败也能在对话里
+        看到原因。注意 /fast on 可能把进程模型切到 Opus，process_model
+        不会跟着变，后续带模型的发送仍按原记录切换。
+        """
+        on = bool(on)
+        if not self.alive():
+            return 409, {"error": "hosted process is not running"}
+        if on:
+            try:
+                self._control("apply_flag_settings", settings={"fastMode": True})
+            except (RuntimeError, TimeoutError) as e:
+                return 409, {"error": f"fast mode opt-in 失败: {e}"}
+        previous = self.fast_mode
+        code, resp = self.send("/fast on" if on else "/fast off")
+        if code == 202:
+            self.fast_mode = on
+            # 命令排队/执行期间可能被取消、被接管或被 CLI 拒绝（账号/模型不支持），
+            # 这些路径实际没有切换成功，_finish_job 收尾时据此回滚意图
+            job = self.mon.jobs.get(resp.get("job_id")) if resp.get("job_id") else None
+            if job is not None:
+                job["_fast_prev"] = previous
+        return code, resp
+
+    def _settle_fast_intent_locked(self, job, executed=False):
+        """fast 切换命令的意图收尾：命令未真正执行时回滚开关记录。
+
+        用键存在性判断标记（prev 的合法值含 None——切换前未设置过开关），
+        不能拿值当哨兵。executed 为真的判据由调用方给（status=done 且非被
+        接管且 CLI 未回复 "Fast mode unavailable"）；进程退出路径不调
+        这里——Hosted 已死，fast 投影按 alive() 归 None。
+        """
+        if "_fast_prev" not in job:
+            return
+        prev = job.pop("_fast_prev")
+        if not executed and self.fast_mode != prev:
+            self.fast_mode = prev
+
     def cancel_queued(self, job, sid=None):
         """取消一条尚未开始执行的托管消息（可能已写进 CLI 的命令队列）。"""
         with self.ready:
@@ -973,6 +1052,7 @@ class Hosted:
             queued = [j for _, j, _ in self.pending if j is not job]
             queued_count = len(queued)
             for queued_job in queued:
+                self._settle_fast_intent_locked(queued_job)
                 self._remember_resolved_locked(queued_job)
                 self.mon._terminal_job_locked(queued_job, "cancelled", error="已中断")
             self.pending = deque(item for item in self.pending if item[1] is job) \
@@ -1056,6 +1136,9 @@ class Hosted:
                 "stream_text": stream_text, "streaming": streaming,
                 "last_api_retry": self.last_api_retry,
                 "last_rate_limit": util.active_rate_limit(self.last_rate_limit),
+                "fast_mode": self.fast_mode,
+                "fast_mode_state": self.fast_mode_state,
+                "fast_mode_reason": self.fast_mode_reason,
                 "last_conversation_reset": self.last_conversation_reset,
                 "needs_rehost": self.needs_rehost,
                 "turns": turns, "returncode": self.returncode,

@@ -706,6 +706,15 @@ class Monitor:
             return 409, {"error": "session is not hosted"}
         return h.interrupt()
 
+    def set_fast(self, sid, on):
+        """切换托管会话的 fast mode（/fast）。会话级，不持久化：CLI 语义即
+        "this session only"，与计费相关，重托管后回到关闭。"""
+        with self.lock:
+            h = self.hosted_by_sid.get(sid)
+        if not h or not h.alive():
+            return 409, {"error": "fast 仅托管会话支持"}
+        return h.set_fast(on)
+
     def set_approval(self, sid, mode):
         """先切换活动托管进程，成功后再持久化，避免失败时磁盘与内存不一致。"""
         if mode not in APPROVAL_MODES:

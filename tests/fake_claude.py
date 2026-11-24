@@ -16,6 +16,9 @@ _write_lock = threading.Lock()
 pending_permission_uuid = None
 pending_interrupt_uuid = None
 cancelled = set()
+fast_opt_in = False        # apply_flag_settings 注入的 fastMode opt-in
+fast_on = False            # /fast 的会话级开关
+turn_busy = threading.Event()   # 有回合进行中：/fast 等它结束（模拟 CLI 命令队列）
 
 
 def emit(obj):
@@ -24,15 +27,22 @@ def emit(obj):
 
 
 def complete(uuid, text):
-    emit({"type": "result", "session_id": "fake-session", "result": text})
+    result = {"type": "result", "session_id": "fake-session", "result": text}
+    if fast_on:
+        # 真实 CLI 在 result 帧附带当前 fast 状态（thin client 靠它同步）
+        result["fast_mode_state"] = "on"
+    emit(result)
     emit({"type": "command_lifecycle", "command_uuid": uuid, "state": "completed"})
 
 
 def slow_turn(uuid, text):
-    time.sleep(5 if text == "interrupt-me" else 0.15)
-    if uuid in cancelled:
-        return
-    complete(uuid, str(model) + ":" + text)
+    turn_busy.set()
+    try:
+        time.sleep(5 if text == "interrupt-me" else 0.15)
+        if uuid not in cancelled:
+            complete(uuid, str(model) + ":" + text)
+    finally:
+        turn_busy.clear()
 
 
 for line in sys.stdin:
@@ -54,6 +64,10 @@ for line in sys.stdin:
                     "error": "模型不可用"}})
                 continue
             model = value
+        elif subtype == "apply_flag_settings":
+            settings = request.get("settings") or {}
+            if settings.get("fastMode") is True:
+                fast_opt_in = True
         elif subtype == "interrupt":
             uuid = pending_interrupt_uuid
             if uuid:
@@ -69,13 +83,46 @@ for line in sys.stdin:
             uuid, pending_permission_uuid = pending_permission_uuid, None
             complete(uuid, "decision:" + str(decision))
     elif typ == "user":
-        emit({"type": "system", "subtype": "init", "session_id": "fake-session",
-              "slash_commands": ["/compact", "model", "/review", "/model"]})
+        init = {"type": "system", "subtype": "init", "session_id": "fake-session",
+                "slash_commands": ["/compact", "model", "/review", "/model", "/fast"]}
+        if fast_on:
+            init["fast_mode_state"] = "on"
+        elif not fast_opt_in:
+            # 模拟真实 CLI：SDK 模式未 opt-in 时每回合都报 sdk_opt_in_required
+            init["fast_mode_state"] = "off"
+            init["fast_mode_disabled_reason"] = "sdk_opt_in_required"
+        else:
+            init["fast_mode_state"] = "off"
+        emit(init)
         text = obj["message"]["content"]
         uuid = obj.get("uuid")
         # 真实 CLI 会先发 queued，再发 started
         emit({"type": "command_lifecycle", "command_uuid": uuid, "state": "queued"})
         emit({"type": "command_lifecycle", "command_uuid": uuid, "state": "started"})
+        if text in ("/fast on", "/fast off"):
+            # 复现真实行为：忙时命令先进 CLI 队列，等当前回合结束才执行；
+            # 无 opt-in 时 /fast 被拒（result 仍带状态帧）；/fast off 顺带
+            # 清掉 opt-in；result 带 fast_mode_state
+            deadline = time.time() + 30
+            while turn_busy.is_set() and time.time() < deadline:
+                time.sleep(0.02)
+            want = text.endswith("on")
+            result = {"type": "result", "session_id": "fake-session",
+                      "fast_mode_state": "off"}
+            if want and not fast_opt_in:
+                result["result"] = ("Fast mode unavailable: Fast mode is not "
+                                    "available in the Agent SDK")
+                result["fast_mode_disabled_reason"] = "sdk_opt_in_required"
+            else:
+                fast_on = want
+                if not want:
+                    fast_opt_in = False
+                result["result"] = "Fast mode ON" if want else "Fast mode OFF"
+                if want:
+                    result["fast_mode_state"] = "on"
+            emit(result)
+            emit({"type": "command_lifecycle", "command_uuid": uuid,
+                  "state": "completed"})
         if text.startswith("permission"):
             pending_permission_uuid = uuid
             emit({"type": "control_request", "request_id": "req-1", "request": {

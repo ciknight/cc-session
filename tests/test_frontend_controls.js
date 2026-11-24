@@ -2228,6 +2228,53 @@ test('effort 下拉即切并软同步服务端值', async () => {
   assert.equal(b.run('sessionCommands[0]'), 'model');
 });
 
+test('fast 开关：会话页渲染、新建页不渲染、未托管禁用', () => {
+  const b=boot();
+  const conv=b.run('composerHtml("conv", {hosted:false})');
+  assert.match(conv, /id="fastcb"/);
+  assert.match(conv, /id="fastcb"[^>]*disabled/, '未托管应禁用');
+  const hosted=b.run('composerHtml("conv", {hosted:true})');
+  assert.doesNotMatch(hosted, /id="fastcb"[^>]*disabled/);
+  const fresh=b.run('composerHtml("new", {})');
+  assert.doesNotMatch(fresh, /id="fastcb"/);
+});
+
+test('fast 开关 POST /fast，失败回滚勾选；detail 软同步', async () => {
+  const requests=[];
+  const b=boot(async(url, opts={})=>{
+    requests.push([url, opts.body && JSON.parse(opts.body)]);
+    if(url==='/sessions/sid/fast') return response({job_id:'j1'});
+    return response({});
+  });
+  b.run('bindSendBox("sid", {hosted:true})');
+  const cb=b.node('fastcb');
+  assert.ok(cb, '会话页应有 fast 开关');
+  assert.equal(cb.disabled, false);
+  cb.checked=true;
+  cb.dispatchEvent({type:'change'});
+  await new Promise(r=>setImmediate(r));
+  const fastCall = requests.find(r=>r[0]==='/sessions/sid/fast');
+  assert.ok(fastCall, '应发出 fast POST');
+  assert.deepEqual(fastCall[1], {fast:true});
+  // 失败路径：非 2xx 回滚勾选
+  const b2=boot(async(url)=>{
+    if(url==='/sessions/sid/fast') return {ok:false,status:409,json:async()=>({error:'fast 仅托管会话支持'})};
+    return response({});
+  });
+  b2.run('bindSendBox("sid", {hosted:true})');
+  const cb2=b2.node('fastcb');
+  cb2.checked=true;
+  cb2.dispatchEvent({type:'change'});
+  await new Promise(r=>setImmediate(r));
+  assert.equal(cb2.checked, false, '切换失败应回滚');
+  // 软同步：detail 的 fast/托管状态回填开关
+  b.run('updateHostedControls({hosted:true, fast:true})');
+  assert.equal(cb.checked, true);
+  b.run('updateHostedControls({hosted:false})');
+  assert.equal(cb.checked, false);
+  assert.equal(cb.disabled, true);
+});
+
 test('composer 结构：队列 chip 在模型行内、次要控件包进 extra、概览含计数', () => {
   const b=boot();
   const conv=b.run('composerHtml("conv",{hosted:false})');

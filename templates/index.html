@@ -719,6 +719,15 @@ function rateLimitChip(s){
   if(r.resets_at) parts.push("重置 " + new Date(r.resets_at * 1000).toLocaleTimeString());
   return `<span class="chip warn" title="${esc(parts.join(" · "))}">⏳ ${label}</span>`;
 }
+function fastStateChip(d){
+  const f = d && d.hosted_fast_mode;
+  if(!f) return "";
+  if(f.state === "cooldown")
+    return '<span class="chip warn" title="fast mode 限流后冷却中，到期自动恢复；恢复前后均为标准速度计费外的正常输出">⚡ 冷却</span>';
+  if(f.state === "on")
+    return '<span class="chip" title="fast mode 生效中（CLI system/init 与 result 帧上报）">⚡ fast</span>';
+  return "";
+}
 
 const metadataCache = new Map(), metadataSaves = new Map(), detailMetadata = new Map();
 function mergeMetadata(data){
@@ -1046,7 +1055,7 @@ function composerHtml(mode, d){
               title="插入常用提示词模板">模板</button>
       ${isNew ? "" : `<button class="back" id="intbtn" disabled>中断并清空队列</button>`}
       <button class="back composer-cog" id="cogbtn" aria-label="发送选项"
-              title="审批 / 思考 / 发送选项">⚙</button>
+              title="审批 / 思考 / fast / 发送选项">⚙</button>
       <span class="composer-extra">
         <label class="ctl" id="approvalwrap">审批
           <select id="approvalsel" aria-label="托管审批模式">
@@ -1063,6 +1072,8 @@ function composerHtml(mode, d){
             <option value="xhigh">xhigh</option>
             <option value="max">max</option>
           </select></label>
+        ${!isNew ? `<label class="ctl" id="fastwrap" title="fast mode：模型支持时更快输出，否则切到 Opus（计费不同，详见命令输出）；仅当前托管进程有效，重托管后回到关闭">
+          <input type="checkbox" id="fastcb" ${d.fast ? "checked" : ""} ${d.hosted ? "" : "disabled"}> fast</label>` : ""}
         <label class="ctl" title="勾选后本次发送会启动一个常驻 claude 进程接管该会话，之后的消息直接写进它的 stdin，不再每次重启">
           <input type="checkbox" id="hostcb" ${!isNew && d.hosted ? "checked disabled" : "checked"}> 托管（常驻进程，后续消息不再重启）</label>
         ${!isNew && d.hosted ? `<span class="chip">⚙ 已托管，消息直接写入常驻进程</span>
@@ -1335,7 +1346,7 @@ const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_
   "tool_use", "tool_error", "turn_finished", "subagent_start", "subagent_done",
   "task_created",
   "task_updated", "context_compacted", "api_error", "hosted_turn_done",
-  "hosted_api_retry", "hosted_rate_limit", "hosted_conversation_reset",
+  "hosted_api_retry", "hosted_rate_limit", "hosted_fast_mode", "hosted_conversation_reset",
   "hosted_session_switched", "hosted_foreign_turn", "interaction_pending",
   "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
   "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed"];
@@ -2225,6 +2236,12 @@ function updateHostedControls(d){
   if(sel && d && d.approval) sel.value = d.approval;
   const effortSel = document.getElementById("effortsel");
   if(effortSel && d && d.effort) effortSel.value = d.effort;
+  const fastCb = document.getElementById("fastcb");
+  if(fastCb && d){
+    // 会话页才有 fast 开关；未托管禁用并回 false（CLI 的 /fast 是会话级）
+    fastCb.disabled = !d.hosted;
+    fastCb.checked = d.hosted ? !!d.fast : false;
+  }
   sessionCommands = d && Array.isArray(d.commands) ? d.commands : [];
   const intBtn = document.getElementById("intbtn");
   if(intBtn && d){
@@ -2434,7 +2451,7 @@ async function renderConversation(id, force){
                       title="返回项目列表">←<span class="back-label"> 返回</span></button>
               <h2>
                 <span class="b ${d.state}" id="statebadge">${STATE_ZH[d.state] || d.state}</span>
-                ${d.hosted ? '<span class="chip" title="该会话由常驻进程托管">⚙<span class="chip-label"> 托管中</span></span>' : ""}${rateLimitChip(d)}
+                ${d.hosted ? '<span class="chip" title="该会话由常驻进程托管">⚙<span class="chip-label"> 托管中</span></span>' : ""}${rateLimitChip(d)}${fastStateChip(d)}
                 <span id="detailtitle">${esc(sessTitle(mergeMetadata(d)))}</span>
                 <span class="mut conv-cwd">${esc(d.cwd || "")}</span></h2>
               <button class="back" id="zenbtn" title="沉浸模式：隐藏顶部栏与概览，扩大消息区"
@@ -3323,6 +3340,27 @@ function bindSendBox(id, d){
         document.getElementById("sendst").textContent = "思考档位失败: " + (j.error || r.status);
     }catch(e){
       document.getElementById("sendst").textContent = "思考档位保存失败: " + e;
+    }
+  };
+  const fastCb = document.getElementById("fastcb");
+  if(fastCb) fastCb.onchange = async () => {
+    const on = fastCb.checked;
+    try{
+      const r = await fetchT("/sessions/" + encodeURIComponent(id) + "/fast", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({fast: on}),
+      });
+      const j = await r.json();
+      if(r.ok){
+        flashSendSt(id, on ? "已发送 /fast on，切换结果见对话中的命令输出"
+                           : "已发送 /fast off");
+      }else{
+        fastCb.checked = !on;   // 切换失败回滚开关
+        document.getElementById("sendst").textContent = "fast 切换失败: " + (j.error || r.status);
+      }
+    }catch(e){
+      fastCb.checked = !on;
+      document.getElementById("sendst").textContent = "fast 切换失败: " + e;
     }
   };
   btn.onclick = async () => {
