@@ -137,6 +137,9 @@ h4,h5{margin:10px 0 2px;font-size:12px;color:var(--mut);font-weight:600;text-tra
 .bgchip{font:inherit;font-size:11px;border:1px solid rgba(168,85,247,.35);background:rgba(168,85,247,.08);
   border-radius:10px;padding:1px 7px;color:var(--mut);cursor:pointer;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bgchip b{color:var(--fg);font-weight:600}
+/* 窄屏只保留第一个后台任务 chip，其余折叠成计数 */
+.bgmore{display:none;flex:none;font-size:11px;border:1px solid rgba(168,85,247,.35);
+  background:rgba(168,85,247,.08);border-radius:10px;padding:1px 7px;color:var(--mut)}
 /* 压缩 / 思考 */
 .compact-card{margin:6px 0;border:1px solid var(--bd);border-left:3px solid #64748b;border-radius:6px;
   background:var(--card2);padding:3px 8px;font:12px ui-monospace,monospace;color:var(--mut)}
@@ -362,7 +365,9 @@ main.convview .composer{flex:none;margin:10px 18px 12px}
   #conv{padding:4px 10px 12px}
   main.convview .composer{margin:6px 10px calc(6px + env(safe-area-inset-bottom,0px))}
   .composer.info-panel{padding:8px 10px}
-  #bgstrip{margin:0 10px}
+  #bgstrip{margin:0 10px;flex-wrap:nowrap;overflow:hidden}
+  #bgstrip .bgchip~.bgchip{display:none}
+  #bgstrip .bgmore{display:inline-block}
   .composer textarea{resize:none}
   .composer-cog{display:inline-block}
   .composer-extra{display:none}
@@ -2274,7 +2279,9 @@ function renderBgStrip(){
     return `<button class="bgchip" data-scroll-agent="${esc(s.tid || "")}" ` +
       `title="${esc(label + (desc ? " · " + desc : ""))}"><b>${esc(label)}</b>` +
       `${desc ? " · " + esc(desc) : ""}${s.async ? " · 后台" : ""}</button>`;
-  }).join("") : "";
+  }).join("") + (running.length > 1
+    ? `<span class="bgmore" title="还有 ${running.length - 1} 个后台任务运行中">+${running.length - 1}</span>`
+    : "") : "";
   el.hidden = !html;
   // 内容没变就不重写，避免轮询把正在聚焦的后台任务 chip 焦点打掉
   if(el.__bgHtml !== html){ el.__bgHtml = html; el.innerHTML = html; }

@@ -136,7 +136,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
   或请求子代理 id 时才解析，`--scan-subagents` 可在启动时全量扫描。只读、不能发消息或托管。
   父会话的 `subagent_count` 来自主转录的 Agent/Task 工具调用，不依赖子代理转录。
   子代理条目记录 `tid/state/async/type/description/prompt/model/agent_id`；前端把 Agent/Task
-  工具调用渲染成子代理卡片，并在对话上方用后台任务条列出运行中的条目。
+  工具调用渲染成子代理卡片，并在对话上方用后台任务条列出运行中的条目
+  （窄屏只留第一个 chip，其余折叠为 `+N` 计数，避免任务条吃掉大半屏）。
 - **扫描缓存**：`scan_cache.py` 把每个转录的 offset、末尾 4 KiB 校验值和累计 Session 状态存到
   `CLAUDE_DIR/claude-sessions/scan-cache.json`；重启时校验一致就只读追加字节，截断/重写/缓存损坏
   时回退全量解析。默认只缓存主会话，开启 `--scan-subagents` 时降低落盘频率。
