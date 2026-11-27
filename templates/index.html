@@ -1106,6 +1106,16 @@ function composerHtml(mode, d){
     <div class="mut composer-status" id="sendst"></div>
   </div>`;
 }
+function subagentComposerHtml(d){
+  // 子代理转录只读：不给发送框，避免用户输入后才收到 400
+  const parent = d.parent_id || String(d.id || "").split("::")[0];
+  return `<div class="info-panel composer">
+    <div class="mut">子代理会话（只读）：该转录属于父会话的子代理，不能在这里发消息或托管。</div>
+    <div class="composer-actions">
+      ${parent ? `<button class="back" id="openparent" type="button">返回父会话</button>` : ""}
+    </div>
+  </div>`;
+}
 function autosizeComposer(box){
   // 按内容增高到上限，避免长指令在固定高度的小框里来回滚动；
   // 窄屏上限更低：长草稿不该吞掉近半屏消息区
@@ -1255,6 +1265,7 @@ async function saveModel(key){
 }
 function bindModel(key, selected){
   const s = modelDraft(key, selected), sel = document.getElementById("modelsel"), input = document.getElementById("modelcustom");
+  if(!sel || !input) return;   // 只读视图（子代理）没有模型选择控件
   sel.value = s.value === null ? defaultModelChoice : modelChoiceFor(key, s.value);
   input.hidden = sel.value !== customModelChoice; input.value = s.custom;
   const edit = save => {
@@ -2835,7 +2846,7 @@ async function renderConversation(id, force){
           </div>
           <div id="bgstrip" hidden></div>
           <div id="conv"></div>
-          ${composerHtml("conv", d)}`;
+          ${d.is_subagent ? subagentComposerHtml(d) : composerHtml("conv", d)}`;
         toggleTplPop(false);
         const backBtn = document.getElementById("back");
         backBtn.onclick = () => {
@@ -2856,10 +2867,13 @@ async function renderConversation(id, force){
           zenBtn.onclick = () => setZen(!zenOn());
         }
         // 输入区由 bindMessageDraft 按目标 key 恢复，不从其他面板复制。
-        bindSendBox(id, d);
+        bindSendBox(id, d);   // 子代理只读视图没有 sendbtn，函数会直接返回
         curPanel = {type: "conv", key: id};
         bindModel(id, d.selected_model);
         loadModelOptions(id, d.cwd);
+        const parentBtn = document.getElementById("openparent");
+        if(parentBtn) parentBtn.onclick = () =>
+          navigate({project: view.project, session: d.parent_id, new: false});
         connectSessionSse(id);
       }
       // 返回尚未替换的旧面板时仅同步过期草稿；请求期间 input 已更新版本则不碰输入框。

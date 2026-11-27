@@ -332,6 +332,27 @@ class ManagementAPITests(unittest.TestCase):
         scan.assert_called_once()
         self.assertEqual([item["id"] for item in json.load(response)], ["sid-1"])
 
+    def test_percent_encoded_subagent_session_id_resolves(self):
+        # 前端用 encodeURIComponent 拼会话 ID，`::` 会编码成 %3A%3A；
+        # 服务端必须还原后再查会话，否则「查看子代理」永远 404
+        self._write_transcript(1)
+        subdir = self.project / "sid-1" / "subagents"
+        subdir.mkdir(parents=True)
+        # 子代理转录的每一行都带 isSidechain；查看子代理时不能当主转录的旁支跳过
+        (subdir / "agent-abc123.jsonl").write_text(
+            json.dumps({"type": "user", "isSidechain": True,
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "message": {"content": "子代理问题"}}) + "\n",
+            encoding="utf-8")
+        sid = "sid-1::agent-abc123"
+        encoded = urllib.parse.quote(sid, safe="")
+        detail = json.load(self.request("/sessions/" + encoded))
+        self.assertEqual(detail["id"], sid)
+        self.assertTrue(detail["is_subagent"])
+        self.assertEqual(detail["parent_id"], "sid-1")
+        messages = json.load(self.request("/sessions/" + encoded + "/messages"))
+        self.assertEqual(self._message_texts(messages), ["子代理问题"])
+
     def test_messages_paging_default_and_before(self):
         self._write_transcript(250)
         first = json.load(self.request("/sessions/sid-1/messages"))

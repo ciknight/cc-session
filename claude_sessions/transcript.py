@@ -221,12 +221,12 @@ def _align_line_start(f, offset, size):
     return 0
 
 
-def _parse_message_chunk(data, tools):
+def _parse_message_chunk(data, tools, include_sidechain=False):
     """解析一段字节数据，返回 (messages, 末尾半行)。"""
     *lines, tail = data.split(b"\n")
     msgs = []
     for ln in lines:
-        m = parse_msg_line(ln)
+        m = parse_msg_line(ln, include_sidechain=include_sidechain)
         if not m:
             continue
         keep = []
@@ -283,12 +283,16 @@ def _absorb_orphan_tool_parts(msgs, tools):
     return [msg for msg in msgs if msg["parts"]], absorbed
 
 
-def parse_msg_line(ln, clip_len=8000):
+def parse_msg_line(ln, clip_len=8000, include_sidechain=False):
     """把一行转录解析为一条消息；无内容返回 None。
 
     返回 {role: user/assistant/tool/system, ts, parts: [...]}。
     parts 类型：text / thinking / tool / tool_result / tool_note / command /
     command_output / compact / compact_summary。
+
+    主转录里 ``isSidechain`` 行属于子代理对话，跳过；但子代理自己的转录
+    整份都是 sidechain，查看子代理时分必须传入 ``include_sidechain=True``，
+    否则会解析出空对话。
     """
     if isinstance(ln, bytes):
         ln = ln.decode("utf-8", "replace")
@@ -298,7 +302,7 @@ def parse_msg_line(ln, clip_len=8000):
         o = json.loads(ln)
     except json.JSONDecodeError:
         return None
-    if o.get("isSidechain"):
+    if o.get("isSidechain") and not include_sidechain:
         return None
     typ = o.get("type")
     if typ == "system":

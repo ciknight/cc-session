@@ -143,7 +143,11 @@ uv run monitor.py --webhook http://localhost:3000/hook
   compact / compact_summary / thinking part，前端折叠展示。
 - **子代理会话**：`projects/<proj>/<parent>/subagents/agent-*.jsonl` 默认**不扫描**（懒加载），
   id 为 `<parent>::agent-<hash>`，默认不在 `/sessions` 返回；`?include_subagents=1`
-  或请求子代理 id 时才解析，`--scan-subagents` 可在启动时全量扫描。只读、不能发消息或托管。
+  或请求子代理 id 时才解析，`--scan-subagents` 可在启动时全量扫描。只读、不能发消息或托管，
+  网页进入子代理视图时用只读提示替代发送框并提供「返回父会话」。
+  会话 ID 在 URL 里经过 `encodeURIComponent`（`::` 变 `%3A%3A`），HTTP 层按路径段解码后再查。
+  子代理转录的每一行都带 `isSidechain`；解析主转录时跳过这类旁支行，但查看子代理自身文件时
+  必须 `include_sidechain=True` 当主对话解析，否则对话为空。
   父会话的 `subagent_count` 来自主转录的 Agent/Task 工具调用，不依赖子代理转录。
   子代理条目记录 `tid/state/async/type/description/prompt/model/agent_id`；前端把 Agent/Task
   工具调用渲染成子代理卡片，并在对话上方用后台任务条列出运行中的条目

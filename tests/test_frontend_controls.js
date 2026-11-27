@@ -3084,3 +3084,28 @@ test('转录落盘后移除被正式 part 覆盖的流式预览', () => {
 test('stream_part 事件进入 SSE 白名单', () => {
   assert.match(html, /"stream_part"/);
 });
+
+test('子代理会话只读：不装配发送框，可返回父会话', async () => {
+  const sid = 'parent::agent-abc';
+  const requests = [];
+  const b = boot(async url => {
+    requests.push(url);
+    if (url === '/sessions/' + encodeURIComponent(sid))
+      return response({id: sid, parent_id: 'parent', is_subagent: true, cwd: '/project',
+        state: 'idle', selected_model: null, tokens: {}, tool_uses: {}, user_msgs: 0,
+        assistant_msgs: 0, subagents: [], tasks: [], commands: []});
+    if (url.startsWith('/sessions/' + encodeURIComponent(sid) + '/messages'))
+      return response({size: 1, total: 1, end: 1, start: 0, has_more: false,
+        messages: [{role: 'user', ts: 1, parts: [{type: 'text', text: '子代理任务'}]}]});
+    throw Error('unexpected fetch ' + url);
+  });
+  b.context.setTimeout = callback => { callback(); return 1; };
+  b.run(`view={project:"/project",session:${JSON.stringify(sid)},new:false}; renderConversation(${JSON.stringify(sid)},true)`);
+  for (let i = 0; i < 40; i++) await Promise.resolve();
+  assert.match(b.node('main').innerHTML, /子代理会话（只读）/);
+  assert.doesNotMatch(b.node('main').innerHTML, /id="sendbtn"/);
+  assert.match(b.node('conv').innerHTML, /子代理任务/);
+  assert.match(b.node('main').innerHTML, /id="openparent"/);
+  b.node('openparent').onclick();
+  assert.equal(b.run('view.session'), 'parent');
+});

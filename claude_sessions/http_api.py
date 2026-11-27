@@ -8,7 +8,7 @@ import threading
 from collections import Counter
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -25,6 +25,19 @@ _jinja = Environment(
     loader=FileSystemLoader(str(config.TEMPLATE_DIR)),
     autoescape=select_autoescape(["html"]),
 )
+
+
+def decode_url_path(path):
+    """逐段解码请求路径中的百分号转义。
+
+    前端用 encodeURIComponent 拼接会话 ID，子代理 ID 里的 ``::`` 会变成
+    ``%3A%3A``；不还原就按编码后的字符串查会话，永远 404。逐段解码后再
+    交给路由切分：编码的 ``%2F`` 只会变成额外路径段、查不到任何会话，
+    不会绕过 ``ensure_subagent`` 的字符校验。query 仍交给 parse_qs。
+    """
+    if "%" not in path:
+        return path
+    return "/".join(unquote(seg) for seg in path.split("/"))
 
 
 def active_model(mon, sid, fallback=None):
@@ -117,6 +130,7 @@ def make_handler(mon, refresh_interval):
 
         def do_GET(self):
             u = urlparse(self.path)
+            u = u._replace(path=decode_url_path(u.path))
             if u.path == "/healthz":
                 return self._json({"ok": True, "sessions": len(mon.sessions)})
             if u.path == "/system":
@@ -200,6 +214,8 @@ def make_handler(mon, refresh_interval):
                     s = mon.by_sid(sid)
                 if not s:
                     return self._json({"error": "not found"}, 404)
+                # 子代理转录每一行都带 isSidechain；查看子代理时这些正是对话本身
+                include_sidechain = bool(getattr(s, "is_subagent", False))
                 try:
                     size = s.path.stat().st_size
                 except OSError:
@@ -226,7 +242,8 @@ def make_handler(mon, refresh_interval):
                                 f.seek(st["off"])
                                 raw = f.read()
                             data = st["buf"] + raw
-                            msgs, st["buf"] = _parse_message_chunk(data, st["tools"])
+                            msgs, st["buf"] = _parse_message_chunk(
+                                data, st["tools"], include_sidechain)
                             st["msgs"].extend(msgs)
                             st["off"] += len(raw)
                             size = st["off"]
@@ -245,7 +262,8 @@ def make_handler(mon, refresh_interval):
                                     f.seek(new_base)
                                     data = f.read(st["base"] - new_base)
                                     chunk_tools = {}
-                                    chunk_msgs, _ = _parse_message_chunk(data, chunk_tools)
+                                    chunk_msgs, _ = _parse_message_chunk(
+                                        data, chunk_tools, include_sidechain)
                                     if chunk_tools:
                                         st["msgs"], _ = _absorb_orphan_tool_parts(
                                             st["msgs"], chunk_tools)
@@ -446,6 +464,7 @@ def make_handler(mon, refresh_interval):
 
         def do_POST(self):
             u = urlparse(self.path)
+            u = u._replace(path=decode_url_path(u.path))
             print(f"[http] {self.command} {self.path} 收到", flush=True)   # 请求到达即记录，响应见 log_request
             if u.path.startswith("/hook/"):
                 return self._handle_hook(u.path[len("/hook/"):])
@@ -640,6 +659,7 @@ def make_handler(mon, refresh_interval):
 
         def do_DELETE(self):
             u = urlparse(self.path)
+            u = u._replace(path=decode_url_path(u.path))
             if not self._safe_write_origin():
                 return
             print(f"[http] {self.command} {self.path} 收到", flush=True)
