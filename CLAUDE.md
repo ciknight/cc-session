@@ -201,6 +201,11 @@ uv run monitor.py --webhook http://localhost:3000/hook
 - **托管审批**：模式为 `ask`/`auto`/`full`，**默认 `full`（服务自动放行）**，持久化在
   `~/.claude/claude-sessions/approvals.json`；已有明确保存的模式优先。`ask` 等待网页响应
   （`--permission-timeout` 默认 1800 秒，超时自动拒绝），`auto` 交给 CLI 权限模式。
+  `full` 下 CLI 仍会为每次工具权限请求走 `can_use_tool`，服务在毫秒级自动放行；这类**瞬时交互
+  不广播** `interaction_pending`/`interaction_resolved`，也**不登记**进待审批列表（用户看不到
+  审批卡，广播只会让网页对每次工具调用弹「待审批」通知并响铃，登记则可能被快照渲染成卡）。
+  例外：AskUserQuestion 的 `can_use_tool` 兜底在 full 下仍广播并等待用户作答——自动放行不能
+  替用户回答问题。
 - **思考档位（effort）**：仅托管会话；`POST /sessions/<id>/effort` 在线切换
   （control `apply_flag_settings` 的 `effortLevel`，`default` 传 null 回落模型默认），
   档位持久化在 `~/.claude/claude-sessions/efforts.json`，重托管 spawn 带 `--effort`（有档位时

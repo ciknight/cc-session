@@ -937,15 +937,22 @@ class Hosted:
             questions = (request.get("input") or {}).get("questions") or []
         inter = Interaction(request_id, self, request,
                             kind=kind, questions=questions)
+        # AskUserQuestion 的 can_use_tool 兜底必须真的等用户作答：full 的
+        # “自动放行”只适用于权限类请求，替用户回答会把问题静默跳过。
+        wait_for_user = self.approval != "full" or kind == "choice"
         with self.mon.lock:
             if request_id in self.mon.interactions:
                 return
-            self.mon.interactions[request_id] = inter
-        self._emit_session_event("interaction_pending", inter.public())
-        if self.approval == "full":
+            if wait_for_user:
+                self.mon.interactions[request_id] = inter
+        if not wait_for_user:
+            # 服务在微秒级自动放行，用户看不到审批卡：既广播事件会让网页对
+            # 每次工具调用弹“待审批”通知并响铃（实测 pending→resolved 仅
+            # 0.5ms），也不登记到 mon.interactions，避免快照恰好把它渲染成卡。
             inter.resolve("allow", "once", state="allowed")
-            self._write_interaction(inter)
+            self._write_interaction(inter, emit=False)
         else:
+            self._emit_session_event("interaction_pending", inter.public())
             threading.Thread(target=self._await_interaction, args=(inter,), daemon=True).start()
 
     def _await_interaction(self, inter):
@@ -955,7 +962,7 @@ class Hosted:
             inter.resolve("deny", reason="审批超时，已自动拒绝", state="timed_out")
         self._write_interaction(inter)
 
-    def _write_interaction(self, inter):
+    def _write_interaction(self, inter, emit=True):
         if inter.behavior == "allow":
             updated_input = inter.updated_input
             if inter.answers:
@@ -977,7 +984,8 @@ class Hosted:
                 inter.state = "cancelled"
         with self.mon.lock:
             self.mon.interactions.pop(inter.id, None)
-        self._emit_session_event("interaction_resolved", inter.public())
+        if emit:
+            self._emit_session_event("interaction_resolved", inter.public())
 
     def set_approval(self, mode):
         if mode not in APPROVAL_MODES:

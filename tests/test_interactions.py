@@ -86,6 +86,67 @@ class InteractionTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
         self.assertEqual(self.mon.jobs[job]["result"], "decision:allow")
 
+    def test_full_mode_does_not_emit_approval_events(self):
+        # full 模式由服务在微秒级自动放行，用户看不到审批卡；广播
+        # interaction_pending 会让网页对每次工具权限请求弹通知/响铃。
+        self.mon.first_scan_done = True
+        q = queue.Queue()
+        self.mon.subscribers.append(q)
+        host, job = self.start_host("permission please", approval="full")
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        types = []
+        while True:
+            try:
+                types.append(q.get_nowait()["type"])
+            except queue.Empty:
+                break
+        self.assertNotIn("interaction_pending", types)
+        self.assertNotIn("interaction_resolved", types)
+        self.assertEqual(self.mon.jobs[job]["result"], "decision:allow")
+        # 自动放行的瞬时交互不登记，快照/待审批列表都看不到它
+        self.assertEqual(self.mon.pending_interactions("fake-session"), [])
+
+    def test_ask_mode_emits_pending_and_resolved_events(self):
+        # 静默只针对 full 自动放行；真实等待用户的审批必须广播事件，
+        # 否则网页的即时刷新与“待审批”浏览器通知会静默退化。
+        self.mon.first_scan_done = True
+        q = queue.Queue()
+        self.mon.subscribers.append(q)
+        host, job = self.start_host("permission please", approval="ask")
+        self.assertTrue(self.wait_for(lambda: self.mon.pending_interactions("fake-session")))
+        self.assertIn("interaction_pending", self._drain_types(q))
+        pending = self.mon.pending_interactions("fake-session")[0]
+        code, _ = self.mon.respond_interaction(pending["id"], {"behavior": "allow"})
+        self.assertEqual(code, 200)
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        self.assertIn("interaction_resolved", self._drain_types(q))
+
+    def test_full_mode_ask_user_question_still_waits(self):
+        # full 模式不能替用户回答 AskUserQuestion：hook 未生效的兜底路径
+        # 仍应呈现问答卡并等待作答，而不是静默放行。
+        self.mon.first_scan_done = True
+        q = queue.Queue()
+        self.mon.subscribers.append(q)
+        host, job = self.start_host("ask", approval="full")
+        self.assertTrue(self.wait_for(lambda: self.mon.pending_interactions("fake-session")))
+        self.assertIn("interaction_pending", self._drain_types(q))
+        pending = self.mon.pending_interactions("fake-session")[0]
+        self.assertEqual(pending["kind"], "choice")
+        code, _ = self.mon.respond_interaction(
+            pending["id"], {"behavior": "allow", "answers": {"Q1": "A"}})
+        self.assertEqual(code, 200)
+        self.assertTrue(self.wait_for(lambda: self.mon.jobs[job]["status"] == "done"))
+        self.assertEqual(self.mon.jobs[job]["result"], "decision:allow")
+
+    @staticmethod
+    def _drain_types(q):
+        types = []
+        while True:
+            try:
+                types.append(q.get_nowait()["type"])
+            except queue.Empty:
+                return types
+
     def test_write_to_closed_stdin_converts_value_error(self):
         # stop 关闭 stdin 后并发写入会抛 ValueError("write to closed file")，
         # 不转换就会逃过 _send_loop 的 (BrokenPipeError, OSError) 处理、线程裸死
