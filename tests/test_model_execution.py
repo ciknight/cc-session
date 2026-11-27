@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -792,6 +793,40 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(info["fast_mode_state"], "off")
         self.assertIsNone(info["fast_mode_reason"])
         self.assertIsNone(info["fast_mode"])
+
+    def test_hosted_stream_parts_reach_sse(self):
+        # 托管进程的 thinking / tool_use 预览通过 transient SSE 进入网页
+        sess = monitor.Session("fake-session", self.root / "fake.jsonl")
+        sess.cwd = str(self.root)
+        self.mon.sessions[str(sess.path)] = sess
+        self.mon.first_scan_done = True
+        q = queue.Queue()
+        self.mon.subscribers.append(q)
+        host, job_id = self.start_host(text="stream-parts")
+        self.wait_done(job_id)
+        events, deadline = [], time.time() + 3
+        while time.time() < deadline:
+            while True:
+                try:
+                    events.append(q.get_nowait())
+                except queue.Empty:
+                    break
+            if any(e["type"] == "hosted_turn_done" for e in events):
+                break
+            time.sleep(0.02)
+        self.mon.subscribers.remove(q)
+
+        parts = [e["data"] for e in events if e["type"] == "stream_part"]
+        thinking_done = [p for p in parts
+                         if p["kind"] == "thinking" and p["phase"] == "done"]
+        tool_done = [p for p in parts
+                     if p["kind"] == "tool" and p["phase"] == "done"]
+        self.assertTrue(thinking_done, "缺少 thinking 完成事件")
+        self.assertEqual(thinking_done[0]["text"], "想一想")
+        self.assertTrue(tool_done, "缺少 tool 完成事件")
+        self.assertEqual(tool_done[0]["input"], {"command": "echo hi"})
+        self.assertTrue(any(e["type"] == "hosted_turn_done" for e in events))
+        self.assertEqual(host.stream_blocks, {}, "回合结束后预览块应清空")
 
 
 if __name__ == "__main__":

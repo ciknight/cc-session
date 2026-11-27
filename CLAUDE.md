@@ -270,9 +270,14 @@ uv run monitor.py --webhook http://localhost:3000/hook
   归档及持久递增 revision；不改转录标题或扫描缓存。HTTP/SSE 使用统一元数据投影，前端按
   `metadata_revision` 合并，旧响应不能回退新设置。归档只影响默认列表，不停止任务、不删转录，
   直链及恢复保留；全局待审批来自完整会话集，包含已归档会话。
-- **流式文本**：托管进程带 `--include-partial-messages`；`stream_event` 的
+- **流式文本与思考/工具预览**：托管进程带 `--include-partial-messages`；`stream_event` 的
   `text_delta` 按 job 聚合，约 80ms 节流发 `turn_delta`（transient，不进 recent/webhook），
-  回合结束发最终文本并清空。
+  回合结束发最终文本并清空。`thinking_delta` 发累计全文、`input_json_delta` 只累积不发：
+  思考与工具调用通过 transient `stream_part` 事件（start/delta/done，按 id 幂等）在网页
+  底部预览，思考结束约 1 秒后自动折叠，工具参数在 `content_block_stop` 后一次性展示
+  （不播半截 JSON，官方 Claude Code 同样等参数完整）；转录落盘后前端按 `tool_use_id` /
+  思考文本对账移除预览。stream-json 没有工具执行输出（Bash stdout）的增量帧，
+  结果仍由转录轮询一次性补上。
 - **网页问答**：托管启动时用内联 `--settings` 注册 AskUserQuestion 的 PreToolUse hook，
   command 为 `python monitor.py hook --port <port> --token <token>`；
   `/hook/PreToolUse` 只接受回环地址和每次启动随机生成的令牌。若用户已通过
@@ -376,8 +381,9 @@ detail 轮询的 `commands`，仅托管会话有），`<details>` 的展开状�
 （条目带状态圆点，运行中在前）；发送后对话末尾有本地回显气泡（`pendingEcho`，转录出现
 同文本 user 消息或 command part 后退场，失败标红）；斜杠命令渲染为命令气泡（输出折叠），
 状态行显示"正在执行命令 /xxx…"。工具卡由 `TOOL_VIEW` 注册表驱动（按 Bash/Read/Edit/Grep/
-Agent 等给出摘要、类别色、状态与 diff 统计），连续同名工具折叠成一组；成功的 Read/Grep/Glob
-结果默认不展开。消息头提供复制按钮，图片点击打开全屏灯箱；SSE 断开时 header 的
+Agent 等给出摘要、类别色、状态与 diff 统计），运行中的卡默认展开、结果到达后自动收回
+（`detailsOpen` 用 `:running` 后缀隔离两阶段记忆，历史卡仍折叠），连续同名工具折叠成一组；
+成功的 Read/Grep/Glob 结果默认不展开。消息头提供复制按钮，图片点击打开全屏灯箱；SSE 断开时 header 的
 `#connbadge` 显示重连提示。模型行内的 `#tokchip` 显示上下文 token，点击展开概览。
 移动端用 `visualViewport` 计算 `--keyboard-height` 收缩 body，输入框按内容自适应高度，
 避免 iOS 键盘遮住发送区。

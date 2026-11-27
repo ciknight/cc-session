@@ -15,11 +15,17 @@ from session_preferences import (APPROVAL_MODES, EFFORT_LEVELS, default_model,
 from . import config, util
 from .util import clip, _arg_present, _arg_index, _merge_hook_settings
 from .interactions import Interaction
+from .transcript import _tool_input_data
 
 
 # 解释器正常退出时兜底回收常驻进程；Windows 被强杀时不保证执行，
 # 残留仍由 OrphanWatcher 观察。弱引用避免阻止 Hosted 被回收。
 _LIVE_HOSTED = weakref.WeakSet()
+
+# 流式工具参数只累计不转发；超过该长度视为异常大输入，停止累积并等转录落盘
+_STREAM_INPUT_LIMIT = 256 * 1024
+# 思考预览按累计全文发送；超过该长度后停止追加，正式内容仍以转录为准
+_STREAM_TEXT_LIMIT = 20_000
 
 
 def _terminate_process(proc, grace=5.0, lock=None):
@@ -138,6 +144,12 @@ class Hosted:
         self.stream_text = ""          # 当前 job 的流式文本聚合
         self.stream_job = None
         self.last_delta_emit = 0.0
+        # 流式预览块（thinking / tool_use）：id -> 状态。只发给网页做临时展示，
+        # 转录落盘后前端按 tool_use_id / 文本对账移除。
+        self.stream_blocks = {}
+        self.stream_index = {}          # 当前 message 的 content block index -> 块 id
+        self.stream_msg_id = ""
+        self.last_part_emit = 0.0
         self.max_queued = 32
 
     def alive(self):
@@ -309,6 +321,7 @@ class Hosted:
                         self.stream_text = ""
                         self.stream_job = job
                         self.last_delta_emit = 0.0
+                        self._reset_stream_parts_locked()
                     self.processing = True
                 self.mon.queue_changed(job["session"])
                 try:
@@ -486,9 +499,10 @@ class Hosted:
                 self._on_lifecycle(obj)
             elif typ == "stream_event":
                 self._on_stream_event(obj)
-            elif typ == "assistant":
-                # 完整 assistant 帧说明该段内容已成形；含工具调用时清掉流式预览，
-                # 兼容不发 content_block_start 的旧版 CLI
+            elif typ == "assistant" and not obj.get("parent_tool_use_id"):
+                # 完整 assistant 帧说明该段内容已成形；含工具调用时清掉流式文本预览，
+                # 兼容不发 content_block_start 的旧版 CLI。thinking/tool 预览保留，
+                # 由前端在转录落盘后按 tool_use_id / 文本对账移除。
                 content = (obj.get("message") or {}).get("content")
                 if isinstance(content, list) and any(
                         isinstance(b, dict) and b.get("type") == "tool_use"
@@ -497,7 +511,6 @@ class Hosted:
             elif typ == "result":
                 self._update_fast_mode(obj)
                 self._on_result(obj)
-            # 其余事件（thinking 等）转录文件里已有，这里不处理
         rc = self.proc.wait()
         try:
             self.proc.stdin.close()
@@ -517,6 +530,7 @@ class Hosted:
             self.interrupt_target = None
             self.stream_text = ""
             self.stream_job = None
+            self._reset_stream_parts_locked()
             dead = []
             for job in ([self.current] if self.current else []) + [j for _, j, _ in self.pending]:
                 if all(job is not seen for seen in dead):
@@ -631,6 +645,7 @@ class Hosted:
                             self.stream_text = ""
                             self.stream_job = job
                             self.last_delta_emit = 0.0
+                            self._reset_stream_parts_locked()
             return
         if job is None:
             self._emit_session_event("hosted_foreign_turn",
@@ -699,6 +714,7 @@ class Hosted:
                   "at": util.now_ts()}
         with self.ready:
             self.last_conversation_reset = record
+            self._reset_stream_parts_locked()
             # 新会话的 session_id 不在 reset 帧里，等下一帧带 session_id 时迁移
             self.pending_conversation_reset = record
         self._emit_session_event("hosted_conversation_reset",
@@ -862,6 +878,7 @@ class Hosted:
                 final_text = self.stream_text
                 self.stream_text = ""
                 self.stream_job = None
+                self._reset_stream_parts_locked()
             self.ready.notify_all()
             if notify:
                 self.turns += 1
@@ -886,32 +903,197 @@ class Hosted:
             "api_error_status": job.get("api_error_status")})
 
     def _on_stream_event(self, obj):
-        event = obj.get("event") or {}
+        # 子代理（sidechain）的流事件不属于主对话预览
+        if obj.get("parent_tool_use_id"):
+            return
+        event = obj.get("event")
+        if not isinstance(event, dict):
+            return
         etype = event.get("type")
+        if etype == "message_start":
+            message = event.get("message")
+            msg_id = message.get("id") if isinstance(message, dict) else ""
+            with self.ready:
+                if self._stream_job_locked() is None:
+                    return
+                self.stream_msg_id = msg_id if isinstance(msg_id, str) else ""
+                self.stream_index = {}
+            return
         if etype == "content_block_start":
-            # 模型开始调用工具：上一段流式文本已经作为 assistant 消息落盘，
-            # 清掉临时气泡，否则网页会一直停在“助手正在输入…”的旧文本上
-            if (event.get("content_block") or {}).get("type") == "tool_use":
+            block = event.get("content_block")
+            if not isinstance(block, dict):
+                return
+            btype = block.get("type")
+            if btype == "tool_use":
+                # 模型开始调用工具：上一段流式文本已经作为 assistant 消息落盘，
+                # 清掉临时气泡，否则网页会一直停在“助手正在输入…”的旧文本上
                 self._clear_stream_text()
+            if btype in ("tool_use", "thinking"):
+                self._start_stream_block(event.get("index"), block)
             return
-        if etype != "content_block_delta":
+        if etype == "content_block_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, dict):
+                return
+            dtype = delta.get("type")
+            if dtype == "text_delta":
+                text = delta.get("text")
+                if not text:
+                    return
+                with self.ready:
+                    job = self.current
+                    if job is None or self.stream_job is not job:
+                        return
+                    self.stream_text += text
+                    should_emit = util.now_ts() - self.last_delta_emit >= 0.08
+                    full_text = self.stream_text
+                    if should_emit:
+                        self.last_delta_emit = util.now_ts()
+                if should_emit:
+                    self._emit_session_event("turn_delta", {
+                        "hosted": self.hid, "job": job.get("id"), "text": full_text},
+                        transient=True)
+            elif dtype == "thinking_delta":
+                self._append_thinking(event.get("index"),
+                                      delta.get("thinking") or delta.get("text") or "")
+            elif dtype == "input_json_delta":
+                self._append_input_json(event.get("index"),
+                                        delta.get("partial_json") or "")
             return
-        delta = event.get("delta") or {}
-        if delta.get("type") != "text_delta" or not delta.get("text"):
+        if etype == "content_block_stop":
+            self._finish_stream_block(event.get("index"))
+
+    def _stream_job_locked(self):
+        """当前 stream_job（调用方需持有 self.ready）；没有活动回合时返回 None。"""
+        job = self.current
+        return job if job is not None and self.stream_job is job else None
+
+    def _reset_stream_parts_locked(self):
+        self.stream_blocks.clear()
+        self.stream_index.clear()
+        self.stream_msg_id = ""
+        self.last_part_emit = 0.0
+
+    def _start_stream_block(self, index, block):
+        """登记 thinking / tool_use 预览块并发 start；前端按 id 幂等处理。"""
+        kind = "tool" if block.get("type") == "tool_use" else "thinking"
+        with self.ready:
+            job = self._stream_job_locked()
+            if job is None:
+                return
+            tool_use_id = block.get("id") if kind == "tool" else None
+            if kind == "tool" and isinstance(tool_use_id, str) and tool_use_id:
+                bid = tool_use_id
+            else:
+                bid = f"{self.stream_msg_id or job.get('id') or 'm'}:{index}"
+                # 旧版 CLI 可能没有 message_start，多个 message 的 index 会重复；
+                # 已结束/类型不同的块继续沿用会让后一段思考丢失，改用新 id
+                existing = self.stream_blocks.get(bid)
+                if existing is not None and (existing["done"]
+                                             or existing["kind"] != kind):
+                    n = 2
+                    while f"{bid}#{n}" in self.stream_blocks:
+                        n += 1
+                    bid = f"{bid}#{n}"
+            state = self.stream_blocks.get(bid)
+            if state is None:
+                initial_input = block.get("input") if kind == "tool" else None
+                state = self.stream_blocks[bid] = {
+                    "id": bid, "kind": kind, "index": index,
+                    "name": block.get("name") if kind == "tool" else "",
+                    "tool_use_id": tool_use_id,
+                    "text": "", "partial_json": "",
+                    "initial_input": initial_input if isinstance(initial_input, dict) else None,
+                    "started_mono": time.monotonic(),
+                    "done": False, "truncated": False,
+                }
+            self.stream_index[index] = bid
+        data = {"hosted": self.hid, "job": job.get("id"), "id": bid,
+                "kind": kind, "phase": "start"}
+        if kind == "tool":
+            data["name"] = state["name"]
+            data["tool_use_id"] = tool_use_id
+        self._emit_session_event("stream_part", data, transient=True)
+
+    def _append_thinking(self, index, text):
+        if not text:
             return
         with self.ready:
-            job = self.current
-            if job is None or self.stream_job is not job:
+            job = self._stream_job_locked()
+            bid = self.stream_index.get(index)
+            state = self.stream_blocks.get(bid) if bid else None
+            if job is None or state is None or state["done"] or state["truncated"]:
                 return
-            self.stream_text += delta["text"]
-            should_emit = util.now_ts() - self.last_delta_emit >= 0.08
-            text = self.stream_text
+            if len(state["text"]) >= _STREAM_TEXT_LIMIT:
+                state["truncated"] = True
+                return
+            state["text"] += text[:_STREAM_TEXT_LIMIT - len(state["text"])]
+            should_emit = util.now_ts() - self.last_part_emit >= 0.08
+            full_text = state["text"]
             if should_emit:
-                self.last_delta_emit = util.now_ts()
+                self.last_part_emit = util.now_ts()
         if should_emit:
-            self._emit_session_event("turn_delta", {
-                "hosted": self.hid, "job": job.get("id"), "text": text},
+            self._emit_session_event("stream_part", {
+                "hosted": self.hid, "job": job.get("id"), "id": bid,
+                "kind": "thinking", "phase": "delta", "text": full_text},
                 transient=True)
+
+    def _append_input_json(self, index, chunk):
+        # 半截 JSON 只累积不发送：参数完整后再一次性展示（官方 Claude Code 同样做法）
+        if not chunk:
+            return
+        with self.ready:
+            job = self._stream_job_locked()
+            bid = self.stream_index.get(index)
+            state = self.stream_blocks.get(bid) if bid else None
+            if job is None or state is None or state["done"] or state["truncated"]:
+                return
+            if len(state["partial_json"]) + len(chunk) > _STREAM_INPUT_LIMIT:
+                state["truncated"] = True
+                return
+            state["partial_json"] += chunk
+
+    def _finish_stream_block(self, index):
+        with self.ready:
+            job = self._stream_job_locked()
+            bid = self.stream_index.pop(index, None)
+            state = self.stream_blocks.get(bid) if bid else None
+            if job is None or state is None or state["done"]:
+                return
+            state["done"] = True
+            kind = state["kind"]
+            duration_ms = None
+            text = ""
+            input_data = {}
+            input_ok = False
+            if kind == "thinking":
+                duration_ms = max(
+                    0, int((time.monotonic() - state["started_mono"]) * 1000))
+                text = state["text"]
+            else:
+                parsed = None
+                if not state["truncated"]:
+                    if state["partial_json"]:
+                        try:
+                            parsed = json.loads(state["partial_json"])
+                        except (TypeError, ValueError):
+                            parsed = None
+                    else:
+                        # 旧版 CLI 可能只在 content_block_start 带完整 input
+                        parsed = state.get("initial_input")
+                if isinstance(parsed, dict):
+                    input_data = _tool_input_data(parsed)
+                    input_ok = True
+        data = {"hosted": self.hid, "job": job.get("id"), "id": bid,
+                "kind": kind, "phase": "done"}
+        if kind == "thinking":
+            data.update(text=text, duration_ms=duration_ms,
+                        truncated=state["truncated"])
+        else:
+            data.update(name=state["name"], tool_use_id=state["tool_use_id"],
+                        input=input_data, input_ok=input_ok,
+                        truncated=state["truncated"])
+        self._emit_session_event("stream_part", data, transient=True)
 
     def _clear_stream_text(self):
         """清空当前回合的流式预览（工具轮开始/回合收尾时调用）。"""
@@ -1100,6 +1282,7 @@ class Hosted:
                 if job else deque()
             self.interrupt_target = job
             self.interrupting = job is not None
+            self._reset_stream_parts_locked()
             self.ready.notify_all()
         self.mon.queue_changed(self.session_id)
         try:

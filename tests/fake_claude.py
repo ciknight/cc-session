@@ -168,6 +168,28 @@ for line in sys.stdin:
                     "type": "content_block_delta",
                     "delta": {"type": "text_delta", "text": chunk}}})
             complete(uuid, "stream-done")
+        elif text == "stream-parts":
+            emit({"type": "stream_event", "event": {
+                "type": "message_start", "message": {"id": "msg-fake"}}})
+            emit({"type": "stream_event", "event": {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}})
+            emit({"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "想一想"}}})
+            emit({"type": "stream_event", "event": {
+                "type": "content_block_stop", "index": 0}})
+            emit({"type": "stream_event", "event": {
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": "toolu-fake",
+                                  "name": "Bash", "input": {}}}})
+            emit({"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": '{"command": "echo hi"}'}}})
+            emit({"type": "stream_event", "event": {
+                "type": "content_block_stop", "index": 1}})
+            complete(uuid, "stream-parts-done")
         elif text in ("slow", "interrupt-me"):
             pending_interrupt_uuid = uuid
             threading.Thread(target=slow_turn, args=(uuid, text), daemon=True).start()

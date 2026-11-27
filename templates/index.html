@@ -491,6 +491,10 @@ let esGlobal = null, esSession = null, globalSeq = 0, sessionSeq = 0;
 let listTimer = null, convTimer = null;
 let lastListLoad = 0;              // 上次 /sessions 请求开始的毫秒时间戳
 let liveText = "", liveRaf = null;
+let liveParts = new Map();        // 托管流式预览块：id -> {kind,text,input,...}
+let livePartsRaf = null;
+const endedJobs = new Set();      // 已结束的 job，屏蔽迟到的 stream_part
+const thinkingDurations = new Map();  // thinking 前缀哈希 -> 秒数（正式卡沿用）
 let timer = null;
 let sendJobs = {};                 // key -> {jobId, status, result, error} 发送任务状态，跨刷新保留；
                                    // key 为会话 id 或 "new:<cwd>"，多个会话可各有一个进行中任务
@@ -1367,8 +1371,9 @@ const SSE_TYPES = ["snapshot", "session_discovered", "user_message", "assistant_
   "task_updated", "context_compacted", "api_error", "hosted_turn_done",
   "hosted_api_retry", "hosted_rate_limit", "hosted_fast_mode", "hosted_conversation_reset",
   "hosted_session_switched", "hosted_foreign_turn", "interaction_pending",
-  "interaction_resolved", "turn_interrupted", "turn_delta", "remote_message_sent",
-  "remote_message_done", "hosted_exited", "session_metadata_changed", "queue_changed"];
+  "interaction_resolved", "turn_interrupted", "turn_delta", "stream_part",
+  "remote_message_sent", "remote_message_done", "hosted_exited",
+  "session_metadata_changed", "queue_changed"];
 const raf = window.requestAnimationFrame || (fn => setTimeout(fn, 16));
 
 function listGap(){ return +ival.value || DEFAULT_IVAL; }
@@ -1422,6 +1427,10 @@ function handleSseMessage(msg){
     if(view.session === msg.session) updateLiveBubble(msg.data.text || "");
     return;
   }
+  if(msg.type === "stream_part"){
+    if(view.session === msg.session) applyStreamPart(msg.data || {});
+    return;
+  }
   if(msg.type === "hosted_session_switched" && msg.data
      && msg.data.from && msg.data.to && view.session === msg.data.from){
     // /clear 后 CLI 会换 session id；新会话被扫描进列表后自动切过去
@@ -1429,9 +1438,13 @@ function handleSseMessage(msg){
     flashSendSt(msg.data.from, "会话已被 /clear 重置，正在切换…");
     load();
   }
-  if(["turn_finished", "hosted_turn_done", "interaction_pending",
-      "turn_interrupted"].includes(msg.type) && view.session === msg.session){
-    clearLiveBubble();
+  if(msg.type === "hosted_turn_done") markJobEnded((msg.data || {}).job);
+  if(["turn_finished", "hosted_turn_done", "turn_interrupted", "hosted_exited",
+      "hosted_conversation_reset", "hosted_session_switched"]
+     .includes(msg.type) && view.session === msg.session){
+    clearLiveStream();
+  } else if(msg.type === "interaction_pending" && view.session === msg.session){
+    clearLiveBubble();   // 审批期间思考/工具预览仍然有效，只收掉旧文本气泡
   }
   if(msg.type === "api_error" && view.session === msg.session){
     // 不等下一轮 detail：SSE 到达就更新横幅与倒计时
@@ -1748,6 +1761,206 @@ function clearLiveBubble(){
   renderLiveBubble();
 }
 
+/* ---------- 托管流式预览（thinking / tool_use） ---------- */
+// stream_part 是 transient 事件：不进 recent，断线重连后由转录轮询补全。
+// thinking 发累计全文、tool 只发开始与完成，按 id 幂等处理两路 SSE 的重复投递。
+function thinkingKey(text){
+  return hashText(String(text || "").trim().slice(0, 500));
+}
+function recordThinkingDuration(text, ms){
+  if(!text || !(ms > 0)) return;
+  thinkingDurations.set(thinkingKey(text), Math.max(1, Math.round(ms / 1000)));
+  while(thinkingDurations.size > 300){
+    const oldest = thinkingDurations.keys().next().value;
+    thinkingDurations.delete(oldest);
+  }
+}
+function liveToolSummary(block){
+  const input = block.input || {};
+  const config = TOOL_VIEW[block.name] || {};
+  try{ return config.value ? String(config.value(input) || "") : ""; }catch(e){ return ""; }
+}
+function livePartsEl(){
+  const conv = document.getElementById("conv");
+  if(!conv || !conv.appendChild) return null;
+  let box = document.getElementById("liveparts");
+  if(!box){
+    box = document.createElement("div");
+    box.id = "liveparts";
+    const bubble = document.getElementById("livebubble");
+    if(bubble && conv.insertBefore) conv.insertBefore(box, bubble);
+    else conv.appendChild(box);
+  }
+  return box;
+}
+function makeLivePartNode(block){
+  const el = document.createElement("details");
+  if(!el || !el.appendChild) return null;
+  const summary = document.createElement("summary");
+  const body = document.createElement(block.kind === "thinking" ? "div" : "pre");
+  el.className = block.kind === "thinking" ? "thinking live" : "tool-details live";
+  body.className = block.kind === "thinking" ? "think-body" : "tool-out";
+  el.open = true;
+  block.wantOpen = true;   // 区分程序设置与用户点击，避免自动收起被记成用户操作
+  el.appendChild(summary);
+  el.appendChild(body);
+  if(el.addEventListener) el.addEventListener("toggle", () => {
+    if(block.wantOpen !== undefined && el.open === block.wantOpen){
+      block.wantOpen = undefined;
+      return;
+    }
+    block.wantOpen = undefined;
+    block.userToggled = true;
+  });
+  block.summaryEl = summary;
+  block.bodyEl = body;
+  return el;
+}
+function updateLivePartNode(block){
+  const el = block.el, summary = block.summaryEl, body = block.bodyEl;
+  if(!el || !summary || !body) return;
+  if(block.kind === "thinking"){
+    const secs = block.duration_ms != null
+      ? Math.max(1, Math.round(block.duration_ms / 1000)) : 0;
+    const chars = (block.text || "").length;
+    summary.textContent = block.done
+      ? "思考过程" + (secs ? " · 思考了 " + secs + " 秒" : "")
+      : "思考中…" + (chars ? " · " + chars + " 字" : "");
+    body.textContent = block.text || "";
+    if(block.done && secs && !block.userToggled && !block.closeTimer && el.open !== false){
+      block.closeTimer = setTimeout(() => {
+        block.closeTimer = null;
+        if(block.userToggled || !block.el) return;
+        if(block.el.open){
+          block.wantOpen = false;
+          block.el.open = false;
+        }
+      }, 1000);
+    }
+    return;
+  }
+  const value = liveToolSummary(block);
+  const status = block.done
+    ? (block.input_ok === false ? "参数不可用" : "运行中")
+    : "参数生成中";
+  summary.innerHTML = `<span class="tool-kind">${esc(block.name || "工具")}</span>` +
+    (value ? `<code class="tool-value">${esc(value)}</code>` : "") +
+    `<span class="tool-status${block.done ? " running" : ""}">${status}</span>`;
+  if(!block.done) body.textContent = "…";
+  else if(block.input_ok === false) body.textContent = "参数过大或解析失败，完成后以转录为准。";
+  else body.textContent = JSON.stringify(block.input || {}, null, 2);
+}
+function renderLiveParts(){
+  const conv = document.getElementById("conv");
+  if(!conv) return;
+  if(!liveParts.size){
+    const box = document.getElementById("liveparts");
+    if(box && box.remove) box.remove();
+    return;
+  }
+  const nearBottom = !conv.scrollHeight || !conv.clientHeight
+    || conv.scrollHeight - conv.scrollTop - conv.clientHeight < 80;
+  const box = livePartsEl();
+  if(!box) return;
+  for(const block of liveParts.values()){
+    if(!block.el) block.el = makeLivePartNode(block);
+    if(!block.el) continue;
+    if(block.el.parentNode !== box && box.appendChild) box.appendChild(block.el);
+    updateLivePartNode(block);
+  }
+  if(nearBottom && conv.scrollTop !== undefined){
+    raf(() => { conv.scrollTop = conv.scrollHeight; });
+  }
+}
+function renderLivePartsSoon(){
+  if(livePartsRaf) return;
+  livePartsRaf = raf(() => { livePartsRaf = null; renderLiveParts(); });
+}
+function applyStreamPart(d){
+  if(!d || !d.id) return;
+  if(d.job && endedJobs.has(d.job)) return;
+  const kind = d.kind === "tool" ? "tool" : "thinking";
+  let block = liveParts.get(d.id);
+  if(!block){
+    if(d.phase !== "start" && d.phase !== "delta" && d.phase !== "done") return;
+    block = {id: d.id, kind, name: d.name || "", tool_use_id: d.tool_use_id || "",
+             text: "", input: null, input_ok: true, truncated: false,
+             duration_ms: null, done: false, el: null, summaryEl: null, bodyEl: null,
+             userToggled: false, closeTimer: null};
+    liveParts.set(d.id, block);
+  }
+  if(d.phase === "delta" && block.done) return;
+  if(d.phase === "delta"){
+    if(kind === "thinking"){
+      const text = String(d.text || "");
+      // 累计文本只前进不回退：两路 SSE 交错或迟到事件不能把内容缩短
+      if(text.length <= String(block.text || "").length) return;
+      block.text = text;
+    }
+  }else if(d.phase === "done"){
+    block.done = true;
+    if(kind === "thinking"){
+      if(typeof d.text === "string" && d.text.length >= String(block.text || "").length)
+        block.text = d.text;
+      if(d.duration_ms != null) block.duration_ms = d.duration_ms;
+      recordThinkingDuration(block.text, block.duration_ms);
+    }else{
+      if(d.name) block.name = d.name;
+      if(d.tool_use_id) block.tool_use_id = d.tool_use_id;
+      block.input = d.input && typeof d.input === "object" ? d.input : {};
+      block.input_ok = d.input_ok !== false;
+      block.truncated = !!d.truncated;
+    }
+  }
+  renderLivePartsSoon();
+}
+// 转录落盘后移除被正式 part 覆盖的预览，避免同一内容显示两次
+function reconcileLiveParts(){
+  if(!liveParts.size) return;
+  const ids = new Set(), texts = [];
+  for(const m of convState.msgs || []){
+    for(const p of (m.parts || [])){
+      if(p.type === "tool" && p.tool_use_id) ids.add(p.tool_use_id);
+      else if(p.type === "thinking" && p.text) texts.push(String(p.text).trim());
+    }
+  }
+  const remove = [];
+  for(const block of liveParts.values()){
+    if(block.kind === "tool"){
+      if(block.tool_use_id && ids.has(block.tool_use_id)) remove.push(block);
+      continue;
+    }
+    const t = String(block.text || "").trim();
+    const hit = t && texts.some(x => x && (x === t
+      || (Math.min(x.length, t.length) >= 40 && (x.startsWith(t) || t.startsWith(x)))));
+    if(hit){
+      if(block.duration_ms != null) recordThinkingDuration(block.text, block.duration_ms);
+      remove.push(block);
+    }
+  }
+  for(const block of remove){
+    if(block.closeTimer) clearTimeout(block.closeTimer);
+    if(block.el && block.el.remove) block.el.remove();
+    liveParts.delete(block.id);
+  }
+  if(remove.length) renderLiveParts();
+}
+function clearLiveStream(){
+  for(const block of liveParts.values()){
+    if(block.closeTimer) clearTimeout(block.closeTimer);
+    if(block.el && block.el.remove) block.el.remove();
+  }
+  liveParts.clear();
+  const box = document.getElementById("liveparts");
+  if(box && box.remove) box.remove();
+  clearLiveBubble();
+}
+function markJobEnded(job){
+  if(!job) return;
+  endedJobs.add(job);
+  setTimeout(() => endedJobs.delete(job), 5000);
+}
+
 /* ---------- 分组 ---------- */
 function groupByProject(){
   const groups = new Map();
@@ -2026,8 +2239,10 @@ function agentCardHtml(p){
     ? `<div class="agent-body">${esc(clipText(p.result.text, 2000))}</div>` : "";
   const link = agentId && convState.id
     ? `<button class="back" data-open-subagent="${esc(convState.id + "::agent-" + agentId)}">查看子代理</button>` : "";
-  const key = p.tool_use_id ? "agent:" + p.tool_use_id : "";
-  return `<details class="agent-card"${key ? detailsAttrs(key) : ""} data-agent-tid="${esc(p.tool_use_id || "")}">` +
+  // 运行中的卡默认展开；完成后切回旧 key 自动收起（用户手动状态按 key 记忆）
+  const running = state === "running";
+  const key = p.tool_use_id ? "agent:" + p.tool_use_id + (running ? ":running" : "") : "";
+  return `<details class="agent-card"${key ? detailsAttrs(key, running) : ""} data-agent-tid="${esc(p.tool_use_id || "")}">` +
     `<summary><span class="agent-name">${esc(label)}</span>` +
     (description ? `<span class="agent-desc">${esc(description)}</span>` : "") +
     (async ? '<span class="agent-badge">后台</span>' : "") +
@@ -2047,16 +2262,23 @@ function toolPartHtml(p){
   if(p.name === "Agent" || p.name === "Task") return agentCardHtml(p);
   const view = toolView(p);
   const notes = (p.notes || []).map(esc).join("\n");
-  const key = p.tool_use_id ? "tool:" + p.tool_use_id : "";
+  // 运行中默认展开、结果到达后自动收起：用 :running key 隔离两阶段的展开记忆
+  const running = toolStatus(p) === "running";
+  const key = p.tool_use_id ? "tool:" + p.tool_use_id + (running ? ":running" : "") : "";
   const result = p.result;
   const hidden = view.hideSuccess && result && !result.is_error
     && result.kind !== "error" && result.kind === "text";
+  // 运行中还没有结果：展开后展示完整参数，否则 summary 里的单行摘要会把长命令截断
+  const inputData = running && !result ? toolInputData(p) : null;
+  const args = inputData && Object.keys(inputData).length
+    ? JSON.stringify(inputData, null, 2) : "";
   const category = view.cat && view.cat !== "default" ? " tool-cat-" + view.cat : "";
-  return `<details class="tool-details${category}"${key ? detailsAttrs(key) : ""}>` +
+  return `<details class="tool-details${category}"${key ? detailsAttrs(key, running) : ""}>` +
     `<summary><span class="tool-kind">${esc(view.label)}</span>` +
     (view.value ? `<code class="tool-value">${esc(view.value)}</code>` : "") +
     toolStatusHtml(p) + diffStatsHtml(result && result.stats) + `</summary>` +
     (notes ? `<div class="mut">${esc(notes)}</div>` : "") +
+    (args ? `<pre class="tool-out tool-args">${esc(args)}</pre>` : "") +
     (hidden
       ? `<details class="fold tool-result-fold"${detailsAttrs("toolresult:" + (p.tool_use_id || hashText(p.result.text || "")))}>` +
         `<summary>结果</summary>${toolResultHtml(p)}</details>`
@@ -2075,8 +2297,9 @@ function toolGroupHtml(run){
   }
   const running = run.filter(p => toolStatus(p) === "running").length;
   const errors = run.filter(p => toolStatus(p) === "error").length;
-  const key = "toolgroup:" + (run[0].tool_use_id || hashText(view.label + "|" + previews.join("|")));
-  return `<details class="tool-group"${detailsAttrs(key)}>` +
+  const key = "toolgroup:" + (run[0].tool_use_id || hashText(view.label + "|" + previews.join("|")))
+    + (running ? ":running" : "");
+  return `<details class="tool-group"${detailsAttrs(key, running > 0)}>` +
     `<summary><span class="tool-kind">${esc(view.label)}</span>` +
     `<span class="tool-count">×${run.length}</span>` +
     (previews.length ? `<span class="tool-value">${esc(previews.join(", ") + (extra ? `, +${extra} 个` : ""))}</span>` : "") +
@@ -2138,8 +2361,12 @@ function compactSummaryHtml(p){
     `<summary>压缩摘要</summary><div class="sysbody">${esc(p.text || "")}</div></details>`;
 }
 function thinkingHtml(p){
-  return `<details class="thinking"${detailsAttrs("think:" + hashText(p.text || ""))}>` +
-    `<summary>思考过程</summary><div class="think-body">${esc(p.text || "")}</div></details>`;
+  const text = p.text || "";
+  // 流式预览记录的时长带到正式卡；刷新后 map 为空，只显示“思考过程”
+  const secs = thinkingDurations.get(thinkingKey(text));
+  return `<details class="thinking"${detailsAttrs("think:" + hashText(text))}>` +
+    `<summary>思考过程${secs ? " · 思考了 " + secs + " 秒" : ""}</summary>` +
+    `<div class="think-body">${esc(text)}</div></details>`;
 }
 function convPartHtml(p, role){
   if(p.type === "text")
@@ -2442,6 +2669,10 @@ function renderConvList(){
     const live = document.getElementById("livebubble");
     if(live && live.remove) live.remove();
   }
+  if(!liveParts.size){
+    const lp = document.getElementById("liveparts");
+    if(lp && lp.remove) lp.remove();
+  }
 }
 function groupRenderContext(g){
   // 工具/子代理卡的状态来自 detail 而不是 parts：把会影响显示的状态并入签名，
@@ -2465,7 +2696,7 @@ function renderConvDom(el, groups, echoStr){
     // 切换会话：旧节点全部作废，清空容器重新开始
     convDom = {id: convState.id, nodes: new Map(), echo: null};
     for(const child of el.querySelectorAll("*")){
-      if(child.id !== "livebubble" && child.remove) child.remove();
+      if(child.id !== "livebubble" && child.id !== "liveparts" && child.remove) child.remove();
     }
   }
   // 加载更早按钮固定为第一个子节点
@@ -2679,6 +2910,7 @@ async function renderConversation(id, force){
                    total: fresh.total || 0, cursor: fresh.end || 0,
                    start: fresh.start || 0, size: fresh.size || 0,
                    hasMore: !!fresh.has_more, loadingEarlier: false, detail: null};
+      clearLiveStream();   // 文件被截断/替换，旧预览可能属于已不存在的回合
       renderConvList();
       scrollConvBottom();
     } else if(m.messages && m.messages.length){
@@ -2689,6 +2921,7 @@ async function renderConversation(id, force){
       convState.total = m.total;
       convState.cursor = m.end;
       convState.size = m.size;
+      reconcileLiveParts();   // 正式 part 已落盘：先移除被覆盖的预览再渲染，避免重复
       clearLiveBubble();
       renderConvList();
       if(nearBottom) scrollConvBottom();
@@ -3599,7 +3832,7 @@ function clearSessionView(){
   hideQueuePop();
   toggleTplPop(false);   // 模板浮层同样离开会话即收起，避免停在列表页
   disconnectSessionSse();
-  clearLiveBubble();
+  clearLiveStream();
   convCache = {id: null, size: -1};
   convState = {id: null, msgs: [], total: 0, cursor: 0, start: 0, size: -1,
                hasMore: false, loadingEarlier: false, detail: null};

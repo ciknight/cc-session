@@ -2954,3 +2954,133 @@ test('活动胶囊只在工作中显示当前步骤与持续时间', () => {
     activity:{kind:"retry",label:"模型服务重试中",attempt:3,max_retries:10,since:100}}, 103)`),
     '模型服务重试中（第 3/10 次） · 3 秒');
 });
+
+test('工具卡运行中默认展开，结果到达后自动收起', () => {
+  const b = boot();
+  b.run('convState.detail={state:"working",subagents:[]}');
+  const running = b.run(`toolPartHtml({type:"tool",tool_use_id:"t3",name:"Bash",
+    input_data:{command:"sleep 1"}})`);
+  assert.match(running, /data-dkey="tool:t3:running"/);
+  assert.match(running, /data-dkey="tool:t3:running" open/);
+  assert.match(running, /运行中/);
+  // 展开后要能看到完整参数，而不是只有会被省略的 summary
+  assert.match(running, /tool-args/);
+  assert.match(running, /&quot;command&quot;: &quot;sleep 1&quot;/);
+
+  const done = b.run(`toolPartHtml({type:"tool",tool_use_id:"t3",name:"Bash",
+    input_data:{command:"sleep 1"},result:{kind:"text",text:"ok"}})`);
+  assert.match(done, /data-dkey="tool:t3"/);
+  assert.doesNotMatch(done, /data-dkey="tool:t3" open/);
+  assert.doesNotMatch(done, /:running/);
+  assert.doesNotMatch(done, /tool-args/);
+
+  // 用户运行中手动收起后，同一状态下仍尊重记忆
+  b.run('detailsOpen["tool:t4:running"]=false');
+  const closed = b.run(`toolPartHtml({type:"tool",tool_use_id:"t4",name:"Bash",
+    input_data:{command:"x"}})`);
+  assert.doesNotMatch(closed, /open/);
+
+  // 完成后 key 回到历史卡，不继承运行中的展开状态
+  const history = b.run(`toolPartHtml({type:"tool",tool_use_id:"t4",name:"Bash",
+    input_data:{command:"x"},result:{kind:"text",text:"ok"}})`);
+  assert.match(history, /data-dkey="tool:t4"/);
+  assert.doesNotMatch(history, /open/);
+});
+
+test('同名工具组与 Agent 卡同样按运行中状态展开', () => {
+  const b = boot();
+  b.run('convState.detail={state:"working",subagents:[]}');
+  const group = b.run(`toolGroupHtml([
+    {type:"tool",tool_use_id:"a",name:"Bash",input_data:{command:"one"}},
+    {type:"tool",tool_use_id:"b",name:"Bash",input_data:{command:"two"}}
+  ])`);
+  assert.match(group, /data-dkey="toolgroup:a:running"/);
+  assert.match(group, /data-dkey="toolgroup:a:running" open/);
+
+  const doneGroup = b.run(`toolGroupHtml([
+    {type:"tool",tool_use_id:"a",name:"Bash",input_data:{command:"one"},
+     result:{kind:"text",text:"1"}},
+    {type:"tool",tool_use_id:"b",name:"Bash",input_data:{command:"two"},
+     result:{kind:"text",text:"2"}}
+  ])`);
+  assert.match(doneGroup, /data-dkey="toolgroup:a"/);
+  assert.doesNotMatch(doneGroup, /data-dkey="toolgroup:a" open/);
+
+  const agent = b.run(`agentCardHtml({type:"tool",tool_use_id:"t5",name:"Agent",
+    input_data:{description:"调研",subagent_type:"Explore"}})`);
+  assert.match(agent, /data-dkey="agent:t5:running"/);
+  assert.match(agent, /data-dkey="agent:t5:running" open/);
+});
+
+test('托管流式预览按 id 幂等合并，不重复追加累计文本', () => {
+  const b = boot();
+  b.run('applyStreamPart({id:"m1:0",kind:"thinking",phase:"start",job:"j1"})');
+  b.run('applyStreamPart({id:"m1:0",kind:"thinking",phase:"delta",text:"你",job:"j1"})');
+  b.run('applyStreamPart({id:"m1:0",kind:"thinking",phase:"delta",text:"你",job:"j1"})');
+  assert.equal(b.run('liveParts.get("m1:0").text'), '你');
+  b.run('applyStreamPart({id:"m1:0",kind:"thinking",phase:"delta",text:"你好",job:"j1"})');
+  assert.equal(b.run('liveParts.get("m1:0").text'), '你好');
+  // 更短的迟到事件不能把累计文本回退
+  b.run('applyStreamPart({id:"m1:0",kind:"thinking",phase:"delta",text:"你",job:"j1"})');
+  assert.equal(b.run('liveParts.get("m1:0").text'), '你好');
+
+  b.run(`applyStreamPart({id:"m1:0",kind:"thinking",phase:"done",
+    text:"你好",duration_ms:2500,job:"j1"})`);
+  assert.equal(b.run('liveParts.get("m1:0").done'), true);
+  assert.equal(b.run('thinkingDurations.get(thinkingKey("你好"))'), 3);
+  // done 后迟到的 delta 直接忽略
+  b.run('applyStreamPart({id:"m1:0",kind:"thinking",phase:"delta",text:"你好呀",job:"j1"})');
+  assert.equal(b.run('liveParts.get("m1:0").text'), '你好');
+
+  const html = b.run('thinkingHtml({type:"thinking",text:"你好"})');
+  assert.match(html, /思考过程 · 思考了 3 秒/);
+});
+
+test('托管流式工具预览在完成后显示过滤参数', () => {
+  const b = boot();
+  b.run(`applyStreamPart({id:"toolu_1",kind:"tool",phase:"start",
+    name:"Bash",tool_use_id:"toolu_1",job:"j1"})`);
+  assert.equal(b.run('liveParts.get("toolu_1").done'), false);
+  b.run(`applyStreamPart({id:"toolu_1",kind:"tool",phase:"done",
+    name:"Bash",tool_use_id:"toolu_1",input:{command:"ls"},input_ok:true,job:"j1"})`);
+  assert.equal(b.run('liveParts.get("toolu_1").input.command'), 'ls');
+  assert.equal(b.run('liveParts.get("toolu_1").done'), true);
+  assert.equal(b.run('liveParts.get("toolu_1").input_ok'), true);
+
+  // 结束的 job 屏蔽迟到事件
+  b.run('markJobEnded("j2")');
+  b.run(`applyStreamPart({id:"late",kind:"thinking",phase:"start",job:"j2"})`);
+  assert.equal(b.run('liveParts.has("late")'), false);
+
+  b.run('clearLiveStream()');
+  assert.equal(b.run('liveParts.size'), 0);
+});
+
+test('转录落盘后移除被正式 part 覆盖的流式预览', () => {
+  const b = boot();
+  b.run(`applyStreamPart({id:"toolu_1",kind:"tool",phase:"done",name:"Bash",
+    tool_use_id:"toolu_1",input:{command:"ls"},input_ok:true,job:"j1"})`);
+  b.run(`convState.msgs=[{role:"assistant",
+    parts:[{type:"tool",tool_use_id:"toolu_1",name:"Bash"}]}]`);
+  b.run('reconcileLiveParts()');
+  assert.equal(b.run('liveParts.has("toolu_1")'), false);
+
+  const thought = "一段思考内容，超过四十个字符……需要足够的长度才能匹配正式卡。";
+  b.run(`applyStreamPart({id:"m:0",kind:"thinking",phase:"done",
+    text:${JSON.stringify(thought)},duration_ms:2000,job:"j1"})`);
+  b.run(`convState.msgs=[{role:"assistant",
+    parts:[{type:"thinking",text:${JSON.stringify(thought)}}]}]`);
+  b.run('reconcileLiveParts()');
+  assert.equal(b.run('liveParts.has("m:0")'), false);
+  assert.equal(b.run(`thinkingDurations.get(thinkingKey(${JSON.stringify(thought)}))`), 2);
+
+  // 尚未落盘的预览不能被误删
+  b.run(`applyStreamPart({id:"m:1",kind:"thinking",phase:"delta",
+    text:"另一段完全不同的思考内容，用来确认短前缀不会误匹配。",job:"j1"})`);
+  b.run('reconcileLiveParts()');
+  assert.equal(b.run('liveParts.has("m:1")'), true);
+});
+
+test('stream_part 事件进入 SSE 白名单', () => {
+  assert.match(html, /"stream_part"/);
+});
