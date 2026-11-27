@@ -51,8 +51,16 @@ uv run monitor.py --webhook http://localhost:3000/hook
 
 1. **轮询线程**（`Monitor.run` → `scan_once`）：按 `--interval` 秒扫描 `CLAUDE_DIR/projects/*/*.jsonl`，
    每个 `Session` 维护文件 offset 增量读取，半行留在 buffer 下次拼接。同一路径由
-   每文件扫描锁串行化，stat/读文件/缓存校验在 `mon.lock` 外执行，只有注册、
-   截断判定与 offset 提交持全局锁，慢盘不阻塞 HTTP 与审批。
+   每文件扫描锁串行化，stat/读文件/缓存校验**和逐行解析**都在 `mon.lock` 外执行，
+   只有注册、截断判定、offset/buffer 提交持全局锁，慢盘或大增量不阻塞 HTTP 与审批。
+   单次轮询最多解析 `config.SCAN_MAX_LINES_PER_TICK` 行、读取
+   `config.SCAN_MAX_BYTES_PER_TICK` 字节，超大转录首次回填时分批进行；未读取的字节
+   留在文件里，未解析的整行留在 `Session.buf`（offset 仍是已读位置），文件没有新增时
+   也继续消化。缓冲积压达到字节上限时先暂停读取、把缓冲解析完，避免“读得快、解析得慢”
+   导致 buf 无限增长。未完成行缓冲超过 `config.SCAN_CACHE_BUF_LIMIT` 时跳过本次缓存
+   写入并保留旧条目，避免大 base64 行反复编码落盘。单行解析异常只记录并跳过，
+   不能让整批从同一位置反复回放。每 `config.LIVENESS_SCAN_SECONDS` 秒读取
+   `CLAUDE_DIR/sessions/<pid>.json`，用 PID 存活校验外部 CLI 是否仍在运行（见「状态机」）。
 2. **行解析**（`handle_line`）：逐行 JSON 解析，更新 `Session` 的 cwd/git 分支/模型/token 用量/
    工具统计/任务清单/状态等。事件经 `emit` 分发给 SSE 订阅者和可选 webhook
    （webhook 走单 worker 有界队列，容量 1000，满时丢弃新事件并限频记日志）；
@@ -77,6 +85,8 @@ uv run monitor.py --webhook http://localhost:3000/hook
    svg 按文本防同源脚本，二进制流式下发带附件头；query 里的 `+` 先还原成
    `%2B` 再 parse_qs，文件名里的真实 `+` 不被吞成空格）。
    `/sessions/<id>/messages` 支持 `limit`（默认 100）、`before`、`from` 分页。
+   会话列表/详情额外投影 `activity`（当前步骤）、`active_model`（当前模型）、
+   `cli_live`（外部 CLI 进程仍存活），详情合并托管重试后的 `last_api_error`。
    托管进程通过 `POST /hook/PreToolUse` 接收 AskUserQuestion（仅回环 + 令牌）。
    `POST /sessions/<id>/approval` 设置审批模式，`POST /sessions/<id>/effort`
    设置托管思考档位（low/medium/high/xhigh/max/default），
@@ -148,6 +158,38 @@ uv run monitor.py --webhook http://localhost:3000/hook
   该会话从未出现该标记时才回退到 `stop_reason=end_turn`；turn_duration 清扫时
   `active_agents` 收敛到仍运行的异步 Agent）/ `stale`（超过 `--stale`
   秒无内容事件，在 `summary()` 输出时动态计算）。
+  重试耗尽的 `assistant/isApiErrorMessage` 是**回合终态**（CLI 不再写
+  `turn_duration`）：记录错误、清 pending、按 `_end_turn` 收尾，否则会话会永久停在
+  working。该消息的 `message.model` 是 `<synthetic>`，不能覆盖真实模型。错误终态
+  **不推进 `last_turn_end_ts`**，前端不把它算作“新回复”/未读，通知按失败类展示
+  `turn_finished.error`。主转录中的 sidechain 错误属于子代理，不影响主会话；子代理
+  自身转录则直接收尾为 idle。
+- **活动心跳**（`Session.activity`）：每行转录同时记录当前步骤
+  `{kind, label, since, tool/attempt/max_retries}`——用户输入/tool_result 后是
+  「等待模型响应」，tool_use 是「执行 <工具>」，assistant 文本是「模型输出中」，
+  api_error 是「模型服务重试中」，回合结束清空。网页把它显示在发送区上方的浮动胶囊里，
+  本地每秒刷新已持续时长，长工具/长等待时不会只剩一个静止的「助手」。
+- **存活探测**（`liveness.read_cli_sessions`）：外部 CLI 在
+  `~/.claude/sessions/<pid>.json` 登记 sessionId/pid；每次都校验 PID 仍存活
+  （Windows 用 OpenProcess，不能用会杀进程的 `os.kill(pid, 0)`），并在 Windows 上
+  用 `procStart` 与进程创建时间比对排除 PID 复用。Monitor 自己发起的非托管一次性
+  任务（`self.busy`）不在注册表里，也计入存活集合。进程存活时，只有仍有
+  `pending_tools`/`active_agents` 的 working 会话才豁免 `--stale`（长 Bash/长思考
+  不被误判）；曾确认存活过（`seen_live`）之后进程消失，则 `LIVENESS_EXIT_GRACE`
+  秒无事件即按中断收尾，不必等满 `--stale`。`seen_live` 不跨服务重启恢复，
+  避免误伤不写注册表的旧版 CLI。
+- **API 错误识别**：`util.api_error_fields` 统一解析 `system/api_error`、
+  `system/api_retry` 与合成 assistant 错误消息；文本优先取 `error.formatted`
+  （如 DNS/网关提示），而不是只有 "Connection error." 的 `error.message`，并归类为
+  `network` / `rate_limit` / `server` / `auth` / `other`，保留 status/code/重试次数/
+  退避毫秒。前端横幅按类型给标题（「无法连接模型服务」等）、重试次数与倒计时，
+  SSE `api_error` 到达即更新；正常 assistant 输出清除，错误终态保留。
+  托管进程 stdout 的 `api_retry` 通过 `merge_hosted_retry` 合并进会话详情：
+  取转录记录与 stdout 中较新的一条，回合结束（`last_turn_end_at >= retry.ts`）后
+  只留作诊断，不再显示“正在重试”。
+- **模型投影**：`Session.model` 表示最近一条真实回复的模型（跳过 `<synthetic>`）；
+  列表/详情的 `active_model` 表示当前实际生效的模型（托管 `process_model` 优先，
+  其次用户保存的选择，最后回退 `model`），网页展示用它，切换模型后立即反映。
 - **双时钟**：`last_input_ts` 只由真实用户输入推进（排除 tool_result、isMeta、
   origin/promptSource 注入、中断标记），`last_event_ts` 是最后一条带时间戳的转录事件；
   列表按 `last_input_ts` 排序、回退 `last_event_ts`。
@@ -310,7 +352,16 @@ aria 状态绑定当前视觉态。`autosizeComposer` 的输入框增高上限�
 视口 25%（桌面 40%），长草稿不再吞掉近半屏消息区。
 所有设备的会话页发送框均常驻底部，滚动消息时不隐藏、不回弹，也不因滚动停止强制顶底。
 发送状态（发送中/排队/处理中/已完成/失败）显示为输入区上方的浮动胶囊，不占布局高度；
-「已完成/已取消」约 4 秒后自动消失，失败等错误保持显示。发送区提供中断按钮、审批
+没有发送任务时同一胶囊显示 `activity`（执行工具/等待模型/重试中）与已持续时长，
+本地每秒刷新。「已完成/已取消」约 4 秒后自动消失，失败等错误保持显示。
+会话头部 `#apierr` 按错误类型显示「无法连接模型服务 / 限流 / 异常 / 鉴权失败」，
+带重试次数与倒计时；SSE `api_error` 即时更新、正常回复清除。`visibleApiError` 只在
+working 或失败后 180 秒内把错误顶在头部，更早的历史失败留在对话里、不再伪装成当前
+故障（避免打开旧会话时误以为服务仍不可用）。列表卡片另显示「模型重试」chip。
+`turn_finished.api_error` 按失败通知（带 `error` 文本），不算新回复；
+`hosted_api_retry` 直接使用后端归一化的 `text/kind`。托管流式气泡在收到工具调用
+（`content_block_start` 的 tool_use）时清空，避免旧文本一直停在「助手正在输入…」。
+发送区提供中断按钮、审批
 模式选择与思考档位（effort）下拉（托管中 onchange 即切，未托管保存待下次托管生效；新建页未勾选
 托管时禁用）与 fast 开关（仅会话页渲染，未托管禁用；切换失败回滚勾选，结果看对话里的命令气泡）；
 审批默认 `full`，发送按钮在托管会话运行/排队期间保持可用。会话页和新建会话页共用

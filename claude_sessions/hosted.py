@@ -453,11 +453,19 @@ class Hosted:
                 retry = {"attempt": obj.get("attempt"),
                          "max_retries": obj.get("max_retries"),
                          "error_status": obj.get("error_status"),
-                         "error": obj.get("error")}
+                         "error": obj.get("error"),
+                         "ts": util.now_ts()}
                 with self.ready:
                     self.last_api_retry = retry
-                self._emit_session_event("hosted_api_retry",
-                                         {"hosted": self.hid, **retry})
+                # 事件里带上归一化后的 text/kind：网页无需再猜是网络、限流还是服务端
+                self._emit_session_event("hosted_api_retry", {
+                    "hosted": self.hid, **retry,
+                    **util.api_error_fields({
+                        "error": retry.get("error"),
+                        "error_status": retry.get("error_status"),
+                        "attempt": retry.get("attempt"),
+                        "max_retries": retry.get("max_retries"),
+                    })})
             elif typ == "system" and obj.get("subtype") == "turn_preempted":
                 self._on_turn_preempted(obj)
             elif (config.DEBUG_TASK_FRAMES and typ == "system"
@@ -478,10 +486,18 @@ class Hosted:
                 self._on_lifecycle(obj)
             elif typ == "stream_event":
                 self._on_stream_event(obj)
+            elif typ == "assistant":
+                # 完整 assistant 帧说明该段内容已成形；含工具调用时清掉流式预览，
+                # 兼容不发 content_block_start 的旧版 CLI
+                content = (obj.get("message") or {}).get("content")
+                if isinstance(content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_use"
+                        for b in content):
+                    self._clear_stream_text()
             elif typ == "result":
                 self._update_fast_mode(obj)
                 self._on_result(obj)
-            # 其余事件（assistant / thinking 等）转录文件里已有，这里不处理
+            # 其余事件（thinking 等）转录文件里已有，这里不处理
         rc = self.proc.wait()
         try:
             self.proc.stdin.close()
@@ -871,7 +887,14 @@ class Hosted:
 
     def _on_stream_event(self, obj):
         event = obj.get("event") or {}
-        if event.get("type") != "content_block_delta":
+        etype = event.get("type")
+        if etype == "content_block_start":
+            # 模型开始调用工具：上一段流式文本已经作为 assistant 消息落盘，
+            # 清掉临时气泡，否则网页会一直停在“助手正在输入…”的旧文本上
+            if (event.get("content_block") or {}).get("type") == "tool_use":
+                self._clear_stream_text()
+            return
+        if etype != "content_block_delta":
             return
         delta = event.get("delta") or {}
         if delta.get("type") != "text_delta" or not delta.get("text"):
@@ -889,6 +912,16 @@ class Hosted:
             self._emit_session_event("turn_delta", {
                 "hosted": self.hid, "job": job.get("id"), "text": text},
                 transient=True)
+
+    def _clear_stream_text(self):
+        """清空当前回合的流式预览（工具轮开始/回合收尾时调用）。"""
+        with self.ready:
+            job = self.current
+            if job is None or self.stream_job is not job or not self.stream_text:
+                return
+            self.stream_text = ""
+        self._emit_session_event("turn_delta", {
+            "hosted": self.hid, "job": job.get("id"), "text": ""}, transient=True)
 
     # ---------- 权限审批 ----------
     def _on_can_use_tool(self, obj):

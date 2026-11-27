@@ -27,6 +27,47 @@ _jinja = Environment(
 )
 
 
+def active_model(mon, sid, fallback=None):
+    """当前实际生效/选用的模型：托管进程的 process_model 优先，
+    其次用户为该会话保存的选择，最后才是转录里最近一条回复的模型。"""
+    h = mon.hosted_by_sid.get(sid)
+    if h and h.alive() and getattr(h, "process_model", None):
+        return h.process_model
+    return mon.preferences.get(sid) or fallback
+
+
+def merge_hosted_retry(mon, sid, detail):
+    """把托管进程 stdout 的 api_retry 合并进详情。
+
+    转录里的 system/api_error 通常晚于 stdout 帧落盘；这里取两者较新的记录，
+    让网页在模型服务开始重试时就能看到提示，而不是等下一行转录。
+    """
+    h = mon.hosted_by_sid.get(sid)
+    if not (h and h.alive()):
+        return
+    retry = getattr(h, "last_api_retry", None)
+    if not isinstance(retry, dict):
+        return
+    ts = retry.get("ts")
+    if not isinstance(ts, (int, float)) or util.now_ts() - ts > 180:
+        return
+    current = detail.get("last_api_error") or {}
+    if isinstance(current.get("ts"), (int, float)) and current["ts"] > ts:
+        return
+    # 回合已在这次重试之后结束（成功或失败）：旧重试记录只留作诊断，
+    # 不再当作“正在重试”展示；失败终态会由转录里的错误记录接管。
+    turn_end = detail.get("last_turn_end_at")
+    if isinstance(turn_end, (int, float)) and turn_end >= ts:
+        return
+    data = util.api_error_fields({
+        "error": retry.get("error"),
+        "error_status": retry.get("error_status"),
+        "attempt": retry.get("attempt"),
+        "max_retries": retry.get("max_retries"),
+    })
+    detail["last_api_error"] = {"ts": ts, **data}
+
+
 def _payload_bytes(value):
     """估算缓存 payload 大小；字符串取长度，避免为大图片再做一次编码/序列化。"""
     if isinstance(value, str):
@@ -133,6 +174,7 @@ def make_handler(mon, refresh_interval):
                     it["hosted_rate_limit"] = (util.active_rate_limit(h.last_rate_limit)
                                                if h and h.alive() else None)
                     it["selected_model"] = mon.preferences.get(it["id"])
+                    it["active_model"] = active_model(mon, it["id"], it.get("model"))
                     it["pending_interactions"] = counts.get(it["id"], 0)
                 return self._json(items)
             parts = u.path.strip("/").split("/")
@@ -262,6 +304,8 @@ def make_handler(mon, refresh_interval):
                     d = s.detail(mon.stale_after, mon.project_of(s, mon.project_map()))
                 mon.with_metadata(d)
                 d["selected_model"] = mon.preferences.get(sid)
+                d["active_model"] = active_model(mon, sid, d.get("model"))
+                merge_hosted_retry(mon, sid, d)
                 d["approval"] = mon.approvals.get(sid)
                 d["effort"] = mon.efforts.get(sid)
                 d["interactions"] = mon.pending_interactions(sid)
@@ -689,6 +733,9 @@ def make_handler(mon, refresh_interval):
                               if s else None)
                 mon.with_metadata(detail)
                 h = mon.hosted_by_sid.get(only)
+                if detail:
+                    detail["active_model"] = active_model(mon, only, detail.get("model"))
+                    merge_hosted_retry(mon, only, detail)
                 data = {
                     "session": detail,
                     "interactions": mon.pending_interactions(only),
@@ -717,6 +764,7 @@ def make_handler(mon, refresh_interval):
                     item["hosted_id"] = h.hid if h else None
                     item["hosted_rate_limit"] = (util.active_rate_limit(h.last_rate_limit)
                                                  if h and h.alive() else None)
+                    item["active_model"] = active_model(mon, item["id"], item.get("model"))
                 data = {"sessions": sessions, "interactions": mon.pending_interactions()}
             return {"ts": util.now_ts(), "seq": seq, "session": only,
                     "type": "snapshot", "data": data}

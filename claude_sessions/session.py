@@ -2,7 +2,7 @@
 import copy
 from collections import Counter, deque
 
-from . import util
+from . import config, util
 from .util import project_root
 
 
@@ -44,6 +44,15 @@ class Session:
         self.parent_id = None
         self.agent_name = None
         self.state = "idle"
+        # 当前步骤（等待模型/执行工具/重试等），供网页在长回合中说明"还在做什么"
+        self.activity = None
+        # 外部 CLI 注册表（~/.claude/sessions/<pid>.json）确认的进程存活状态；
+        # seen_live 一旦为真，进程消失后才允许提前判定回合中断
+        self.cli_live = False
+        self.seen_live = False
+        # 批量解析期间保存解析前快照：落盘缓存若在此时发生，必须写入旧状态，
+        # 否则重启后会跳过尚未应用完的行
+        self.scan_baseline = None
         self.recent = deque(maxlen=50)
         self.tail_sample = b""        # 文件末尾 4 KiB，用于校验扫描缓存没有过期
 
@@ -71,6 +80,7 @@ class Session:
             "last_api_error": copy.deepcopy(self.last_api_error),
             "agent_name": self.agent_name,
             "state": self.state,
+            "activity": copy.deepcopy(self.activity),
         }
 
     def restore_cache(self, data):
@@ -127,11 +137,29 @@ class Session:
                            for k in ("input", "output", "cache_read", "cache_creation")}
         error = data.get("last_api_error")
         self.last_api_error = error if isinstance(error, dict) else None
+        activity = data.get("activity")
+        self.activity = activity if isinstance(activity, dict) else None
 
     def _is_stale(self, stale_after):
         """超过 stale 秒无内容事件。父进程异常退出留下的截断转录没有回合结束
-        标记，靠它把残留的运行中子代理在输出层降级。"""
-        return bool(self.last_event_ts and util.now_ts() - self.last_event_ts > stale_after)
+        标记，靠它把残留的运行中子代理在输出层降级。
+
+        外部 CLI 进程仍存活时，长工具执行/长思考不算停滞；曾确认存活、
+        之后进程消失且没有结束标记时，则提前在 LIVENESS_EXIT_GRACE 秒后收尾，
+        不必等满 --stale。"""
+        if not self.last_event_ts:
+            return False
+        quiet = util.now_ts() - self.last_event_ts
+        working = self.state == "working" or bool(self.active_agents)
+        if working and self.seen_live:
+            if self.cli_live:
+                # 只有确实还有未完成的工具/子代理才豁免 --stale；
+                # 进程活着但状态卡在 working 时仍按原阈值收尾，避免永久工作中
+                if self.pending_tools or self.active_agents:
+                    return False
+                return quiet > stale_after
+            return quiet > min(stale_after, config.LIVENESS_EXIT_GRACE)
+        return quiet > stale_after
 
     def summary(self, stale_after, project=None):
         state = self.state
@@ -157,6 +185,8 @@ class Session:
             "context_tokens": self.context_tokens,
             "compacted_at": self.compacted_at,
             "last_api_error": self.last_api_error,
+            "activity": self.activity,
+            "cli_live": self.cli_live,
             "is_subagent": self.is_subagent,
             "parent_id": self.parent_id,
             "agent_name": self.agent_name,

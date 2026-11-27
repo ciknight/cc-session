@@ -83,6 +83,95 @@ class ScanCacheTests(unittest.TestCase):
         self.assertEqual(sess.last_user, "hello")
         self.assertEqual(sess.last_assistant, "hi")
 
+    def test_scan_budget_splits_large_backlog(self):
+        lines = [self.user_line("hello")]
+        lines += [self.assistant_line(f"m{i}", f"id{i}", 1, 1,
+                                      epoch=1_700_000_001 + i)
+                  for i in range(25)]
+        self.write(lines)
+        mon = monitor.Monitor(600)
+        with patch.object(config, "SCAN_MAX_LINES_PER_TICK", 10):
+            mon.scan_once()
+            sess = mon.by_sid("sid-1")
+            self.assertEqual(sess.assistant_msgs, 9)   # 首轮解析 user + 9 条
+            self.assertTrue(sess.buf)                  # 剩余整行留待下一轮
+            mon.scan_once()
+            mon.scan_once()
+        self.assertEqual(sess.assistant_msgs, 25)
+        self.assertFalse(sess.buf)
+        self.assertIsNone(sess.scan_baseline)
+
+    def test_scan_reads_at_most_byte_budget(self):
+        lines = [self.user_line("hello")]
+        lines += [self.assistant_line(f"m{i}", f"id{i}", 1, 1,
+                                      epoch=1_700_000_001 + i)
+                  for i in range(40)]
+        self.write(lines)
+        mon = monitor.Monitor(600)
+        with patch.object(config, "SCAN_MAX_BYTES_PER_TICK", 160):
+            mon.scan_once()
+            sess = mon.by_sid("sid-1")
+            # 首轮只读 160 字节，剩余内容留在文件里，不进入内存 buf
+            self.assertLess(len(sess.buf), 1024)
+            for _ in range(500):
+                mon.scan_once()
+                if sess.assistant_msgs == 40 and not sess.buf:
+                    break
+        self.assertEqual(sess.assistant_msgs, 40)
+        self.assertFalse(sess.buf)
+
+    def test_scan_backlog_buffer_stays_bounded(self):
+        lines = [self.user_line("hello")]
+        lines += [self.assistant_line(f"m{i}", f"id{i}", 1, 1,
+                                      epoch=1_700_000_001 + i)
+                  for i in range(200)]
+        self.write(lines)
+        mon = monitor.Monitor(600)
+        peak = 0
+        with patch.object(config, "SCAN_MAX_LINES_PER_TICK", 2), \
+                patch.object(config, "SCAN_MAX_BYTES_PER_TICK", 1024):
+            for _ in range(2000):
+                mon.scan_once()
+                sess = mon.by_sid("sid-1")
+                peak = max(peak, len(sess.buf))
+                if sess.assistant_msgs == 200 and not sess.buf:
+                    break
+        self.assertEqual(sess.assistant_msgs, 200)
+        self.assertFalse(sess.buf)
+        # 解析速度跟不上读取时会暂停读新字节，缓冲不会无限累积
+        self.assertLess(peak, 8192)
+
+    def test_large_partial_line_keeps_previous_cache_entry(self):
+        self.write([self.user_line("hello")])
+        mon = monitor.Monitor(600)
+        mon.scan_once()
+        key = str(self.transcript)
+        before = json.loads(self.cache_path.read_text(encoding="utf-8"))["files"][key]
+
+        sess = mon.by_sid("sid-1")
+        sess.buf = b"x" * 200                       # 模拟超长未完成行
+        mon.cache_dirty = True
+        with patch.object(config, "SCAN_CACHE_BUF_LIMIT", 100):
+            mon.maybe_save_cache(force=True)
+        after = json.loads(self.cache_path.read_text(encoding="utf-8"))["files"][key]
+        self.assertEqual(after, before)
+
+    def test_malformed_line_does_not_block_remaining_lines(self):
+        self.write([
+            self.user_line("before"),
+            {"type": "assistant", "timestamp": _ts(1_700_000_002),
+             "message": {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": "bad", "name": "Bash",
+                  "input": "not-a-dict"}]}},
+            self.user_line("after", epoch=1_700_000_003),
+        ])
+        mon = monitor.Monitor(600)
+        mon.scan_once()   # 坏行被跳过，不能抛到 run() 导致整轮回放
+        sess = mon.by_sid("sid-1")
+        self.assertEqual(sess.user_msgs, 2)
+        self.assertEqual(sess.last_user, "after")
+        self.assertFalse(sess.buf)
+
     def test_append_parses_only_new_bytes(self):
         self.write([self.user_line("hello"),
                     self.assistant_line("hi", "m1", 10, 2)])

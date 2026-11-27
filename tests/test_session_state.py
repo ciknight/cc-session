@@ -435,6 +435,107 @@ class SessionStateTests(unittest.TestCase):
         self.line("user", [{"type": "text", "text": "[Request interrupted by user]"}])
         self.assertIsNone(self.sess.last_api_error)
 
+    def test_api_error_prefers_formatted_and_sets_retry_activity(self):
+        self.line("system", [], subtype="api_error",
+                  error={"message": "Connection error.",
+                         "formatted": "Can't reach the API server (ENOTFOUND)",
+                         "connection": {"code": "ENOTFOUND"},
+                         "isNetworkDown": True},
+                  retryAttempt=2, maxRetries=10, retryInMs=1000)
+        err = self.sess.last_api_error
+        self.assertEqual(err["kind"], "network")
+        self.assertIn("ENOTFOUND", err["text"])
+        self.assertNotEqual(err["text"], "Connection error.")
+        self.assertEqual(self.sess.activity["kind"], "retry")
+        self.assertEqual(self.sess.activity["attempt"], 2)
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "working")
+
+    def test_api_error_message_ends_turn_and_keeps_real_model(self):
+        self.sess.model = "opus"
+        self.sess.state = "working"
+        self.mon.first_scan_done = True
+        events = []
+        self.mon.emit = lambda sess, kind, data, transient=False: events.append((kind, data))
+        self.mon.handle_line(self.sess, json.dumps({
+            "type": "assistant",
+            "timestamp": self.timestamp(self.now),
+            "isApiErrorMessage": True,
+            "error": "server_error",
+            "message": {
+                "model": "<synthetic>",
+                "role": "assistant",
+                "content": [{"type": "text",
+                             "text": "API Error: Connection dropped (ECONNRESET)."}],
+            },
+        }))
+        # 合成错误消息不能覆盖真实模型，也不能把会话永久留在 working
+        self.assertEqual(self.sess.model, "opus")
+        self.assertEqual(self.sess.state, "idle")
+        self.assertEqual(self.sess.last_api_error["kind"], "network")
+        # 失败回合不算“新回复”：不推进回合结束水位，通知带错误原因
+        self.assertIsNone(self.sess.last_turn_end_ts)
+        self.assertTrue(any(kind == "api_error" for kind, _ in events))
+        finished = [d for kind, d in events if kind == "turn_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertTrue(finished[0]["api_error"])
+        self.assertIn("ECONNRESET", finished[0]["error"])
+
+    def test_sidechain_error_does_not_affect_main_session(self):
+        self.sess.state = "working"
+        self.mon.first_scan_done = True
+        events = []
+        self.mon.emit = lambda sess, kind, data, transient=False: events.append((kind, data))
+        self.mon.handle_line(self.sess, json.dumps({
+            "type": "assistant",
+            "timestamp": self.timestamp(self.now),
+            "isSidechain": True,
+            "isApiErrorMessage": True,
+            "error": "server_error",
+            "message": {"model": "<synthetic>", "role": "assistant",
+                        "content": [{"type": "text", "text": "API Error: ECONNRESET"}]},
+        }))
+        # 主转录里夹带的子代理错误不应打断主会话，也不应显示在主会话横幅
+        self.assertEqual(self.sess.state, "working")
+        self.assertIsNone(self.sess.last_api_error)
+        self.assertEqual(events, [])
+
+    def test_activity_tracks_waiting_tool_and_turn_end(self):
+        self.line("user", "hello")
+        self.assertEqual(self.sess.activity["kind"], "model")
+        self.line("assistant", [{"type": "tool_use", "id": "t1",
+                                 "name": "Bash", "input": {}}],
+                  stop_reason="tool_use")
+        self.assertEqual(self.sess.activity["kind"], "tool")
+        self.assertEqual(self.sess.activity["tool"], "Bash")
+        self.line("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}])
+        self.assertEqual(self.sess.activity["kind"], "model")
+        self.line("system", [], subtype="turn_duration")
+        self.assertIsNone(self.sess.activity)
+        self.assertEqual(self.sess.state, "idle")
+
+    def test_busy_remote_job_counts_as_live(self):
+        from claude_sessions import liveness
+        self.sess.id = "sid-1"
+        self.mon.sessions[str(self.sess.path)] = self.sess
+        self.mon.busy.add("sid-1")
+        with patch.object(liveness, "read_cli_sessions", return_value={}):
+            self.mon._refresh_liveness()
+        self.assertTrue(self.sess.cli_live)
+        self.assertTrue(self.sess.seen_live)
+
+    def test_live_process_prevents_stale_during_long_tool(self):
+        stale_ts = self.now - self.mon.stale_after - 1
+        self.line("user", "run the long build", timestamp=self.timestamp(stale_ts))
+        self.line("assistant", [{"type": "tool_use", "id": "t1",
+                                 "name": "Bash", "input": {}}],
+                  timestamp=self.timestamp(stale_ts), stop_reason="tool_use")
+        self.sess.seen_live = True
+        self.sess.cli_live = True
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "working")
+        # 进程消失且超过退出宽限，才按异常中断收尾
+        self.sess.cli_live = False
+        self.assertEqual(self.sess.summary(self.mon.stale_after)["state"], "stale")
+
     def test_restore_old_subagent_entries_marked_done(self):
         self.sess.restore_cache({
             "subagents": [{"type": "Explore", "description": "d", "ts": 1},

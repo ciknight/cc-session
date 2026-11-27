@@ -2916,3 +2916,41 @@ test('定时睡眠预设支持 30/60/120/180 分钟', () => {
   }
   assert.doesNotMatch(out, /value="15"/);
 });
+
+test('错误横幅按错误类型给出准确标题与重试倒计时', () => {
+  const b = boot();
+  assert.equal(b.run('apiErrorHead("network")'), '无法连接模型服务');
+  assert.equal(b.run('apiErrorHead("rate_limit")'), '模型服务限流');
+  const text = b.run(`apiErrorText({kind:"network",text:"Can't reach the API server (ENOTFOUND)",
+    retry_attempt:2,max_retries:10,retry_in_ms:5000,ts:1000}, 1002)`);
+  assert.match(text, /无法连接模型服务/);
+  assert.match(text, /ENOTFOUND/);
+  assert.match(text, /第 2\/10 次重试/);
+  assert.match(text, /约 3 秒后继续/);
+  const exhausted = b.run(`apiErrorText({kind:"server",text:"529 overloaded",
+    retry_attempt:10,max_retries:10,ts:1000}, 1002)`);
+  assert.match(exhausted, /已重试 10\/10 次/);
+});
+
+test('历史失败不再顶在当前会话头部', () => {
+  const b = boot();
+  assert.equal(b.run(`visibleApiError({state:"idle",
+    last_api_error:{text:"old",ts:100}}, 250).text`), 'old');
+  assert.equal(b.run(`visibleApiError({state:"idle",
+    last_api_error:{text:"old",ts:100}}, 500)`), null);
+  assert.equal(b.run(`visibleApiError({state:"working",
+    last_api_error:{text:"retrying",ts:100}}, 500).text`), 'retrying');
+  assert.equal(b.run('visibleApiError({state:"idle"}, 500)'), null);
+});
+
+test('活动胶囊只在工作中显示当前步骤与持续时间', () => {
+  const b = boot();
+  assert.equal(b.run(`activityText({state:"working",
+    activity:{kind:"tool",label:"执行 Bash",tool:"Bash",since:100}}, 105)`),
+    '执行 Bash · 5 秒');
+  assert.equal(b.run(`activityText({state:"idle",
+    activity:{kind:"tool",label:"执行 Bash",since:100}}, 105)`), '');
+  assert.equal(b.run(`activityText({state:"working",
+    activity:{kind:"retry",label:"模型服务重试中",attempt:3,max_retries:10,since:100}}, 103)`),
+    '模型服务重试中（第 3/10 次） · 3 秒');
+});

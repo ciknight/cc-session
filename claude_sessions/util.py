@@ -144,6 +144,89 @@ def active_rate_limit(record, now=None):
     return record
 
 
+_NETWORK_CODES = {
+    "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED",
+    "ETIMEDOUT", "EPIPE", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT",
+    "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "ERR_TLS_CERT_ALTNAME_INVALID",
+}
+_NETWORK_MARKERS = (
+    "connection error", "connection dropped", "network", "getaddrinfo",
+    "socket hang up", "tls", "ssl", "fetch failed", "econnreset", "enotfound",
+    "econnrefused", "etimedout", "eai_again", "http/2 cancel",
+)
+_AUTH_MARKERS = ("unauthorized", "authentication", "invalid api key",
+                 "permission denied", "forbidden", "401", "403")
+_RATE_MARKERS = ("rate limit", "rate_limit", "overloaded", "too many requests",
+                 "quota", "insufficient_quota", "no available upstream")
+
+
+def classify_api_error(text, status=None, connection=None, network_down=False):
+    """把上游错误归成 network / rate_limit / server / auth / other。
+
+    转录里的错误文本形态很杂（连接失败、网关 5xx、529 过载、鉴权失败），
+    分类只用于网页选择更准确的标题，具体原因仍原样展示 text。
+    """
+    low = (text or "").lower()
+    if status in (401, 403) or any(m in low for m in _AUTH_MARKERS):
+        return "auth"
+    if network_down:
+        return "network"
+    code = connection.get("code") if isinstance(connection, dict) else None
+    if isinstance(code, str) and code.upper() in _NETWORK_CODES:
+        return "network"
+    if any(m in low for m in _NETWORK_MARKERS):
+        return "network"
+    if status == 429 or "529" in low or any(m in low for m in _RATE_MARKERS):
+        return "rate_limit"
+    if (isinstance(status, int) and status >= 500) or any(
+            m in low for m in ("server_error", "internal server error", "500", "503")):
+        return "server"
+    return "other"
+
+
+def api_error_fields(obj):
+    """从 system/api_error、system/api_retry 或 assistant isApiErrorMessage 行
+    提取看板需要的结构化错误字段。
+
+    文本优先取 error.formatted（CLI 会给出更具体的说明，例如 DNS/网关提示），
+    而不是只有 "Connection error." 的 error.message。
+    """
+    obj = obj if isinstance(obj, dict) else {}
+    err = obj.get("error")
+    if isinstance(err, dict):
+        text = err.get("formatted") or err.get("message") or ""
+        status = err.get("status")
+        connection = err.get("connection")
+        network_down = bool(err.get("isNetworkDown"))
+    else:
+        text = err if isinstance(err, str) else ""
+        status = None
+        connection = None
+        network_down = False
+    if not text and isinstance(obj.get("message"), str):
+        text = obj["message"]
+    if status is None:
+        status = obj.get("error_status")
+    if status is None:
+        status = obj.get("api_error_status")
+    attempt = obj.get("retryAttempt", obj.get("attempt"))
+    max_retries = obj.get("maxRetries", obj.get("max_retries"))
+    retry_in_ms = obj.get("retryInMs", obj.get("retry_in_ms"))
+    kind = classify_api_error(text, status, connection, network_down)
+    fields = {"text": clip(text or "模型服务暂时不可用", 300), "kind": kind}
+    for key, value in (("status", status), ("retry_attempt", attempt),
+                       ("max_retries", max_retries), ("retry_in_ms", retry_in_ms)):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            fields[key] = int(value)
+    code = connection.get("code") if isinstance(connection, dict) else None
+    if isinstance(code, str) and code:
+        fields["code"] = code
+    source = obj.get("source")
+    if isinstance(source, str) and source:
+        fields["source"] = source
+    return fields
+
+
 def message_content(text, images=None):
     """把网页消息整理成 CLI stream-json 的文本/图片 content blocks。"""
     if not isinstance(text, str):

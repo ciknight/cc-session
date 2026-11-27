@@ -163,6 +163,8 @@ class ManagementAPITests(unittest.TestCase):
         detail = json.load(self.request("/sessions/sid-1"))
         self.assertEqual(detail["model"], "actual-model")
         self.assertEqual(detail["selected_model"], "custom/model")
+        # 网页展示当前生效的模型：用户选择优先于最近一条回复的模型
+        self.assertEqual(detail["active_model"], "custom/model")
 
     def test_model_api_rejects_cross_origin_and_bad_model(self):
         with self.assertRaises(HTTPError) as cross:

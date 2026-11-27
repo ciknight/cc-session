@@ -731,6 +731,13 @@ function rateLimitChip(s){
   if(r.resets_at) parts.push("重置 " + new Date(r.resets_at * 1000).toLocaleTimeString());
   return `<span class="chip warn" title="${esc(parts.join(" · "))}">⏳ ${label}</span>`;
 }
+function apiErrorChip(s){
+  const err = s && s.last_api_error;
+  if(!err || !err.text || !err.ts || s.state !== "working") return "";
+  if(Date.now() / 1000 - err.ts > 180) return "";   // 过期的重试记录不再提示
+  const label = err.kind === "rate_limit" ? "限流重试" : "模型重试";
+  return `<span class="chip warn" title="${esc(apiErrorText(err))}">⚠ ${label}</span>`;
+}
 function fastStateChip(d){
   const f = d && d.hosted_fast_mode;
   if(!f) return "";
@@ -1426,6 +1433,35 @@ function handleSseMessage(msg){
       "turn_interrupted"].includes(msg.type) && view.session === msg.session){
     clearLiveBubble();
   }
+  if(msg.type === "api_error" && view.session === msg.session){
+    // 不等下一轮 detail：SSE 到达就更新横幅与倒计时
+    const data = msg.data || {};
+    renderApiError({...data, ts: msg.ts,
+      kind: data.kind || inferApiErrorKind(data.text, data.status)});
+  }
+  if(msg.type === "hosted_api_retry" && view.session === msg.session){
+    const d = msg.data || {}, err = d.error;
+    const text = d.text || (typeof err === "string" ? err
+      : (err && (err.formatted || err.message)) || "模型服务暂时不可用");
+    const status = d.status != null ? d.status : d.error_status;
+    renderApiError({text, status, ts: msg.ts,
+      kind: d.kind || inferApiErrorKind(text, status),
+      retry_attempt: d.retry_attempt != null ? d.retry_attempt : d.attempt,
+      max_retries: d.max_retries, retry_in_ms: d.retry_in_ms});
+  }
+  if(msg.type === "user_message" && view.session === msg.session) clearApiError();
+  if(msg.type === "assistant_message" && view.session === msg.session) clearApiError();
+  if(msg.type === "turn_finished" && view.session === msg.session
+     && !(msg.data || {}).api_error) clearApiError();
+  if(msg.type === "hosted_turn_done" && view.session === msg.session){
+    const d = msg.data || {};
+    if(d.status === "failed" || d.is_error){
+      // 具体重试信息已在横幅里时不要用笼统的失败结果覆盖
+      if(!lastApiError) renderApiError({
+        text: d.result || "回合执行失败", ts: msg.ts,
+        kind: inferApiErrorKind(d.result || "", d.api_error_status)});
+    }else clearApiError();
+  }
   scheduleListRefresh();
   if(msg.session) scheduleConvRefresh(msg.session);
   maybeNotify(msg);
@@ -1497,7 +1533,7 @@ function sessionDisplayName(sid){
 function maybeNotify(msg){
   if(!msg || !msg.type || !document.hidden || !notifyOn()) return;
   let kind = null;
-  if(msg.type === "turn_finished") kind = "reply";
+  if(msg.type === "turn_finished") kind = msg.data.api_error ? "failed" : "reply";
   else if(msg.type === "interaction_pending") kind = "approval";
   else if(msg.type === "hosted_turn_done" && (msg.data.is_error || msg.data.status === "failed")) kind = "failed";
   else if(msg.type === "remote_message_done" && msg.data.status === "failed") kind = "failed";
@@ -1507,7 +1543,10 @@ function maybeNotify(msg){
   if(kind === "reply" && minDur > 0 && typeof msg.data.duration === "number"
      && msg.data.duration < minDur) return;
   const sid = msg.session || msg.data.session_id || "";
-  const key = kind + ":" + sid + ":" + (msg.data.id || msg.data.job || "");
+  // 失败事件可能由 turn_finished 与 hosted_turn_done 同时投递：按会话去重，
+  // 避免一次失败弹两条通知
+  const key = kind + ":" + sid + ":"
+    + (kind === "failed" ? "" : (msg.data.id || msg.data.job || ""));
   const now = Date.now();
   if(now - (notifyCooldown.get(key) || 0) < 5000) return;   // 两路重复/连发冷却
   notifyCooldown.set(key, now);
@@ -1585,35 +1624,104 @@ function applySessionDetail(d){
       tok.title = `上下文 ${fmtTok(ctx)} · 输入 ${fmtTok(tokens.input)} · 输出 ${fmtTok(tokens.output)} · 缓存读 ${fmtTok(tokens.cache_read)}`;
     }
   }
-  renderApiError(d.last_api_error);
+  renderApiError(visibleApiError(d));
   renderBgStrip();
   updateModelSt(d.id || convState.id || "");
   return detailChanged;
 }
+const API_ERROR_HEAD = {
+  network: "无法连接模型服务", rate_limit: "模型服务限流",
+  server: "模型服务异常", auth: "模型服务鉴权失败",
+  other: "模型服务暂不可用",
+};
+function apiErrorHead(kind){ return API_ERROR_HEAD[kind] || API_ERROR_HEAD.other; }
+function inferApiErrorKind(text, status){
+  // SSE 即时事件没有经过服务端分类时，用同样的规则兜底
+  const low = String(text || "").toLowerCase();
+  if(status === 401 || status === 403
+     || /unauthorized|invalid api key|permission denied/.test(low)) return "auth";
+  if(/econnreset|enotfound|econnrefused|etimedout|eai_again|connection|network|getaddrinfo|socket|tls|ssl/.test(low))
+    return "network";
+  if(status === 429 || /rate limit|overloaded|quota|no available upstream/.test(low))
+    return "rate_limit";
+  if(status >= 500 || /server_error|internal server error|\b50[03]\b/.test(low)) return "server";
+  return "other";
+}
+function apiErrorText(err, nowSec){
+  if(!err || !err.text) return "";
+  const now = nowSec || Date.now() / 1000;
+  // 只有最近发生的错误才算“正在重试”；重启服务回放旧转录时不显示过期状态
+  const fresh = err.ts ? now - err.ts < 180 : true;
+  let text = "⚠ " + apiErrorHead(err.kind) + "：" + err.text;
+  if(fresh && err.retry_attempt){
+    const max = err.max_retries ? "/" + err.max_retries : "";
+    if(err.max_retries && err.retry_attempt >= err.max_retries){
+      text += `（已重试 ${err.retry_attempt}${max} 次）`;
+    }else{
+      text += `，正在第 ${err.retry_attempt}${max} 次重试`;
+      if(err.retry_in_ms && err.ts){
+        const wait = Math.max(0, Math.round(err.ts + err.retry_in_ms / 1000 - now));
+        text += wait > 0 ? `，约 ${wait} 秒后继续` : "，正在重新连接";
+      }
+    }
+  }
+  return text;
+}
+let lastApiError = null;
 function renderApiError(err){
-  // 上游 503/限流时 CLI 只写 system/api_error，转录里没有助手内容；
-  // 这里把服务端记录的重试状态显示出来，避免看起来像卡死
+  // 上游 503/限流时 CLI 只写 system/api_error 或合成 assistant 错误消息；
+  // 这里把分类、重试次数和倒计时显示出来，避免看起来像卡死
   const el = document.getElementById("apierr");
   if(!el) return;
-  if(!err || !err.text){
-    el.textContent = "";
-    el.style.display = "none";
-    return;
+  lastApiError = err && err.text ? err : null;
+  const text = apiErrorText(err);
+  if(el.textContent !== text) el.textContent = text;
+  el.style.display = text ? "" : "none";
+}
+function clearApiError(){ renderApiError(null); }
+function visibleApiError(d, nowSec){
+  // 正在工作的会话显示当前重试；已结束的历史失败只在 180 秒内顶在头部，
+  // 更早的失败留在对话里，避免打开旧会话时误以为此刻仍不可用
+  const err = d && d.last_api_error;
+  if(!err || !err.text) return null;
+  const now = nowSec || Date.now() / 1000;
+  if(d.state !== "working" && err.ts && now - err.ts > 180) return null;
+  return err;
+}
+function fmtElapsed(seconds){
+  seconds = Math.max(0, Math.round(seconds));
+  if(seconds < 60) return seconds + " 秒";
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  if(m < 60) return s ? `${m} 分 ${s} 秒` : `${m} 分`;
+  const h = Math.floor(m / 60);
+  return `${h} 小时 ${m % 60} 分`;
+}
+function activityText(d, nowSec){
+  // 长工具/长等待时转录没有新消息，光看“助手”不会知道还在做什么。
+  // 胶囊展示当前步骤和已持续时间，轮询与本地计时器都会刷新。
+  const a = d && d.activity;
+  if(!a || !a.label || d.state !== "working") return "";
+  const now = nowSec || Date.now() / 1000;
+  let text = a.label;
+  if(a.kind === "retry" && a.attempt){
+    text += `（第 ${a.attempt}${a.max_retries ? "/" + a.max_retries : ""} 次）`;
   }
-  let tail = "";
-  // 只有最近发生的错误才算“正在重试”；重启服务回放旧转录时不显示过期的重试状态
-  const fresh = err.ts && Date.now() / 1000 - err.ts < 180;
-  if(err.retry_attempt && fresh){
-    tail = `，正在第 ${err.retry_attempt}${err.max_retries ? "/" + err.max_retries : ""} 次重试`;
-    if(err.retry_in_ms) tail += `，约 ${Math.max(1, Math.round(err.retry_in_ms / 1000))} 秒后继续`;
-  }
-  el.textContent = "⚠ 模型服务暂不可用：" + err.text + tail;
-  el.style.display = "";
+  const elapsed = a.since ? now - a.since : 0;
+  if(elapsed >= 2) text += " · " + fmtElapsed(elapsed);
+  return text;
 }
 function updateLiveBubble(text){
   liveText = text || "";
   if(liveRaf) return;
   liveRaf = raf(() => { liveRaf = null; renderLiveBubble(); });
+}
+function liveBubbleHead(){
+  // 工具执行时不要继续显示“正在输入”，用 detail.activity 说明当前步骤
+  const a = convState.detail && convState.detail.activity;
+  if(a && a.kind === "tool" && a.tool) return "助手 · 正在执行 " + a.tool + "…";
+  if(a && a.kind === "retry") return "助手 · 模型服务重试中…";
+  if(a && a.kind === "model") return "助手 · 等待模型响应…";
+  return "助手 · 正在输入…";
 }
 function renderLiveBubble(){
   const conv = document.getElementById("conv");
@@ -1627,9 +1735,11 @@ function renderLiveBubble(){
     el = document.createElement("div");
     el.id = "livebubble";
     el.className = "msg assistant";
-    el.innerHTML = '<div class="mhead">助手 · 正在输入…</div><div class="abody"></div>';
+    el.innerHTML = '<div class="mhead"></div><div class="abody"></div>';
     conv.appendChild(el);
   }
+  const head = el.querySelector ? el.querySelector(".mhead") : null;
+  if(head) head.textContent = liveBubbleHead();
   const body = el.querySelector ? el.querySelector(".abody") : null;
   if(body) body.textContent = liveText;
 }
@@ -1744,13 +1854,14 @@ function renderSessionList(p){
       <div class="scard" data-id="${esc(s.id)}">
         <span class="b ${s.state}">${STATE_ZH[s.state] || s.state}</span>
         ${s.hosted ? '<span class="chip" title="消息直接写入常驻 claude 进程">⚙ 托管中</span>' : ""}${rateLimitChip(s)}
+        ${apiErrorChip(s)}
         ${s.pending_interactions ? `<span class="chip pending">待审批 ${s.pending_interactions}</span>` : ""}
         ${unreadSessions.has(s.id) ? '<span class="chip" title="本页面观察到主回合结束；不代表任务成功或后台子代理全部结束">新回复</span>' : ""}
         <span class="stitle">${esc(sessTitle(s))}</span>
         ${metadataActionsHtml(s)}
         <div class="mut">${[
           s.cwd !== s.project ? "⎇ " + projName(s.cwd) : null,
-          s.model, s.git_branch,
+          s.active_model || s.model, s.git_branch,
           relTime(s.last_event_at),
           dur(s.first_event_at, s.last_event_at) && "时长 " + dur(s.first_event_at, s.last_event_at),
           s.tasks_total && `任务 ${s.tasks_completed}/${s.tasks_total}`,
@@ -1768,7 +1879,7 @@ function infoHtml(d){
   const tools = Object.entries(d.tool_uses || {}).map(([k, v]) => `<span class="chip">${esc(k)} ×${v}</span>`).join("");
   return `
     <div class="grid">
-      <span>最近响应 <b>${esc(d.model || "?")}</b></span>
+      <span>当前模型 <b>${esc(d.active_model || d.model || "?")}</b></span>
       <span>分支 <b>${esc(d.git_branch || "?")}</b></span>
       <span>版本 <b>${esc(d.version || "?")}</b></span>
       <span>消息 <b>${d.user_msgs}/${d.assistant_msgs}</b></span>
@@ -1797,7 +1908,7 @@ function overviewSummary(d){
   // 每项带 key：窄屏按类名隐藏模型/分支/token，保留对话数与任务/子代理计数。
   // 分隔符放在各项内部，隐藏某项时不会留下悬空的“·”。
   const items = [
-    ["model", d.model || ""],
+    ["model", d.active_model || d.model || ""],
     ["branch", d.git_branch ? "⎇ " + d.git_branch : ""],
     ["msgs", `消息 ${d.user_msgs || 0}/${d.assistant_msgs || 0}`],
     ["output", t.output ? `输出 ${fmtTok(t.output)} tok` : ""],
@@ -3113,7 +3224,13 @@ function updateSendSt(id){
   if(!panelMatch(id)) return;
   const st = document.getElementById("sendst");
   const images = imageDraft(id);
-  if(st) st.textContent = images.pending ? "图片读取中…" : (images.error || sendJobText(id));
+  if(st){
+    const activity = id === convState.id ? activityText(convState.detail) : "";
+    const next = images.pending ? "图片读取中…"
+      : (images.error || sendJobText(id) || activity);
+    // 每秒 ticker 会调用；文案没变就不写 DOM，避免无谓重排
+    if(st.textContent !== next) st.textContent = next;
+  }
   const btn = document.getElementById("sendbtn");
   const j = sendJobs[id];
   // 对话视图里 running/queued 仍可继续发送：托管会话会排队；新建会话必须先拿到 sid，
@@ -3572,6 +3689,13 @@ function renderMain(){
   if(view.pending){ renderPendingList(); return; }
   if(view.hosted){ renderHostedList(); return; }
   if(view.session){
+    // 切换会话时先清掉上一个会话的错误横幅残留：新详情到达前，
+    // 1 秒 ticker 不能把旧错误画进新页面
+    if(convState.id !== view.session){
+      lastApiError = null;
+      const oldErr = document.getElementById("apierr");
+      if(oldErr){ oldErr.textContent = ""; oldErr.style.display = "none"; }
+    }
     // 单段文件 URL 同步判定直接跳预览，零探测请求；已知会话不被劫持
     const su = sessionFileRedirectUrl(view.session);
     if(su && location.replace) return location.replace(su);
@@ -4131,6 +4255,18 @@ function resetTimer(){
 }
 auto.onchange = () => { localStorage.setItem("auto", auto.checked ? "1" : "0"); resetTimer(); };
 ival.onchange = () => { localStorage.setItem("ival", ival.value); resetTimer(); };
+// 活动步骤与重试倒计时每秒刷新：消息轮询可能 3 秒一次，
+// 但“还在执行什么、已经多久”需要更细的本地计时
+setInterval(() => {
+  if(document.hidden) return;
+  if(lastApiError){
+    const idle = !convState.detail || convState.detail.state !== "working";
+    // 自动刷新关闭时没有 detail 轮询兜底：本地计时器也要收起过期的历史失败
+    if(idle && lastApiError.ts && Date.now() / 1000 - lastApiError.ts > 180) clearApiError();
+    else renderApiError(lastApiError);
+  }
+  if(view.session) updateSendSt(view.session);
+}, 1000);
 
 // 启动时先按地址栏恢复视图，再等首次 /sessions 数据渲染；
 // 不在数据到达前 renderMain，避免空项目列表把 URL 里的项目覆盖掉

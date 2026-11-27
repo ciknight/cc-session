@@ -25,7 +25,7 @@ from session_preferences import (APPROVAL_MODES, ApprovalPreferences, EFFORT_LEV
                                  model_args, validate_effort, validate_model)
 from cc_switch import CCSwitch
 
-from . import config, system, util
+from . import config, liveness, system, util
 from .util import clip, message_content, message_summary, _arg_present
 from .session import Session
 from .transcript import (AGENT_ID_RE, classify_user_line, TASK_TOOL_USE_ID_RE,
@@ -107,6 +107,9 @@ class Monitor:
         # 孤儿进程观察：托管退出后仍存活的后代进程
         self.orphans = OrphanWatcher()
         self.last_orphan_sample = 0.0
+        # 外部 CLI 存活探测：低频率读取 ~/.claude/sessions/<pid>.json
+        self.cli_live = {}
+        self.last_liveness_scan = 0.0
 
     def _keep_awake_pref_path(self):
         return config.CLAUDE_DIR / "claude-sessions" / "power.json"
@@ -860,9 +863,85 @@ class Monitor:
         if sess.state == "idle":
             return
         sess.state = "idle"
-        # 回合时长近似为最后用户输入到回合结束；供前端过滤短回合通知
+        sess.activity = None
+        # 回合时长近似为最后用户输入到回合结束；供前端过滤短回合通知。
+        # api_error 让前端区分"正常完成"和"重试耗尽后的错误收尾"，
+        # 后者不能立刻清掉刚显示的错误横幅。
         duration = max(0, util.now_ts() - sess.last_input_ts) if sess.last_input_ts else None
-        self.emit(sess, "turn_finished", {"last": sess.last_assistant, "duration": duration})
+        error = sess.last_api_error if sess.last_api_error else None
+        self.emit(sess, "turn_finished", {"last": sess.last_assistant, "duration": duration,
+                                          "api_error": bool(error),
+                                          "error": (error or {}).get("text")})
+
+    def _set_activity(self, sess, kind, label, **extra):
+        """记录当前步骤；同一活动延续时保留 since，供网页显示已持续时长。"""
+        now = util.now_ts()
+        current = sess.activity or {}
+        same = (current.get("kind") == kind and current.get("label") == label
+                and current.get("tool") == extra.get("tool"))
+        since = current.get("since") if same and current.get("since") else now
+        sess.activity = {"kind": kind, "label": label, "since": since,
+                         "updated": now, **extra}
+
+    def _end_turn(self, sess, ts_epoch, clear_api_error=False, mark_turn_end=True):
+        """回合结束的公共收尾：turn_duration 与重试耗尽的 API 错误共用。
+
+        两者的区别：正常结束清掉 last_api_error 并推进 last_turn_end_ts；
+        错误结束保留错误给网页展示，且不推进回合结束水位——前端据此
+        判断“新回复”，不能把一次失败当成新回复。后台异步子代理不随回合结束收敛。"""
+        if mark_turn_end:
+            sess.last_turn_end_ts = ts_epoch or util.now_ts()
+        # 权威结束标记：清掉可能因中断而没有结果的 tool id
+        sess.pending_tools.clear()
+        # 中断的 Agent 调用不会再有 tool_result：运行中的子代理条目一并收尾，
+        # 否则“运行中”计数和脉动圆点会永久残留；异步子代理跨回合运行，
+        # 只认 task-notification，不在此清扫
+        for sub in sess.subagents:
+            if sub.get("state") == "running" and not sub.get("async"):
+                sub["state"] = "done"
+                self.emit(sess, "subagent_done",
+                          {"tid": sub.get("tid"), "state": "done",
+                           "type": sub.get("type"),
+                           "description": sub.get("description")})
+        # active_agents 同步收敛到仍在运行的异步条目：同步残留的 tid
+        # 不清掉会让 _set_idle 永不触发、会话永久停在 working
+        sess.active_agents.intersection_update(
+            sub.get("tid") for sub in sess.subagents
+            if sub.get("state") == "running" and sub.get("async"))
+        sess.activity = None
+        if clear_api_error:
+            sess.last_api_error = None
+        if not sess.active_agents:
+            self._set_idle(sess)
+
+    def _refresh_liveness(self):
+        """低频率刷新外部 CLI 存活表，并把状态标到对应 Session。
+
+        进程存活时 working 会话不因长时间没有新转录而 stale；
+        托管会话则用常驻进程自己的存活状态兜底。"""
+        now = util.now_ts()
+        if now - self.last_liveness_scan < config.LIVENESS_SCAN_SECONDS:
+            return
+        self.last_liveness_scan = now
+        try:
+            records = liveness.read_cli_sessions()
+        except Exception as e:      # 探测失败不能影响扫描
+            records = {}
+            print(f"[liveness] 读取 CLI 会话注册表失败: {e}", flush=True)
+        live_ids = set(records)
+        with self.lock:
+            # 本服务自己发起的一次性远程任务不在 CLI 注册表里：
+            # 长任务（模型思考/工具执行）超过退出宽限时不能被误判 stale
+            live_ids.update(self.busy)
+            for sid, h in list(self.hosted_by_sid.items()):
+                if h.alive():
+                    live_ids.add(sid)
+            for sess in self.sessions.values():
+                alive = sess.id in live_ids
+                sess.cli_live = alive
+                if alive:
+                    sess.seen_live = True
+        self.cli_live = records
 
     def handle_line(self, sess, line):
         try:
@@ -902,45 +981,21 @@ class Monitor:
                 if obj.get("isSidechain"):
                     return
                 sess.saw_turn_duration = True
-                sess.last_turn_end_ts = ts_epoch or util.now_ts()
-                # turn_duration 是权威结束标记：清掉可能因中断而没有结果的 tool id
-                sess.pending_tools.clear()
-                # 中断的 Agent 调用不会再有 tool_result：运行中的子代理条目一并收尾，
-                # 否则“运行中”计数和脉动圆点会永久残留；异步子代理跨回合运行，
-                # 只认 task-notification，不在此清扫
-                for sub in sess.subagents:
-                    if sub.get("state") == "running" and not sub.get("async"):
-                        sub["state"] = "done"
-                        self.emit(sess, "subagent_done",
-                                  {"tid": sub.get("tid"), "state": "done",
-                                   "type": sub.get("type"),
-                                   "description": sub.get("description")})
-                # active_agents 同步收敛到仍在运行的异步条目：同步残留的 tid
-                # 不清掉会让 _set_idle 永不触发、会话永久停在 working
-                sess.active_agents.intersection_update(
-                    sub.get("tid") for sub in sess.subagents
-                    if sub.get("state") == "running" and sub.get("async"))
-                sess.last_api_error = None
-                if not sess.active_agents:
-                    self._set_idle(sess)
+                self._end_turn(sess, ts_epoch, clear_api_error=True)
             elif subtype == "compact_boundary":
                 sess.compacted_at = ts_epoch or util.now_ts()
                 self.emit(sess, "context_compacted", {"at": sess.compacted_at})
             elif subtype in ("api_error", "api_retry"):
                 # 上游 503/限流时 CLI 只写这些 system 行，没有 assistant 内容；
-                # 记录下来让网页能说明“为什么没反应”（重试会持续到 maxRetries）
-                err = obj.get("error")
-                if isinstance(err, dict):
-                    text = err.get("message") or err.get("formatted") or ""
-                else:
-                    text = str(err) if err else ""
-                data = {
-                    "text": clip(text or "模型服务暂时不可用", 300),
-                    "retry_attempt": obj.get("retryAttempt"),
-                    "max_retries": obj.get("maxRetries"),
-                    "retry_in_ms": obj.get("retryInMs"),
-                }
+                # 记录下来让网页能说明“为什么没反应”（重试会持续到 maxRetries）。
+                # 文本优先取 error.formatted，比只有 "Connection error." 的
+                # error.message 更能说明是 DNS、网关还是服务端故障。
+                data = util.api_error_fields(obj)
                 sess.last_api_error = {"ts": ts_epoch or util.now_ts(), **data}
+                self._set_activity(sess, "retry", "模型服务重试中",
+                                   attempt=data.get("retry_attempt"),
+                                   max_retries=data.get("max_retries"),
+                                   retry_in_ms=data.get("retry_in_ms"))
                 # 请求还在退避重试，回合没有结束
                 self._set_working(sess)
                 self.emit(sess, "api_error", data)
@@ -966,7 +1021,7 @@ class Monitor:
                 return
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    self._on_tool_result(sess, b, obj.get("toolUseResult"))
+                    self._on_tool_result(sess, b, obj.get("toolUseResult"), sidechain)
             if kind == "system" and any(
                     (b.get("text") or "").lstrip().startswith("<task-notification>")
                     for b in blocks if isinstance(b, dict)):
@@ -986,6 +1041,7 @@ class Monitor:
                     if sess.first_user is None:
                         sess.first_user = clip(summary, 80)
                     sess.last_user = clip(summary)
+                    self._set_activity(sess, "model", "等待模型响应")
                     self._set_working(sess)
                     self.emit(sess, "user_message", {"text": sess.last_user})
             elif sidechain or kind in ("tool", "injected", "system", "meta_tool"):
@@ -998,10 +1054,36 @@ class Monitor:
                 self._set_working(sess)
 
         elif typ == "assistant":
+            if obj.get("isApiErrorMessage"):
+                # 重试耗尽时 CLI 写一条 <synthetic> 的 assistant 错误消息，
+                # 之后不会再发 turn_duration。旧逻辑把它当普通回复处理：
+                # 清掉错误记录、保持 working 直到 --stale，模型还会被写成
+                # <synthetic>。这里按回合终态收尾，并保留错误供网页展示。
+                text = _result_text(msg)
+                data = util.api_error_fields({"error": obj.get("error")})
+                if text:
+                    data["text"] = clip(text, 300)
+                    data["kind"] = util.classify_api_error(
+                        text, data.get("status"))
+                if not sidechain:
+                    sess.last_api_error = {"ts": ts_epoch or util.now_ts(), **data}
+                    self.emit(sess, "api_error", data)
+                    self._end_turn(sess, ts_epoch, mark_turn_end=False)
+                elif sess.is_subagent:
+                    # 子代理转录只读展示，不必向全局发 turn_finished/通知；
+                    # 但它的状态也不应永久停在 working
+                    sess.last_api_error = {"ts": ts_epoch or util.now_ts(), **data}
+                    sess.state = "idle"
+                    sess.activity = None
+                    sess.pending_tools.clear()
+                # 主转录里夹带的 sidechain 错误属于子代理，不影响主会话
+                return
             if not sidechain:
                 sess.assistant_msgs += 1
-                if msg.get("model"):
-                    sess.model = msg["model"]
+                model = msg.get("model")
+                # <synthetic> 是错误/占位消息的模型名，不能覆盖真实模型
+                if isinstance(model, str) and model and not model.startswith("<synthetic"):
+                    sess.model = model
             usage = msg.get("usage") or {}
             sess.tokens["input"] += usage.get("input_tokens", 0)
             sess.tokens["output"] += usage.get("output_tokens", 0)
@@ -1018,13 +1100,11 @@ class Monitor:
                 if b.get("type") == "text" and b.get("text") and not sidechain:
                     sess.last_assistant = clip(b["text"])
                     sess.last_api_error = None   # 重试成功，已有正常输出
+                    self._set_activity(sess, "output", "模型输出中")
                     self.emit(sess, "assistant_message", {"text": sess.last_assistant})
                 elif b.get("type") == "tool_use":
                     self._on_tool_use(sess, b, sidechain)
-            if obj.get("isApiErrorMessage"):
-                self.emit(sess, "api_error", {"text": clip(_result_text(msg), 300)})
-                self._set_working(sess)
-            elif sidechain:
+            if sidechain:
                 # 子代理（sidechain）在跑：即使它本回合 end_turn，主对话仍在等它的结果
                 self._set_working(sess)
             elif not sess.saw_turn_duration and msg.get("stop_reason") == "end_turn" \
@@ -1034,8 +1114,11 @@ class Monitor:
     def _on_tool_use(self, sess, b, sidechain=False):
         name, inp, tid = b.get("name"), b.get("input") or {}, b.get("id")
         sess.tool_uses[name] += 1
-        if not sidechain and tid:
-            sess.pending_tools.add(tid)
+        if not sidechain:
+            if tid:
+                sess.pending_tools.add(tid)
+            # 子代理的工具调用不覆盖主链活动：主对话此刻在等子代理结果
+            self._set_activity(sess, "tool", f"执行 {name}", tool=name)
         self.emit(sess, "tool_use", {"tool": name, "input": clip(inp, 200)})
         if name in ("Agent", "Task"):
             if tid:
@@ -1070,7 +1153,7 @@ class Monitor:
                 self.emit(sess, "task_updated", {"id": task["id"], "status": inp.get("status"),
                                                  "subject": task["subject"]})
 
-    def _on_tool_result(self, sess, b, tur=None):
+    def _on_tool_result(self, sess, b, tur=None, sidechain=False):
         tid = b.get("tool_use_id")
         # 后台异步 Agent 的 tool_result 只是"已启动"确认（行级 toolUseResult.isAsync），
         # 真正的完成信号是后续 task-notification；期间保持 running 和 working
@@ -1082,6 +1165,10 @@ class Monitor:
         if not (async_launch and entry is not None):
             sess.active_agents.discard(tid)
         sess.pending_tools.discard(tid)
+        if not sidechain:
+            # 工具结果回传后 CLI 会发起下一次模型请求；这是长回合里
+            # “看起来没动静”最常见的空窗期
+            self._set_activity(sess, "model", "等待模型响应")
         if b.get("is_error"):
             self.emit(sess, "tool_error", {"tool_use_id": tid,
                                            "error": clip(b.get("content", ""), 200)})
@@ -1107,6 +1194,7 @@ class Monitor:
         tid = m.group(1)
         sess.active_agents.discard(tid)
         sess.pending_tools.discard(tid)
+        self._set_activity(sess, "model", "后台任务已结束，等待模型响应")
         for sub in sess.subagents:
             if sub.get("tid") == tid and sub.get("state") == "running":
                 sub["state"] = "done"
@@ -1210,35 +1298,83 @@ class Monitor:
                 sess = self.sessions[key] = self._new_session(
                     sid, path, parent_id, is_subagent)
                 self.cache_dirty = True
-            if size == sess.offset:
+            # buf 里可能还有上一轮因行数预算未解析的整行：文件没有增长时也要继续消化
+            if size == sess.offset and not sess.buf:
                 return
             offset = sess.offset
-        try:
-            with open(path, "rb") as f:
-                f.seek(offset)
-                chunk = f.read()
-        except OSError:
-            # 文件在 stat 与 open 之间被删除/轮转：跳过本次，下轮重试
-            return
+            buffered = len(sess.buf)
+        if buffered >= config.SCAN_MAX_BYTES_PER_TICK and b"\n" in sess.buf:
+            # 积压的完整行已经够下一轮解析的量：先消化缓冲，暂不读新字节，
+            # 否则“读得多、解析得少”会让 buf 无限增长。含未完成长行时仍要继续读。
+            chunk = b""
+        else:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    # 只读有限字节：超大转录首次回填时，未读部分留在文件里，
+                    # 不会滞留在内存或写进扫描缓存
+                    chunk = f.read(config.SCAN_MAX_BYTES_PER_TICK)
+            except OSError:
+                # 文件在 stat 与 open 之间被删除/轮转：跳过本次，下轮重试
+                return
         with self.lock:
-            # scan_lock 已保证同路径串行：sess 不会被并发重置，直接提交
+            # scan_lock 已保证同路径串行：sess 不会被并发重置。
+            # offset 表示"已读到的文件位置"，buf 里是尚未解析的整行/半行；
+            # 预算只限制解析量，不改变读取位置，下一轮从 buf 继续。
             data = sess.buf + chunk
-            *lines, sess.buf = data.split(b"\n")   # 最后一段可能是半行，留到下次
+            parts = data.split(b"\n")
+            tail = parts.pop()                  # 最后一段可能是半行
+            budget = config.SCAN_MAX_LINES_PER_TICK
+            if len(parts) > budget:
+                rest = b"\n".join(parts[budget:])
+                if tail:
+                    rest = rest + b"\n" + tail if rest else tail
+                elif rest:
+                    # 原文件以换行结尾：保留行尾换行，否则下一轮会把最后一行
+                    # 当成没有结束的半行，永远留在 buf 里
+                    rest += b"\n"
+                lines = parts[:budget]
+                pending_buf = rest
+            else:
+                lines = parts
+                pending_buf = tail
+            # 解析前快照：若别的线程此刻落盘扫描缓存，必须写入旧状态与旧 offset，
+            # 否则重启后会从已推进的 offset 开始、丢掉尚在解析中的行
+            sess.scan_baseline = {
+                "offset": sess.offset,
+                "buf": sess.buf,
+                "tail_sample": sess.tail_sample,
+                "session": sess.cache_state(),
+            }
+            self.cache_dirty = True
+        # 解析在锁外进行：超大转录首次回填时不会长时间占住 mon.lock，
+        # 网页请求与审批仍能及时读到（略旧但完整的）累计状态。
+        # 单行异常必须隔离：否则该行会让整个文件每轮从同一位置反复回放，
+        # 已应用的状态被重复累计
+        for ln in lines:
+            if not ln.strip():
+                continue
+            try:
+                self.handle_line(sess, ln.decode("utf-8", "replace"))
+            except Exception as e:
+                print(f"[scan] 解析转录行失败 ({path}:{offset}): {e}", flush=True)
+        with self.lock:
             sess.offset = offset + len(chunk)
+            sess.buf = pending_buf
             if chunk:
                 if len(chunk) >= config.SCAN_TAIL_SAMPLE_BYTES:
                     sess.tail_sample = chunk[-config.SCAN_TAIL_SAMPLE_BYTES:]
                 else:
                     sess.tail_sample = (sess.tail_sample + chunk)[-config.SCAN_TAIL_SAMPLE_BYTES:]
+            sess.scan_baseline = None
             self.cache_dirty = True
-            for ln in lines:
-                if ln.strip():
-                    self.handle_line(sess, ln.decode("utf-8", "replace"))
 
     def scan_once(self, include_subagents=None):
         self._scan_cache_obj()
         root = config.CLAUDE_DIR / "projects"
         if not root.exists():
+            # 转录目录暂时不可用时也要刷新 CLI 存活状态（否则会一直沿用旧值）
+            self._refresh_liveness()
             return
         if include_subagents is None:
             include_subagents = self.scan_subagents
@@ -1258,6 +1394,7 @@ class Monitor:
             self._scan_path(path, sid, parent_id, is_subagent)
         if self._merge_task_dirs():
             self.cache_dirty = True
+        self._refresh_liveness()
         self.maybe_save_cache(force=not self.first_scan_done)
 
     def scan_subagents_once(self, force=False):
@@ -1340,6 +1477,28 @@ class Monitor:
             for key, sess in self.sessions.items():
                 # 默认只缓存主会话，避免开启全量扫描时反复写数 MB 子代理状态
                 if sess.is_subagent and not self.scan_subagents:
+                    continue
+                baseline = sess.scan_baseline
+                if baseline is not None:
+                    # 解析进行中：缓存写到解析前的状态，重启后重新应用这批行
+                    if len(baseline["buf"]) > config.SCAN_CACHE_BUF_LIMIT:
+                        previous = (self.scan_cache_entries or {}).get(key)
+                        if previous:
+                            entries[key] = previous
+                        continue
+                    entries[key] = {
+                        "offset": baseline["offset"],
+                        "tail_sha256": hashlib.sha256(baseline["tail_sample"]).hexdigest(),
+                        "buf": base64.b64encode(baseline["buf"]).decode("ascii"),
+                        "session": baseline["session"],
+                    }
+                    continue
+                if len(sess.buf) > config.SCAN_CACHE_BUF_LIMIT:
+                    # 超长未完成行（常见于大 base64 图片）不写缓存：
+                    # 保留上一版条目，下轮继续解析；避免反复编码几十 MB
+                    previous = (self.scan_cache_entries or {}).get(key)
+                    if previous:
+                        entries[key] = previous
                     continue
                 entries[key] = {
                     "offset": sess.offset,

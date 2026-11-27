@@ -20,6 +20,20 @@ MSG_CHUNK_BYTES = 1 * 1024 * 1024
 SCAN_CACHE_SAVE_SECONDS = 5
 SCAN_CACHE_SAVE_SUBAGENTS_SECONDS = 30
 SCAN_TAIL_SAMPLE_BYTES = 4096
+# 单次轮询最多解析的行数与读取的字节数：超大转录首次回填时分批进行，
+# 未读取的字节留在文件里（不占内存、不写缓存），避免长时间占住轮询线程。
+# 字节上限是主要约束；行数上限只防极端小行，正常 4 MiB 内不会先触发行数上限。
+SCAN_MAX_LINES_PER_TICK = 100_000
+SCAN_MAX_BYTES_PER_TICK = 4 * 1024 * 1024
+# 未完行的缓冲超过该大小时跳过本次缓存写入（保留旧条目）：
+# 超大 base64 行不应让每个缓存周期都把几十 MB 编码落盘
+SCAN_CACHE_BUF_LIMIT = 8 * 1024 * 1024
+
+# 外部 CLI 存活探测：读 ~/.claude/sessions/<pid>.json（sessionId/pid），
+# 校验进程仍存活。用于长工具执行时不被 --stale 误判，以及进程退出后的收尾。
+LIVENESS_SCAN_SECONDS = 5
+# 曾确认存活的进程消失后，working 会话在多少秒无转录事件后判定为 stale
+LIVENESS_EXIT_GRACE = 30
 
 # 网页图片消息：base64 在 JSON 中传输，单张/总量同时设限，避免请求与进程内存膨胀
 IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
